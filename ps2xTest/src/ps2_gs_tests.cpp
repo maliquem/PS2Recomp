@@ -425,17 +425,20 @@ void register_ps2_gs_tests()
             constexpr uint32_t kGsCsr = 0x12001000u;
             constexpr uint32_t kGsImr = 0x12001010u;
 
+            t.Equals(mem.read32(kGsCsr) >> 16, 0x551Bu, "CSR should report a retail GS (ID 0x55, REV 0x1B) after reset");
+
+            // Bits 16..31 (REV/ID) are read-only; every other non-status bit keeps what was written.
             const uint64_t csrPattern = 0xA1B2C3D4E5F60718ull;
             mem.write64(kGsCsr, csrPattern);
-            t.Equals(mem.read64(kGsCsr), csrPattern, "64-bit CSR read should match prior 64-bit write");
-            t.Equals(mem.read32(kGsCsr), static_cast<uint32_t>(csrPattern & 0xFFFFFFFFull), "CSR low dword read should match");
+            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D4551B0718ull, "64-bit CSR read should match prior 64-bit write except REV/ID");
+            t.Equals(mem.read32(kGsCsr), 0x551B0718u, "CSR low dword read should match");
             t.Equals(mem.read32(kGsCsr + 4u), static_cast<uint32_t>(csrPattern >> 32), "CSR high dword read should match");
 
             mem.write32(kGsCsr, 0x11223344u);
-            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411223344ull, "32-bit low write should preserve CSR high dword");
+            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D4551B3344ull, "32-bit low write should preserve CSR high dword and REV/ID");
 
             mem.write32(kGsCsr + 4u, 0x55667788u);
-            t.Equals(mem.read64(kGsCsr), 0x5566778811223344ull, "32-bit high write should preserve CSR low dword");
+            t.Equals(mem.read64(kGsCsr), 0x55667788551B3344ull, "32-bit high write should preserve CSR low dword");
 
             const uint64_t imrPattern = 0x0123456789ABCDEFull;
             mem.write64(kGsImr, imrPattern);

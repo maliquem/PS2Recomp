@@ -98,6 +98,10 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+    // Read-only REV=0x1B, ID=0x55 of a retail GS (PCSX2 reports the same). Games read REV:
+    // Shadow Hearts programs its 1 ms game clock (EE Timer 0) only when REV >= 7.
+    constexpr uint64_t kGsCsrRevId = 0x551Bull << 16;
+    constexpr uint64_t kGsCsrReadOnlyMask = 0xFFFF0000ull;
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -108,6 +112,7 @@ namespace
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
         constexpr uint32_t kW1cMask = 0x3u;
+        constexpr uint32_t kKeepMask = kW1cMask | static_cast<uint32_t>(kGsCsrReadOnlyMask);
         uint64_t expected = csr.load();
         uint64_t desired;
         do
@@ -115,7 +120,7 @@ namespace
             if (off == 0u)
             {
                 uint32_t oldLow = static_cast<uint32_t>(expected & 0xFFFFFFFFull);
-                uint32_t mergedLow = (oldLow & kW1cMask) | (value & ~kW1cMask);
+                uint32_t mergedLow = (oldLow & kKeepMask) | (value & ~kKeepMask);
                 desired = (expected & 0xFFFFFFFF00000000ull) | static_cast<uint64_t>(mergedLow);
                 desired &= ~static_cast<uint64_t>(value & kW1cMask);
             }
@@ -132,11 +137,12 @@ namespace
     inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
     {
         constexpr uint64_t kW1cMask = 0x3ull;
+        constexpr uint64_t kKeepMask = kW1cMask | kGsCsrReadOnlyMask;
         uint64_t expected = csr.load();
         uint64_t desired;
         do
         {
-            desired = (expected & kW1cMask) | (value & ~kW1cMask);
+            desired = (expected & kKeepMask) | (value & ~kKeepMask);
             desired &= ~(value & kW1cMask);
         } while (!csr.compare_exchange_weak(expected, desired));
     }
@@ -362,8 +368,8 @@ bool PS2Memory::initialize(size_t ramSize)
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
         // memset zero-fills std::atomic<uint64_t>::csr's bytes, which is not itself
-        // a guaranteed-valid atomic store; make the zero-initialization explicit.
-        gs_regs.csr.store(0);
+        // a guaranteed-valid atomic store; make the initialization explicit.
+        gs_regs.csr.store(kGsCsrRevId);
         gs_regs.dispfb1 = (0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43);
         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
         gs_regs.dispfb2 = gs_regs.dispfb1;
