@@ -555,7 +555,8 @@ namespace ps2_stubs
         float dot = 0.0f;
         if (readVuVec4f(rdram, lhsAddr, lhs) && readVuVec4f(rdram, rhsAddr, rhs))
         {
-            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]) + (lhs[3] * rhs[3]);
+            // libvu0: vmul.xyz + vaddy.x + vaddz.x, w is ignored.
+            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]);
         }
 
         if (ctx)

@@ -708,6 +708,17 @@ void register_ps2_vu_tests()
             t.IsTrue(allMatch, "CameraMatrix must normalize xyz only (w of fwd/up ignored)");
         });
 
+        tc.Run("InnerProduct_xyz_only", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 0.0f, 0.0f, 1.0f, 1.0f);
+            writeVec4(env, kB, 0.0f, 0.0f, 1.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kA);
+            SET_GPR_U32(&env.ctx, 5, kB);
+            ps2_stubs::sceVu0InnerProduct(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(nearlyEqual(env.ctx.f[0], 1.0f), "InnerProduct should ignore w (libvu0 vmul.xyz)");
+        });
+
         tc.Run("Normalize_xyz_only_w_zero", [](TestCase &t)
         {
             VuEnv env;
@@ -725,7 +736,7 @@ void register_ps2_vu_tests()
         tc.Run("NormalLightMatrix_neg_normalized", [](TestCase &t)
         {
             VuEnv env;
-            writeVec4(env, kA, 1.0f, 0.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 1.0f, 0.0f, 0.0f, 1.0f); // w=1 must not change the length
             writeVec4(env, kB, 0.0f, 1.0f, 0.0f, 0.0f);
             writeVec4(env, kC, 0.0f, 0.0f, 1.0f, 0.0f);
             SET_GPR_U32(&env.ctx, 4, kDst);
