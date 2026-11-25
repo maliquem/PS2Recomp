@@ -72,6 +72,9 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
+    std::array<uint32_t, 256> m_clutLutCache{};
+    uint64_t m_clutLutKey = 0u;
+    bool m_clutLutValid = false;
     GSMem::TexturePageCache m_texturePageCache;
 
     GSTransferCommand m_transfer{};

@@ -54,6 +54,12 @@ namespace
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
+    bool isInsideInterruptInvocation(const GuestThread *t) noexcept
+    {
+        return t != nullptr && !t->invocations.empty() &&
+               t->invocations.back().kind == GuestInvocationKind::Interrupt;
+    }
+
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
     {
@@ -244,6 +250,7 @@ void EeScheduler::run()
                     {
                     }
                 }
+                applyPendingPreemption();
                 continue;
             }
             makeDormant(*running);
@@ -314,15 +321,7 @@ void EeScheduler::run()
         }
 
         processPendingEvents();
-        if (m_rescheduleRequested && m_currentThreadId != 0)
-        {
-            GuestThread *preempted = currentThread();
-            assert(preempted != nullptr);
-            enqueueReady(*preempted, !m_timeSliceExpired);
-            m_currentThreadId = 0;
-            m_rescheduleRequested = false;
-            m_timeSliceExpired = false;
-        }
+        applyPendingPreemption();
     }
 
     m_guestExecuting.store(false, std::memory_order_release);
@@ -377,7 +376,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     }
 
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (running != nullptr && !isInsideInterruptInvocation(running) &&
+        hasReadyAtOrAbovePriority(running->currentPriority))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
@@ -1734,6 +1734,10 @@ void EeScheduler::applyPendingPreemption()
     }
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    if (isInsideInterruptInvocation(self))
+    {
+        return;
+    }
     enqueueReady(*self, !m_timeSliceExpired);
     m_currentThreadId = 0;
     m_rescheduleRequested = false;
@@ -1847,11 +1851,16 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                auto hostDeadline = scheduled.hostDeadline;
+                const auto now = std::chrono::steady_clock::now();
+                // Keep guest cycles intact without replaying overdue fields faster than real time.
+                if (now - hostDeadline >= kVBlankPeriod)
+                    hostDeadline = now;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              hostDeadline + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

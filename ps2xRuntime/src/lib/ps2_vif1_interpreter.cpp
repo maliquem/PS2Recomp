@@ -300,34 +300,57 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    auto submitPath2Payload = [&](const uint8_t *payload, uint32_t payloadQw, bool directHl)
+    {
+        uint32_t remainingQw = payloadQw;
+        const uint8_t *cursor = payload;
+        while (remainingQw != 0u)
+        {
+            if (m_vif1PendingPath2ImageQwc != 0u)
+            {
+                const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, remainingQw);
+                std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+                const uint64_t imageTag =
+                    static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+                    ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+                    (static_cast<uint64_t>(kGifFmtImage) << 58);
+                std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+                std::memcpy(imagePacket.data() + 16u, cursor, static_cast<size_t>(chunkQw) * 16u);
+                submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, directHl);
+
+                cursor += static_cast<size_t>(chunkQw) * 16u;
+                remainingQw -= chunkQw;
+                m_vif1PendingPath2ImageQwc -= chunkQw;
+            }
+            else
+            {
+                const uint32_t chunkBytes = remainingQw * 16u;
+                submitGifPacket(GifPathId::Path2, cursor, chunkBytes, true, directHl);
+                const uint32_t pendingImageQw = pendingGifImageQwc(cursor, chunkBytes);
+                if (pendingImageQw != 0u)
+                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+                remainingQw = 0u;
+            }
+        }
+    };
+
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (m_vif1PendingDirectQwc != 0u)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
-            {
                 break;
-            }
 
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingDirectQwc, availableQw);
+            submitPath2Payload(data + pos, chunkQw, m_vif1PendingPath2DirectHl);
 
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
+            m_vif1PendingDirectQwc -= chunkQw;
+            if (m_vif1PendingDirectQwc == 0u)
                 m_vif1PendingPath2DirectHl = false;
-            }
             continue;
         }
 
@@ -398,10 +421,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            if (m_gifArbiter && (opcode == VIF_FLUSH || opcode == VIF_FLUSHA))
+                m_gifArbiter->drain();
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
             uint32_t startPC = (uint32_t)imm * 8u;
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
@@ -418,10 +445,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
             continue;
         }
         else if (opcode == VIF_MSCNT)
         {
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
             vif1_regs.top = runTop;
@@ -436,6 +467,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (m_vu1MscntCallback)
                 m_vu1MscntCallback(runTop, runItop);
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
             continue;
         }
         else if (opcode == VIF_STMASK)
@@ -487,30 +520,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
-            uint32_t qwCount = imm;
-            if (qwCount == 0)
-                qwCount = 65536;
+            uint32_t requestedQw = imm;
+            if (requestedQw == 0u)
+                requestedQw = 65536u;
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            const bool truncated = qwCount > availableQw;
-            if (qwCount > availableQw)
-                qwCount = availableQw;
+            const uint32_t consumeQw = std::min<uint32_t>(requestedQw, availableQw);
+            const bool directHl = (opcode == VIF_DIRECTHL);
 
-            if (qwCount > 0)
+            if (consumeQw > 0u)
+                submitPath2Payload(data + pos, consumeQw, directHl);
+
+            pos += consumeQw * 16u;
+            if (consumeQw < requestedQw)
             {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
-            }
-
-            pos += qwCount * 16;
-            if (truncated)
-            {
+                m_vif1PendingDirectQwc = requestedQw - consumeQw;
+                m_vif1PendingPath2DirectHl = directHl;
                 pos = sizeBytes;
                 break;
             }

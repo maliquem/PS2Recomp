@@ -95,6 +95,12 @@ namespace ps2x::iop
         virtual void freeGuest(uint32_t address) = 0;
 
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
+        virtual void submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+        {
+            (void)core;
+            (void)interleavedStereoPcm;
+            (void)frameCount;
+        }
 
         virtual std::string hostPath(HostPathKind kind) const = 0;
         virtual std::string translateGuestPath(std::string_view path) const = 0;
@@ -106,6 +112,14 @@ namespace ps2x::iop
                                   size_t size,
                                   size_t &bytesRead) = 0;
         virtual void closeHostFile(uint64_t handle) = 0;
+        virtual bool readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t byteCount)
+        {
+            (void)lsn;
+            (void)sectors;
+            (void)destination;
+            (void)byteCount;
+            return false;
+        }
 
         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
 

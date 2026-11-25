@@ -1,0 +1,90 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(binding = 0, std430) buffer LocalMemory { uint vram[]; };
+layout(binding = 1, std430) readonly buffer ClutMemory { uint clut[]; };
+layout(binding = 2, std430) writeonly buffer Frame { uint rgba[]; };
+
+#include "gs_common.glsl"
+
+struct Circuit
+{
+    uint width, height, baseBlock, pitch, originX, originY, psm;
+};
+
+layout(push_constant, std430) uniform Presentation
+{
+    Circuit crt1, crt2;
+    uint pmode, background, field, parity;
+} gs;
+
+uint readCircuitColor(Circuit c, uvec2 pos, bool preserveAlpha)
+{
+    uint x = pos.x + c.originX;
+    uint y = pos.y + c.originY;
+    uint fbw = c.pitch != 0u ? c.pitch : 10u;
+    if (c.psm == PSM_CT32 || c.psm == PSM_CT24)
+    {
+        uint color = readVram(c.psm, c.baseBlock, fbw, x, y);
+        uint a = (preserveAlpha && c.psm != PSM_CT24) ? (color & 0xFF000000u) : 0xFF000000u;
+        return (color & 0x00FFFFFFu) | a;
+    }
+    if (c.psm == PSM_CT16 || c.psm == PSM_CT16S)
+    {
+        uint raw = readVram(c.psm, c.baseBlock, fbw, x, y);
+        uint r = raw & 31u;
+        uint g = (raw >> 5u) & 31u;
+        uint b = (raw >> 10u) & 31u;
+        uint r8 = (r << 3u) | (r >> 2u);
+        uint g8 = (g << 3u) | (g >> 2u);
+        uint b8 = (b << 3u) | (b >> 2u);
+        uint a8 = preserveAlpha ? (((raw & 0x8000u) != 0u) ? 0x80u : 0u) : 255u;
+        return r8 | (g8 << 8u) | (b8 << 16u) | (a8 << 24u);
+    }
+    return 0xFF000000u;
+}
+
+ivec3 unpackRgb(uint color)
+{
+    return ivec3(uvec3(color, color >> 8u, color >> 16u) & 255u);
+}
+
+void main()
+{
+    uvec2 position = gl_GlobalInvocationID.xy;
+    if (position.x >= 640u || position.y >= 512u)
+        return;
+    uint outputIndex = position.y * 640u + position.x;
+    uint width = max(gs.crt1.width, gs.crt2.width);
+    uint height = max(gs.crt1.height, gs.crt2.height);
+    if (position.x >= width || position.y >= height)
+    {
+        rgba[outputIndex] = 0u;
+        return;
+    }
+
+    if (gs.field != 0u && height >= 2u)
+        position.y = min(height - 1u, (position.y & ~1u) + gs.parity);
+
+    if (gs.crt1.width == 0u || gs.crt2.width == 0u)
+    {
+        Circuit source = gs.crt1.width != 0u ? gs.crt1 : gs.crt2;
+        rgba[outputIndex] = readCircuitColor(source, position, false) | 0xFF000000u;
+        return;
+    }
+
+    uint color = gs.background;
+    if ((gs.pmode & 128u) == 0u && position.x < gs.crt2.width && position.y < gs.crt2.height)
+        color = readCircuitColor(gs.crt2, position, true);
+    if (position.x < gs.crt1.width && position.y < gs.crt1.height)
+    {
+        uint src = readCircuitColor(gs.crt1, position, true);
+        uint factor = (gs.pmode & 32u) != 0u ? ((gs.pmode >> 8u) & 255u) : min(255u, (src >> 24u) * 2u);
+        ivec3 dst = unpackRgb(color);
+        uvec3 rgb = uvec3(clamp(dst + ((unpackRgb(src) - dst) * int(factor)) / 255, 0, 255));
+        color = rgb.r | (rgb.g << 8u) | (rgb.b << 16u);
+    }
+    rgba[outputIndex] = color | 0xFF000000u;
+}

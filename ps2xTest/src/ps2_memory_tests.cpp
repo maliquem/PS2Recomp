@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace
@@ -249,6 +250,49 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kTimerBases[1] + 0x30u, 0x23456u), "Timer1 HOLD write should succeed");
             t.Equals(mem.readIORegister(kTimerBases[0] + 0x30u), 0x2345u, "Timer0 HOLD should be 16-bit");
             t.Equals(mem.readIORegister(kTimerBases[1] + 0x30u), 0x3456u, "Timer1 HOLD should be 16-bit");
+        });
+
+        tc.Run("EE timer clock scaling preserves fractional cycles and large budgets", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t countReg = 0x10000000u;
+            constexpr uint32_t modeReg = 0x10000010u;
+            constexpr uint32_t compareReg = 0x10000020u;
+            constexpr uint32_t enabled = 1u << 7u;
+            constexpr uint32_t compareIrq = 1u << 8u;
+            constexpr uint64_t eeHz = 294912000u;
+            constexpr uint64_t clockHz[] = {147456000u, 9216000u, 576000u, 15734u};
+            constexpr uint64_t budgets[] = {1u, 30u, 480u, 1u, 1u, 18743u,
+                                            std::numeric_limits<uint64_t>::max() - 41u, 17u};
+            for (uint32_t mode = 0; mode < 4; ++mode)
+            {
+                mem.writeIORegister(countReg, 17u);
+                mem.writeIORegister(modeReg, enabled | mode);
+                uint64_t remainder = 0u;
+                uint64_t count = 17u;
+                for (uint64_t eeCycles : budgets)
+                {
+                    const uint64_t scaled = (eeCycles % eeHz) * clockHz[mode] + remainder;
+                    count = (count + (eeCycles / eeHz) * clockHz[mode] + scaled / eeHz) & 0xFFFFu;
+                    remainder = scaled % eeHz;
+                    t.Equals(mem.advanceEeTimers(eeCycles), 0u, "disabled IRQs should remain clear");
+                    t.Equals(mem.readIORegister(countReg), static_cast<uint32_t>(count),
+                             "COUNT should follow the reference clock scale");
+                }
+            }
+
+            mem.writeIORegister(countReg, 0u);
+            mem.writeIORegister(modeReg, enabled | 2u);
+            mem.advanceEeTimers(511u);
+            mem.writeIORegister(compareReg, 1u);
+            mem.writeIORegister(modeReg, enabled | compareIrq);
+            mem.advanceEeTimers(1u);
+            t.Equals(mem.readIORegister(countReg), 0u, "changing CLKS should reset the previous phase");
+            t.Equals(mem.cyclesUntilNextEeTimerInterrupt(), uint64_t{1}, "the next IRQ should use the retained half tick");
+            t.Equals(mem.advanceEeTimers(1u), 1u, "compare IRQ should fire on the next cycle");
+            t.Equals(mem.readIORegister(countReg), 1u, "fractional cycles should accumulate on the new clock");
         });
 
         tc.Run("EE Timer2 compare and overflow flags raise INTC_TIM2 and clear on write-one", [](TestCase &t)

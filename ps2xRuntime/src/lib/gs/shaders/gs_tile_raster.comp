@@ -1,0 +1,374 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, std430) buffer LocalMemory { uint vram[]; };
+layout(binding = 1, std430) readonly buffer ClutMemory { uint clut[]; };
+layout(binding = 2, std430) readonly buffer StagingMemory { uint staging[]; };
+
+struct SpriteDraw
+{
+    int drawX0, drawY0, drawW, drawH;
+    int unclippedX0, unclippedY0, uBaseFixed, uStepFixed;
+    float v0f, v1f, invH;
+    uint zVal;
+    uint rgba;
+    uint fogAndColor;
+    uint frameInfo;   // fbpBlock(14) | fbw(6) | fpsm(6) | tme(1) | abe(1) | pabe(1) | fba(1) | fge(1) | linear(1)
+    uint fbmsk;
+    uint depthInfo;   // zbpBlock(14) | zpsm(6) | zmask(1)
+    uint testLo;
+    uint alphaLo;
+    uint alphaFix;
+    uint tbp0;
+    uint texMeta;     // tbw(6) | tpsm(6) | tfx(2) | tcc(1) | csm(1) | csa(5) | cpsm(6)
+    uint texDim;      // texW(16) | texH(16)
+    uint clampLo;
+    uint clampHi;
+    uint texaPacked;
+    uint stagingTexOff;
+    uint stagingTexRect;
+};
+
+struct TriangleDraw
+{
+    ivec4 bounds;     // minX, minY, width, height
+    ivec4 vx, vy;     // x0, x1, x2, winding
+    vec4 s, t, q;
+    vec4 uv01;
+    vec4 uv2_pad;
+    double z0, z1, z2, invArea;
+    uvec4 rgba;       // c0, c1, c2, fog0|fog1|fog2
+    uint fogColor;
+    uint frameInfo;
+    uint fbmsk;
+    uint depthInfo;   // zbpBlock(14) | zpsm(6) | zmask(1) | iip(1) | fst(1)
+    uint testLo;
+    uint alphaLo;
+    uint alphaFix;
+    uint tbp0;
+    uint texMeta;
+    uint texDim;
+    uint clampLo;
+    uint clampHi;
+    uint texaPacked;
+    uint pad0, pad1, pad2;
+};
+
+struct TileHeader
+{
+    uint tileX;
+    uint tileY;
+    uint offset;
+    uint count;
+};
+
+layout(binding = 3, std430) readonly buffer SpriteList   { SpriteDraw sprites[]; };
+layout(binding = 4, std430) readonly buffer TriangleList { TriangleDraw tris[]; };
+layout(binding = 5, std430) readonly buffer TileHeaders  { TileHeader tiles[]; };
+layout(binding = 6, std430) readonly buffer TileIndices  { uint drawIndices[]; };
+
+layout(push_constant, std430) uniform TileBatchPush
+{
+    uint firstTile;
+} pc;
+
+#include "gs_common.glsl"
+
+double cross2d(ivec2 a, ivec2 b)
+{
+    return double(a.x) * double(b.y) - double(a.y) * double(b.x);
+}
+
+bool covered(double value, ivec2 edge)
+{
+    return value > 0.0lf || (value == 0.0lf && (edge.y < 0 || (edge.y == 0 && edge.x > 0)));
+}
+
+// Single unified texel sampler so the compiler emits readVram/lookupClut only once instead of 9x.
+uint sampleUnifiedTexel(uint tbp0, uint tbw, uint tpsm, int texW, int texH,
+                        uint clampLo, uint clampHi, uint texaPacked,
+                        uint cpsm, uint csm, uint csa,
+                        uint stagingTexOff, uint stagingTexRect, int u, int v)
+{
+    uint wrapU = clampLo & 3u;
+    uint wrapV = (clampLo >> 2u) & 3u;
+    uint minU = (clampLo >> 4u) & 0x3FFu;
+    uint maxU = (clampLo >> 14u) & 0x3FFu;
+    uint minV = ((clampLo >> 24u) & 0xFFu) | ((clampHi & 3u) << 8u);
+    uint maxV = (clampHi >> 2u) & 0x3FFu;
+    int su = wrapTexCoord(u, texW, wrapU, minU, maxU);
+    int sv = wrapTexCoord(v, texH, wrapV, minV, maxV);
+
+    if ((stagingTexOff & 0x80000000u) != 0u)
+    {
+        uint baseWord = (stagingTexOff & 0x7FFFFFFFu) >> 2u;
+        uint dsax = stagingTexRect & 0x7FFu;
+        uint dsay = (stagingTexRect >> 11u) & 0x7FFu;
+        uint rrw  = (stagingTexRect >> 22u) & 0x3FFu;
+        return staging[baseWord + (uint(sv) - dsay) * rrw + (uint(su) - dsax)];
+    }
+
+    uint raw = readVram(tpsm, tbp0, max(tbw, 1u), uint(su), uint(sv));
+    if (tpsm == PSM_CT32 || tpsm == PSM_Z32 || tpsm == PSM_CT24 || tpsm == PSM_Z24)
+        return applyTexa(texaPacked, tpsm, raw);
+    if (tpsm == PSM_CT16 || tpsm == PSM_CT16S || tpsm == PSM_Z16 || tpsm == PSM_Z16S)
+        return applyTexa(texaPacked, tpsm, rgba5551To8888(raw));
+    if (tpsm == PSM_T8 || tpsm == PSM_T8H || tpsm == PSM_T4 || tpsm == PSM_T4HL || tpsm == PSM_T4HH)
+        return lookupClut(texaPacked, raw, cpsm, csm, csa, tpsm);
+    return 0xFFFF00FFu;
+}
+
+void main()
+{
+    TileHeader hdr = tiles[pc.firstTile + gl_WorkGroupID.x];
+    int px = int(hdr.tileX * 16u + gl_LocalInvocationID.x);
+    int py = int(hdr.tileY * 16u + gl_LocalInvocationID.y);
+    uint end = hdr.offset + hdr.count;
+
+    for (uint k = hdr.offset; k < end; ++k)
+    {
+        uint entry = drawIndices[k];
+        bool isTri = (entry & 0x80000000u) != 0u;
+        uint drawIdx = entry & 0x7FFFFFFFu;
+
+        uint zVal = 0u;
+        ivec4 color = ivec4(0);
+        uint fog = 0u;
+        ivec3 fogColor = ivec3(0);
+        uint frameInfo = 0u, fbmsk = 0u, depthInfo = 0u;
+        uint testLo = 0u, alphaLo = 0u, alphaFix = 0u;
+        uint tbp0 = 0u, texMeta = 0u, texDim = 0u, clampLo = 0u, clampHi = 0u, texaPacked = 0u;
+        uint stagingTexOff = 0u, stagingTexRect = 0u;
+
+        // Texture coordinates for unified sampling (shared between sprite & triangle).
+        bool useSpriteBilinear = false;
+        bool useTriBilinear = false;
+        int u0 = 0, v0 = 0;
+        uint fx4 = 0u, fy4 = 0u;
+        precise float fx = 0.0, fy = 0.0;
+
+        if (!isTri)
+        {
+            int lx = px - sprites[drawIdx].drawX0;
+            int ly = py - sprites[drawIdx].drawY0;
+            if (lx < 0 || ly < 0 || lx >= sprites[drawIdx].drawW || ly >= sprites[drawIdx].drawH)
+                continue;
+
+            SpriteDraw d = sprites[drawIdx];
+            zVal = d.zVal;
+            color = unpackRgba(d.rgba);
+            fog = d.fogAndColor & 0xFFu;
+            fogColor = ivec3((d.fogAndColor >> 8u) & 0xFFu,
+                             (d.fogAndColor >> 16u) & 0xFFu,
+                             (d.fogAndColor >> 24u) & 0xFFu);
+            frameInfo = d.frameInfo;
+            fbmsk = d.fbmsk;
+            depthInfo = d.depthInfo;
+            testLo = d.testLo;
+            alphaLo = d.alphaLo;
+            alphaFix = d.alphaFix;
+
+            if (((frameInfo >> 26u) & 1u) != 0u)
+            {
+                bool linear = ((frameInfo >> 31u) & 1u) != 0u;
+                tbp0 = d.tbp0;
+                texMeta = d.texMeta;
+                texDim = d.texDim;
+                clampLo = d.clampLo;
+                clampHi = d.clampHi;
+                texaPacked = d.texaPacked;
+                stagingTexOff = d.stagingTexOff;
+                stagingTexRect = d.stagingTexRect;
+
+                float ty = (float(py - d.unclippedY0) + 0.5) * d.invH;
+                float texVf = d.v0f + (d.v1f - d.v0f) * ty;
+                int vFixed = int((texVf - (linear ? 0.5 : 0.0)) * 65536.0);
+                int uCur = d.uBaseFixed + lx * d.uStepFixed;
+                u0 = uCur >> 16;
+                v0 = vFixed >> 16;
+                fx4 = uint((uCur >> 12) & 15);
+                fy4 = uint((vFixed >> 12) & 15);
+                useSpriteBilinear = linear && (fx4 != 0u || fy4 != 0u);
+            }
+        }
+        else
+        {
+            ivec4 bnd = tris[drawIdx].bounds;
+            int lx = px - bnd.x;
+            int ly = py - bnd.y;
+            if (lx < 0 || ly < 0 || lx >= bnd.z || ly >= bnd.w)
+                continue;
+
+            TriangleDraw d = tris[drawIdx];
+            ivec2 p = ivec2(px, py) * 16;
+            ivec2 a = ivec2(d.vx.x, d.vy.x);
+            ivec2 b = ivec2(d.vx.y, d.vy.y);
+            ivec2 c = ivec2(d.vx.z, d.vy.z);
+            int winding = d.vx.w;
+
+            ivec2 d0 = (c - b) * winding;
+            ivec2 d1 = (a - c) * winding;
+            ivec2 d2 = (b - a) * winding;
+            precise double e0 = cross2d(d0, p - b);
+            precise double e1 = cross2d(d1, p - c);
+            precise double e2 = cross2d(d2, p - a);
+            if (!covered(e0, d0) || !covered(e1, d1) || !covered(e2, d2))
+                continue;
+
+            precise double weight0 = e0 * d.invArea;
+            precise double weight1 = e1 * d.invArea;
+            precise float w0 = float(weight0);
+            precise float w1 = float(weight1);
+            precise float w2 = float(e2 * d.invArea);
+            precise double z = d.z2 + (d.z0 - d.z2) * weight0 + (d.z1 - d.z2) * weight1;
+            zVal = uint(clamp(z, 0.0lf, 4294967295.0lf));
+
+            frameInfo = d.frameInfo;
+            fbmsk = d.fbmsk;
+            depthInfo = d.depthInfo;
+            testLo = d.testLo;
+            alphaLo = d.alphaLo;
+            alphaFix = d.alphaFix;
+
+            bool iip = ((depthInfo >> 21u) & 1u) != 0u;
+            bool fst = ((depthInfo >> 22u) & 1u) != 0u;
+            ivec4 c0 = unpackRgba(d.rgba.x);
+            ivec4 c1 = unpackRgba(d.rgba.y);
+            ivec4 c2 = unpackRgba(d.rgba.z);
+            if (iip)
+            {
+                precise vec4 cf = vec4(c2) + vec4(c0 - c2) * w0 + vec4(c1 - c2) * w1;
+                color = clamp(ivec4(cf), 0, 255);
+            }
+            else
+            {
+                color = c2;
+            }
+            fog = uint(clamp(int(float((d.rgba.w >> 16u) & 255u) +
+                                 float(int(d.rgba.w & 255u) - int((d.rgba.w >> 16u) & 255u)) * w0 +
+                                 float(int((d.rgba.w >> 8u) & 255u) - int((d.rgba.w >> 16u) & 255u)) * w1), 0, 255));
+            fogColor = ivec3(d.fogColor & 255u, (d.fogColor >> 8u) & 255u, (d.fogColor >> 16u) & 255u);
+
+            if (((frameInfo >> 26u) & 1u) != 0u)
+            {
+                bool linear = ((frameInfo >> 31u) & 1u) != 0u;
+                tbp0 = d.tbp0;
+                texMeta = d.texMeta;
+                texDim = d.texDim;
+                clampLo = d.clampLo;
+                clampHi = d.clampHi;
+                texaPacked = d.texaPacked;
+                int texW = int(texDim & 0xFFFFu);
+                int texH = int(texDim >> 16u);
+
+                precise float texUf, texVf;
+                if (fst)
+                {
+                    uint iu = uint(d.uv01.x * w0 + d.uv01.z * w1 + d.uv2_pad.x * w2) & 0xFFFFu;
+                    uint iv = uint(d.uv01.y * w0 + d.uv01.w * w1 + d.uv2_pad.y * w2) & 0xFFFFu;
+                    texUf = float(iu) / 16.0;
+                    texVf = float(iv) / 16.0;
+                }
+                else
+                {
+                    precise float is = d.s.x * w0 + d.s.y * w1 + d.s.z * w2;
+                    precise float it = d.t.x * w0 + d.t.y * w1 + d.t.z * w2;
+                    precise float iq = d.q.x * w0 + d.q.y * w1 + d.q.z * w2;
+                    precise float invQ = 1.0 / (abs(iq) > 1.0e-8 ? iq : 1.0);
+                    texUf = is * invQ * float(texW);
+                    texVf = it * invQ * float(texH);
+                }
+
+                if (!linear)
+                {
+                    u0 = int(texUf);
+                    v0 = int(texVf);
+                }
+                else
+                {
+                    precise float su = texUf - 0.5;
+                    precise float sv = texVf - 0.5;
+                    u0 = int(floor(su));
+                    v0 = int(floor(sv));
+                    fx = su - float(u0);
+                    fy = sv - float(v0);
+                    useTriBilinear = true;
+                }
+            }
+        }
+
+        if (((frameInfo >> 26u) & 1u) != 0u)
+        {
+            uint tbw = max(texMeta & 0x3Fu, 1u);
+            uint tpsm = (texMeta >> 6u) & 0x3Fu;
+            uint tfx = (texMeta >> 12u) & 3u;
+            uint tcc = (texMeta >> 14u) & 1u;
+            uint csm = (texMeta >> 15u) & 1u;
+            uint csa = (texMeta >> 16u) & 0x1Fu;
+            uint cpsm = (texMeta >> 21u) & 0x3Fu;
+            int texW = int(texDim & 0xFFFFu);
+            int texH = int(texDim >> 16u);
+
+            ivec4 texColor;
+            int tapCount = (useSpriteBilinear || useTriBilinear) ? 4 : 1;
+            uint taps[4];
+            for (int tap = 0; tap < tapCount; ++tap)
+            {
+                int du = tap & 1;
+                int dv = tap >> 1;
+                taps[tap] = sampleUnifiedTexel(tbp0, tbw, tpsm, texW, texH,
+                                               clampLo, clampHi, texaPacked,
+                                               cpsm, csm, csa,
+                                               stagingTexOff, stagingTexRect, u0 + du, v0 + dv);
+            }
+
+            if (useSpriteBilinear)
+            {
+                uint ifx4 = 16u - fx4;
+                uint ify4 = 16u - fy4;
+                uint w00 = ifx4 * ify4, w10 = fx4 * ify4, w01 = ifx4 * fy4, w11 = fx4 * fy4;
+                uint tr = ((taps[0] & 0xFFu) * w00 + (taps[1] & 0xFFu) * w10 + (taps[2] & 0xFFu) * w01 + (taps[3] & 0xFFu) * w11 + 128u) >> 8u;
+                uint tg = (((taps[0] >> 8u) & 0xFFu) * w00 + ((taps[1] >> 8u) & 0xFFu) * w10 + ((taps[2] >> 8u) & 0xFFu) * w01 + ((taps[3] >> 8u) & 0xFFu) * w11 + 128u) >> 8u;
+                uint tb = (((taps[0] >> 16u) & 0xFFu) * w00 + ((taps[1] >> 16u) & 0xFFu) * w10 + ((taps[2] >> 16u) & 0xFFu) * w01 + ((taps[3] >> 16u) & 0xFFu) * w11 + 128u) >> 8u;
+                uint ta = (((taps[0] >> 24u) & 0xFFu) * w00 + ((taps[1] >> 24u) & 0xFFu) * w10 + ((taps[2] >> 24u) & 0xFFu) * w01 + ((taps[3] >> 24u) & 0xFFu) * w11 + 128u) >> 8u;
+                texColor = ivec4(int(tr), int(tg), int(tb), int(ta));
+            }
+            else if (useTriBilinear)
+            {
+                vec4 c00 = vec4(unpackRgba(taps[0]));
+                vec4 c10 = vec4(unpackRgba(taps[1]));
+                vec4 c01 = vec4(unpackRgba(taps[2]));
+                vec4 c11 = vec4(unpackRgba(taps[3]));
+                precise vec4 top = c00 + (c10 - c00) * fx;
+                precise vec4 bottom = c01 + (c11 - c01) * fx;
+                precise vec4 filtered = top + (bottom - top) * fy + vec4(0.5);
+                texColor = clamp(ivec4(filtered), 0, 255);
+            }
+            else
+            {
+                texColor = unpackRgba(taps[0]);
+            }
+            color = combineTex(tfx, tcc, color, texColor);
+        }
+
+        uint fbpBlock = frameInfo & 0x3FFFu;
+        uint fbw = max((frameInfo >> 14u) & 0x3Fu, 1u);
+        uint fpsm = (frameInfo >> 20u) & 0x3Fu;
+        bool abe  = ((frameInfo >> 27u) & 1u) != 0u;
+        bool pabe = ((frameInfo >> 28u) & 1u) != 0u;
+        bool fba  = ((frameInfo >> 29u) & 1u) != 0u;
+        bool fge  = ((frameInfo >> 30u) & 1u) != 0u;
+
+        uint zbpBlock = depthInfo & 0x3FFFu;
+        uint zpsm = (depthInfo >> 14u) & 0x3Fu;
+        bool zmask = ((depthInfo >> 20u) & 1u) != 0u;
+
+        writeGsPixel(uint(px), uint(py), zVal, color, fog,
+                     fbpBlock, fbw, fpsm, fbmsk,
+                     zbpBlock, zpsm, zmask,
+                     testLo, alphaLo, alphaFix,
+                     abe, pabe, fba, fge, fogColor);
+    }
+}

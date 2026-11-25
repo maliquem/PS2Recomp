@@ -260,26 +260,31 @@ elseif(WIN32)
     set(FFMPEG_PREBUILT_URL
         "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
 
-    set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
+    set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix" CACHE PATH "Prefix directory for prebuilt FFmpeg")
     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
     set(FFMPEG_INCLUDE_DIR "${FFMPEG_SOURCE_DIR}/include")
     set(FFMPEG_LIB_DIR "${FFMPEG_SOURCE_DIR}/bin")
     set(FFMPEG_BIN_DIR "${FFMPEG_SOURCE_DIR}/bin")
 
-    ExternalProject_Add(ffmpeg_external
-        URL "${FFMPEG_PREBUILT_URL}"
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-        PREFIX "${FFMPEG_PREFIX_DIR}"
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND ""
-        INSTALL_COMMAND ""
-        BUILD_BYPRODUCTS
-        "${FFMPEG_LIB_DIR}/avcodec.lib"
-        "${FFMPEG_LIB_DIR}/avformat.lib"
-        "${FFMPEG_LIB_DIR}/avutil.lib"
-        "${FFMPEG_LIB_DIR}/swresample.lib"
-        "${FFMPEG_LIB_DIR}/swscale.lib"
-    )
+    if(EXISTS "${FFMPEG_LIB_DIR}/avcodec.lib" AND EXISTS "${FFMPEG_INCLUDE_DIR}/libavcodec/avcodec.h")
+        message(STATUS "Using existing prebuilt FFmpeg at ${FFMPEG_SOURCE_DIR}")
+        add_custom_target(ffmpeg_external)
+    else()
+        ExternalProject_Add(ffmpeg_external
+            URL "${FFMPEG_PREBUILT_URL}"
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+            PREFIX "${FFMPEG_PREFIX_DIR}"
+            CONFIGURE_COMMAND ""
+            BUILD_COMMAND ""
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS
+            "${FFMPEG_LIB_DIR}/avcodec.lib"
+            "${FFMPEG_LIB_DIR}/avformat.lib"
+            "${FFMPEG_LIB_DIR}/avutil.lib"
+            "${FFMPEG_LIB_DIR}/swresample.lib"
+            "${FFMPEG_LIB_DIR}/swscale.lib"
+        )
+    endif()
 
     # Link against the import libraries shipped with the Windows DLLs.
     add_library(ffmpeg_avcodec STATIC IMPORTED GLOBAL)
@@ -383,6 +388,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_vulkan_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -507,6 +513,9 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(UNIX AND NOT PS2X_IS_VITA)
+    target_link_libraries(ps2_runtime PUBLIC ${CMAKE_DL_LIBS})
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime

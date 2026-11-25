@@ -8,11 +8,14 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 using namespace GSInternal;
@@ -292,11 +295,11 @@ namespace
         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
     }
 
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+    inline uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
     {
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
     }
 }
 
@@ -534,6 +537,7 @@ void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
     m_clutCbp.fill(0u);
+    m_clutLutValid = false;
     m_texturePageCache.Invalidate();
     m_transfer = {};
     m_transfer.direction = 3u;
@@ -596,6 +600,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     if (!sixteenBit && !thirtyTwoBit)
         return;
 
+    m_clutLutValid = false;
     const uint32_t entryCount = fourBit ? 16u : 256u;
     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
     const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
@@ -1120,8 +1125,12 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     const float sampleU = texUf - 0.5f;
     const float sampleV = texVf - 0.5f;
-    const int u0 = static_cast<int>(std::floor(sampleU));
-    const int v0 = static_cast<int>(std::floor(sampleV));
+    int u0 = static_cast<int>(sampleU);
+    if (sampleU < static_cast<float>(u0))
+        --u0;
+    int v0 = static_cast<int>(sampleV);
+    if (sampleV < static_cast<float>(v0))
+        --v0;
     const int u1 = u0 + 1;
     const int v1 = v0 + 1;
     const float fx = sampleU - static_cast<float>(u0);
@@ -1209,13 +1218,71 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         const int texW = state.textureWidth;
         const int texH = state.textureHeight;
 
+        const bool fixedBlend = (alphaMode == 0x68u);
+        if (spanX == 16 && spanY == 8 && texW == 16 && texH == 16 &&
+            tex.psm == GS_PSM_CT32 && tex.tbw == 1 && tex.tfx == 0 && tex.tcc == 1 &&
+            ctx.frame.psm == GS_PSM_CT32 && !ctx.frame.fbmsk && ctx.zbuf.psm == GS_PSM_Z16S &&
+            !ctx.zbuf.zmask && !(ctx.fba & 1u) && ctx.test == 0x5000du && ctx.clamp == 5u &&
+            state.prim.fst && state.prim.abe && !state.prim.fge && !state.pabe && !state.linearFilter &&
+            (alphaMode == 0x44u || fixedBlend) && r == 128 && g == 128 && b == 128 && a == 128 &&
+            v0.u == 0 && v1.u == 256 && (v0.v == 0 || v0.v == 128) && v1.v == v0.v + 128)
+        {
+            constexpr uint32_t vramMask = GSMem::MEMORY_SIZE - 1u;
+            const uint32_t frameBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+            const uint32_t depthBlock = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+            const uint32_t width = std::max<uint32_t>(ctx.frame.fbw, 1u);
+            const uint32_t texV = v0.v / 16u;
+            const uint32_t textureBlocks[2] = {
+                GSPSMCT32::addrPSMCT32(tex.tbp0, 1u, 0u, texV) & vramMask,
+                GSPSMCT32::addrPSMCT32(tex.tbp0, 1u, 8u, texV) & vramMask};
+            const uint8_t *texels[2]{};
+            const auto blend = [&](int src, int dst, int srcAlpha) {
+                const int delta = fixedBlend ? src * alphaFix : (src - dst) * srcAlpha;
+                return clampU8(dst + (delta >> 7));
+            };
+            for (int y = drawY0; y <= drawY1; ++y)
+            {
+                const auto &texelOffsets = GSPSMCT32::columnTable32[y - unclippedY0];
+                for (int x = drawX0; x <= drawX1; ++x)
+                {
+                    const uint32_t depthAddress = GSPSMCT16::addrPSMZ16S(depthBlock, width, x, y) & vramMask;
+                    uint16_t storedDepth;
+                    std::memcpy(&storedDepth, m_vram + depthAddress, sizeof(storedDepth));
+                    if (z1 < storedDepth)
+                        continue;
+
+                    const int u = x - unclippedX0;
+                    const int block = u >> 3;
+                    // A fully depth-rejected block must stay uncached. These two blocks occupy different slots.
+                    if (!texels[block])
+                        texels[block] = m_texturePageCache.Resolve(m_vram, textureBlocks[block]);
+                    uint32_t src;
+                    std::memcpy(&src, texels[block] + texelOffsets[u & 7] * 4u, sizeof(src));
+                    const uint8_t srcAlpha = static_cast<uint8_t>(src >> 24);
+                    if (srcAlpha == 0)
+                        continue;
+
+                    const uint32_t colorAddress = GSPSMCT32::addrPSMCT32(frameBlock, width, x, y) & vramMask;
+                    uint32_t dst;
+                    std::memcpy(&dst, m_vram + colorAddress, sizeof(dst));
+                    const uint32_t color = pack32(blend(src & 255u, dst & 255u, srcAlpha),
+                                                  blend((src >> 8) & 255u, (dst >> 8) & 255u, srcAlpha),
+                                                  blend((src >> 16) & 255u, (dst >> 16) & 255u, srcAlpha), srcAlpha);
+                    const uint16_t depth = static_cast<uint16_t>(z1);
+                    std::memcpy(m_vram + colorAddress, &color, sizeof(color));
+                    std::memcpy(m_vram + depthAddress, &depth, sizeof(depth));
+                }
+            }
+            return;
+        }
+
         float u0f, v0f, u1f, v1f;
         if (state.prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -1233,6 +1300,297 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             spriteW = 1.0f;
         if (spriteH < 1.0f)
             spriteH = 1.0f;
+
+        const bool ateEnabled = (ctx.test & 1u) != 0u;
+        const bool dateEnabled = ((ctx.test >> 14) & 1u) != 0u;
+        const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+        const bool supportedFastTex =
+            tex.psm == GS_PSM_CT32 || tex.psm == GS_PSM_CT16 || tex.psm == GS_PSM_CT16S ||
+            tex.psm == GS_PSM_T8 || tex.psm == GS_PSM_T8H || tex.psm == GS_PSM_T4;
+        if (supportedFastTex && ctx.frame.psm == GS_PSM_CT32 &&
+            !state.prim.fge && !state.pabe && !dateEnabled)
+        {
+            if (ztestMethod == 0u)
+                return;
+
+            const uint8_t atst = static_cast<uint8_t>((ctx.test >> 1) & 0x7u);
+            const uint8_t aref = static_cast<uint8_t>((ctx.test >> 4) & 0xFFu);
+            const uint8_t afail = static_cast<uint8_t>((ctx.test >> 12) & 0x3u);
+            const bool alphaAlwaysPasses = !ateEnabled || atst == 1u ||
+                                           (atst == 3u && aref == 255u) ||
+                                           (atst == 5u && aref == 0u);
+            const bool constantAlpha = alphaAlwaysPasses || (tex.tcc == 0u);
+            const PixelWriteMask constMask = alphaAlwaysPasses
+                                                 ? PixelWriteMask{}
+                                                 : (constantAlpha ? classifyAlphaTest(ctx.test, a, GS_PSM_CT32) : PixelWriteMask{});
+            if (constantAlpha && !constMask.writesAnything())
+                return;
+
+            const uint32_t *clutLut = nullptr;
+            if (tex.psm == GS_PSM_T8 || tex.psm == GS_PSM_T8H || tex.psm == GS_PSM_T4)
+            {
+                const uint64_t key =
+                    static_cast<uint64_t>(tex.cpsm) |
+                    (static_cast<uint64_t>(tex.csm) << 8u) |
+                    (static_cast<uint64_t>(tex.csa) << 16u) |
+                    (static_cast<uint64_t>(tex.psm) << 24u) |
+                    (static_cast<uint64_t>(state.texa.ta0) << 32u) |
+                    (static_cast<uint64_t>(state.texa.ta1) << 40u) |
+                    (static_cast<uint64_t>(state.texa.aem ? 1u : 0u) << 48u);
+                if (!m_clutLutValid || m_clutLutKey != key)
+                {
+                    const uint32_t entries = (tex.psm == GS_PSM_T4) ? 16u : 256u;
+                    for (uint32_t i = 0u; i < entries; ++i)
+                        m_clutLutCache[i] = LookupCLUT(state, static_cast<uint8_t>(i), tex.cpsm, tex.csm, tex.csa, tex.psm);
+                    m_clutLutKey = key;
+                    m_clutLutValid = true;
+                }
+                clutLut = m_clutLutCache.data();
+            }
+
+            const uint32_t fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+            const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
+            const uint32_t zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+            const uint32_t zpsm = ctx.zbuf.psm;
+            const ReadVramFunc readZFn = (ztestMethod >= 2u && zpsm < kPsmHandlerCount) ? m_readVramFuncs[zpsm] : nullptr;
+            const WriteVramFunc writeZFn = (!ctx.zbuf.zmask && zpsm < kPsmHandlerCount) ? m_writeVramFuncs[zpsm] : nullptr;
+            const bool zWriteAllowed = writeZFn != nullptr;
+            const uint32_t tbp0 = tex.tbp0;
+            const uint32_t tbw = std::max<uint32_t>(tex.tbw, 1u);
+            const uint64_t clamp = ctx.clamp;
+            const uint8_t wrapU = static_cast<uint8_t>(clamp & 0x3u);
+            const uint8_t wrapV = static_cast<uint8_t>((clamp >> 2) & 0x3u);
+            const uint16_t minU = static_cast<uint16_t>((clamp >> 4) & 0x3FFu);
+            const uint16_t maxU = static_cast<uint16_t>((clamp >> 14) & 0x3FFu);
+            const uint16_t minV = static_cast<uint16_t>((clamp >> 24) & 0x3FFu);
+            const uint16_t maxV = static_cast<uint16_t>((clamp >> 34) & 0x3FFu);
+            const bool abe = state.prim.abe;
+            const uint8_t asel = static_cast<uint8_t>(alphaReg & 3u);
+            const uint8_t bsel = static_cast<uint8_t>((alphaReg >> 2) & 3u);
+            const uint8_t csel = static_cast<uint8_t>((alphaReg >> 4) & 3u);
+            const uint8_t dsel = static_cast<uint8_t>((alphaReg >> 6) & 3u);
+            const uint32_t fbmsk = ctx.frame.fbmsk;
+            const bool fbaSet = (ctx.fba & 1ull) != 0ull;
+            const bool linear = state.linearFilter;
+            const bool identityCombine =
+                (tex.tfx == 1u) ||
+                (tex.tfx == 0u && r == 128u && g == 128u && b == 128u && (tex.tcc == 0u || a == 128u));
+            const bool simpleKeepAlpha = !constantAlpha && (afail == 0u);
+            const float invW = 1.0f / spriteW;
+            const float invH = 1.0f / spriteH;
+            const float duPerPx = (u1f - u0f) * invW;
+            const float uStart = u0f + (static_cast<float>(drawX0 - unclippedX0) + 0.5f) * duPerPx;
+            const int32_t uStepFixed = static_cast<int32_t>(duPerPx * 65536.0f);
+            const int32_t uBaseFixed = static_cast<int32_t>((uStart - (linear ? 0.5f : 0.0f)) * 65536.0f);
+
+            auto pickRGB = [](uint8_t sel, int cs, int cd) -> int
+            {
+                return (sel == 0u) ? cs : ((sel == 1u) ? cd : 0);
+            };
+
+            auto runFastSprite = [&](auto &&readTexelRaw)
+            {
+                for (int y = drawY0; y <= drawY1; ++y)
+                {
+                    const float ty = (static_cast<float>(y - unclippedY0) + 0.5f) * invH;
+                    const float texVf = v0f + (v1f - v0f) * ty;
+                    const int32_t vFixed = static_cast<int32_t>((texVf - (linear ? 0.5f : 0.0f)) * 65536.0f);
+                    const int v0i = wrapTextureCoordinate(vFixed >> 16, texH, wrapV, minV, maxV);
+                    const int v1i = linear ? wrapTextureCoordinate((vFixed >> 16) + 1, texH, wrapV, minV, maxV) : v0i;
+                    const uint32_t fy4 = static_cast<uint32_t>((vFixed >> 12) & 15);
+                    const uint32_t ify4 = 16u - fy4;
+                    int32_t uCur = uBaseFixed;
+
+                    for (int x = drawX0; x <= drawX1; ++x, uCur += uStepFixed)
+                    {
+                        if (readZFn)
+                        {
+                            uint32_t storedZ;
+                            if (zpsm == GS_PSM_Z16S)
+                            {
+                                const uint32_t za = GSPSMCT16::addrPSMZ16S(zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) & (GSMem::MEMORY_SIZE - 1u);
+                                uint16_t zv = 0u;
+                                std::memcpy(&zv, m_vram + za, sizeof(zv));
+                                storedZ = zv;
+                            }
+                            else
+                            {
+                                storedZ = readZFn(m_vram, zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                            }
+                            const bool zpass = (ztestMethod == 2u) ? (z1 >= storedZ) : (z1 > storedZ);
+                            if (!zpass)
+                                continue;
+                        }
+
+                        uint32_t texel;
+                        if (!linear || (fy4 == 0u && ((uCur >> 12) & 15) == 0))
+                        {
+                            const int u0i = wrapTextureCoordinate(uCur >> 16, texW, wrapU, minU, maxU);
+                            texel = readTexelRaw(u0i, v0i);
+                        }
+                        else
+                        {
+                            const int uRaw = uCur >> 16;
+                            const int u0i = wrapTextureCoordinate(uRaw, texW, wrapU, minU, maxU);
+                            const int u1i = wrapTextureCoordinate(uRaw + 1, texW, wrapU, minU, maxU);
+                            const uint32_t fx4 = static_cast<uint32_t>((uCur >> 12) & 15);
+                            const uint32_t ifx4 = 16u - fx4;
+                            const uint32_t w00 = ifx4 * ify4;
+                            const uint32_t w10 = fx4 * ify4;
+                            const uint32_t w01 = ifx4 * fy4;
+                            const uint32_t w11 = fx4 * fy4;
+                            const uint32_t c00 = readTexelRaw(u0i, v0i);
+                            const uint32_t c10 = readTexelRaw(u1i, v0i);
+                            const uint32_t c01 = readTexelRaw(u0i, v1i);
+                            const uint32_t c11 = readTexelRaw(u1i, v1i);
+                            const uint32_t tr = ((c00 & 0xFFu) * w00 + (c10 & 0xFFu) * w10 + (c01 & 0xFFu) * w01 + (c11 & 0xFFu) * w11 + 128u) >> 8;
+                            const uint32_t tg = (((c00 >> 8) & 0xFFu) * w00 + ((c10 >> 8) & 0xFFu) * w10 + ((c01 >> 8) & 0xFFu) * w01 + ((c11 >> 8) & 0xFFu) * w11 + 128u) >> 8;
+                            const uint32_t tb = (((c00 >> 16) & 0xFFu) * w00 + ((c10 >> 16) & 0xFFu) * w10 + ((c01 >> 16) & 0xFFu) * w01 + ((c11 >> 16) & 0xFFu) * w11 + 128u) >> 8;
+                            const uint32_t ta = (((c00 >> 24) & 0xFFu) * w00 + ((c10 >> 24) & 0xFFu) * w10 + ((c01 >> 24) & 0xFFu) * w01 + ((c11 >> 24) & 0xFFu) * w11 + 128u) >> 8;
+                            texel = tr | (tg << 8) | (tb << 16) | (ta << 24);
+                        }
+
+                        TextureCombineResult color;
+                        if (identityCombine)
+                        {
+                            color.r = static_cast<uint8_t>(texel & 0xFFu);
+                            color.g = static_cast<uint8_t>((texel >> 8) & 0xFFu);
+                            color.b = static_cast<uint8_t>((texel >> 16) & 0xFFu);
+                            color.a = tex.tcc ? static_cast<uint8_t>((texel >> 24) & 0xFFu) : a;
+                        }
+                        else
+                        {
+                            color = combineTexture(
+                                tex, r, g, b, a,
+                                static_cast<uint8_t>(texel & 0xFFu),
+                                static_cast<uint8_t>((texel >> 8) & 0xFFu),
+                                static_cast<uint8_t>((texel >> 16) & 0xFFu),
+                                static_cast<uint8_t>((texel >> 24) & 0xFFu));
+                        }
+
+                        PixelWriteMask mask = constMask;
+                        if (simpleKeepAlpha)
+                        {
+                            bool pass = true;
+                            switch (atst)
+                            {
+                            case 0: pass = false; break;
+                            case 2: pass = color.a < aref; break;
+                            case 3: pass = color.a <= aref; break;
+                            case 4: pass = color.a == aref; break;
+                            case 5: pass = color.a >= aref; break;
+                            case 6: pass = color.a > aref; break;
+                            case 7: pass = color.a != aref; break;
+                            default: break;
+                            }
+                            if (!pass)
+                                continue;
+                        }
+                        else if (!constantAlpha)
+                        {
+                            mask = classifyAlphaTest(ctx.test, color.a, GS_PSM_CT32);
+                            if (!mask.writesAnything())
+                                continue;
+                        }
+
+                        if (mask.writesFramebuffer())
+                        {
+                            uint8_t outR = color.r;
+                            uint8_t outG = color.g;
+                            uint8_t outB = color.b;
+                            uint8_t outA = (mask.writeAlpha && fbaSet) ? static_cast<uint8_t>(color.a | 0x80u) : color.a;
+                            const bool preserveDstAlpha = mask.writeRgb && !mask.writeAlpha;
+
+                            const uint32_t dstAddr = GSPSMCT32::addrPSMCT32(fbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) & (GSMem::MEMORY_SIZE - 1u);
+                            uint32_t dstPx = 0u;
+                            if (abe || fbmsk != 0u || preserveDstAlpha)
+                                std::memcpy(&dstPx, m_vram + dstAddr, sizeof(dstPx));
+                            if (abe)
+                            {
+                                const int dr = static_cast<int>(dstPx & 0xFFu);
+                                const int dg = static_cast<int>((dstPx >> 8) & 0xFFu);
+                                const int db = static_cast<int>((dstPx >> 16) & 0xFFu);
+                                const int da = static_cast<int>((dstPx >> 24) & 0xFFu);
+                                const int cAlpha = (csel == 0u) ? static_cast<int>(color.a) : ((csel == 1u) ? da : static_cast<int>(alphaFix));
+                                outR = clampU8(((pickRGB(asel, outR, dr) - pickRGB(bsel, outR, dr)) * cAlpha >> 7) + pickRGB(dsel, outR, dr));
+                                outG = clampU8(((pickRGB(asel, outG, dg) - pickRGB(bsel, outG, dg)) * cAlpha >> 7) + pickRGB(dsel, outG, dg));
+                                outB = clampU8(((pickRGB(asel, outB, db) - pickRGB(bsel, outB, db)) * cAlpha >> 7) + pickRGB(dsel, outB, db));
+                            }
+                            uint32_t outPx = pack32(outR, outG, outB, outA);
+                            if (fbmsk != 0u)
+                                outPx = (outPx & ~fbmsk) | (dstPx & fbmsk);
+                            if (preserveDstAlpha)
+                                outPx = (outPx & 0x00FFFFFFu) | (dstPx & 0xFF000000u);
+                            std::memcpy(m_vram + dstAddr, &outPx, sizeof(outPx));
+                        }
+                        if (mask.writeDepth && zWriteAllowed)
+                        {
+                            if (zpsm == GS_PSM_Z16S)
+                            {
+                                const uint32_t za = GSPSMCT16::addrPSMZ16S(zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) & (GSMem::MEMORY_SIZE - 1u);
+                                const uint16_t zv = static_cast<uint16_t>(z1);
+                                std::memcpy(m_vram + za, &zv, sizeof(zv));
+                            }
+                            else
+                            {
+                                writeZFn(m_vram, zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), z1);
+                            }
+                        }
+                    }
+                }
+            };
+
+            switch (tex.psm)
+            {
+            case GS_PSM_CT32:
+                runFastSprite([&](int su, int sv) -> uint32_t
+                {
+                    const uint32_t addr = GSPSMCT32::addrPSMCT32(tbp0, tbw, static_cast<uint32_t>(su), static_cast<uint32_t>(sv)) & (GSMem::MEMORY_SIZE - 1u);
+                    uint32_t px = 0u;
+                    std::memcpy(&px, m_texturePageCache.Resolve(m_vram, addr), sizeof(px));
+                    return px;
+                });
+                return;
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+                runFastSprite([&](int su, int sv) -> uint32_t
+                {
+                    const uint32_t addr = addrPSMCT16Family(tbp0, tbw, tex.psm, static_cast<uint32_t>(su), static_cast<uint32_t>(sv)) & (GSMem::MEMORY_SIZE - 1u);
+                    uint16_t raw = 0u;
+                    std::memcpy(&raw, m_texturePageCache.Resolve(m_vram, addr), sizeof(raw));
+                    return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(raw));
+                });
+                return;
+            case GS_PSM_T8:
+                runFastSprite([&](int su, int sv) -> uint32_t
+                {
+                    const uint32_t addr = GSPSMT8::addrPSMT8(tbp0, tbw, static_cast<uint32_t>(su), static_cast<uint32_t>(sv)) & (GSMem::MEMORY_SIZE - 1u);
+                    return clutLut[*m_texturePageCache.Resolve(m_vram, addr)];
+                });
+                return;
+            case GS_PSM_T8H:
+                runFastSprite([&](int su, int sv) -> uint32_t
+                {
+                    const uint32_t addr = GSPSMCT32::addrPSMCT32(tbp0, tbw, static_cast<uint32_t>(su), static_cast<uint32_t>(sv)) & (GSMem::MEMORY_SIZE - 1u);
+                    uint32_t raw = 0u;
+                    std::memcpy(&raw, m_texturePageCache.Resolve(m_vram, addr), sizeof(raw));
+                    return clutLut[raw >> 24u];
+                });
+                return;
+            case GS_PSM_T4:
+                runFastSprite([&](int su, int sv) -> uint32_t
+                {
+                    const uint32_t nibbleAddr = GSPSMT4::addrPSMT4(tbp0, tbw, static_cast<uint32_t>(su), static_cast<uint32_t>(sv));
+                    const uint32_t byteAddr = (nibbleAddr >> 1u) & (GSMem::MEMORY_SIZE - 1u);
+                    const uint8_t packed = *m_texturePageCache.Resolve(m_vram, byteAddr);
+                    const uint8_t idx = (nibbleAddr & 1u) ? (packed >> 4u) : (packed & 0x0Fu);
+                    return clutLut[idx];
+                });
+                return;
+            default:
+                break;
+            }
+        }
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
@@ -1269,6 +1627,172 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     }
     else
     {
+        const bool dateEnabled = ((ctx.test >> 14) & 1u) != 0u;
+        const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+        if (ctx.frame.psm == GS_PSM_CT32 && !state.prim.fge && !state.pabe && !dateEnabled)
+        {
+            if (ztestMethod == 0u)
+                return;
+            const PixelWriteMask mask = classifyAlphaTest(ctx.test, a, GS_PSM_CT32);
+            if (!mask.writesAnything())
+                return;
+
+            const uint32_t fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+            const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
+            const uint32_t zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+            const uint32_t zpsm = ctx.zbuf.psm;
+            const ReadVramFunc readZFn = (ztestMethod >= 2u && zpsm < kPsmHandlerCount) ? m_readVramFuncs[zpsm] : nullptr;
+            const WriteVramFunc writeZFn = (!ctx.zbuf.zmask && zpsm < kPsmHandlerCount) ? m_writeVramFuncs[zpsm] : nullptr;
+            const bool zWriteAllowed = writeZFn != nullptr;
+            const bool abe = state.prim.abe;
+            const uint8_t asel = static_cast<uint8_t>(alphaReg & 3u);
+            const uint8_t bsel = static_cast<uint8_t>((alphaReg >> 2) & 3u);
+            const uint8_t csel = static_cast<uint8_t>((alphaReg >> 4) & 3u);
+            const uint8_t dsel = static_cast<uint8_t>((alphaReg >> 6) & 3u);
+            const uint32_t fbmsk = ctx.frame.fbmsk;
+            const uint8_t outABase = (mask.writeAlpha && (ctx.fba & 1ull) != 0ull) ? static_cast<uint8_t>(a | 0x80u) : a;
+            const bool preserveDstAlpha = mask.writeRgb && !mask.writeAlpha;
+            const uint32_t solidPx = pack32(r, g, b, outABase);
+            auto pickRGB = [](uint8_t sel, int cs, int cd) -> int
+            {
+                return (sel == 0u) ? cs : ((sel == 1u) ? cd : 0);
+            };
+
+            if (ztestMethod == 1u && !abe && fbmsk == 0u && !preserveDstAlpha)
+            {
+                if (mask.writesFramebuffer())
+                {
+                    const int bx0 = (drawX0 + 7) & ~7;
+                    const int bx1 = (drawX1 + 1) & ~7;
+                    const int by0 = (drawY0 + 7) & ~7;
+                    const int by1 = (drawY1 + 1) & ~7;
+                    auto fillColorRect = [&](int rx0, int ry0, int rx1, int ry1)
+                    {
+                        for (int y = ry0; y <= ry1; ++y)
+                        {
+                            for (int x = rx0; x <= rx1; ++x)
+                            {
+                                const uint32_t dstAddr = GSPSMCT32::addrPSMCT32(fbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) & (GSMem::MEMORY_SIZE - 1u);
+                                std::memcpy(m_vram + dstAddr, &solidPx, sizeof(solidPx));
+                            }
+                        }
+                    };
+                    if (bx0 < bx1 && by0 < by1)
+                    {
+                        for (int y = by0; y < by1; y += 8)
+                        {
+                            for (int x = bx0; x < bx1; x += 8)
+                            {
+                                const uint32_t blockAddr = GSPSMCT32::addrPSMCT32(fbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) & (GSMem::MEMORY_SIZE - 1u);
+                                std::fill_n(reinterpret_cast<uint32_t *>(m_vram + blockAddr), 64u, solidPx);
+                            }
+                        }
+                        if (drawY0 < by0) fillColorRect(drawX0, drawY0, drawX1, by0 - 1);
+                        if (by1 <= drawY1) fillColorRect(drawX0, by1, drawX1, drawY1);
+                        if (drawX0 < bx0) fillColorRect(drawX0, by0, bx0 - 1, by1 - 1);
+                        if (bx1 <= drawX1) fillColorRect(bx1, by0, drawX1, by1 - 1);
+                    }
+                    else
+                    {
+                        fillColorRect(drawX0, drawY0, drawX1, drawY1);
+                    }
+                }
+                if (mask.writeDepth && zWriteAllowed)
+                {
+                    if (zpsm == GS_PSM_Z16S || zpsm == GS_PSM_Z16)
+                    {
+                        const uint16_t z16 = static_cast<uint16_t>(z1);
+                        const int bx0 = (drawX0 + 15) & ~15;
+                        const int bx1 = (drawX1 + 1) & ~15;
+                        const int by0 = (drawY0 + 7) & ~7;
+                        const int by1 = (drawY1 + 1) & ~7;
+                        auto fillZRect = [&](int rx0, int ry0, int rx1, int ry1)
+                        {
+                            for (int y = ry0; y <= ry1; ++y)
+                                for (int x = rx0; x <= rx1; ++x)
+                                    writeZFn(m_vram, zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), z1);
+                        };
+                        if (bx0 < bx1 && by0 < by1)
+                        {
+                            for (int y = by0; y < by1; y += 8)
+                            {
+                                for (int x = bx0; x < bx1; x += 16)
+                                {
+                                    const uint32_t blockAddr = ((zpsm == GS_PSM_Z16S)
+                                        ? GSPSMCT16::addrPSMZ16S(zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y))
+                                        : GSPSMCT16::addrPSMZ16(zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y))) & (GSMem::MEMORY_SIZE - 1u);
+                                    std::fill_n(reinterpret_cast<uint16_t *>(m_vram + blockAddr), 128u, z16);
+                                }
+                            }
+                            if (drawY0 < by0) fillZRect(drawX0, drawY0, drawX1, by0 - 1);
+                            if (by1 <= drawY1) fillZRect(drawX0, by1, drawX1, drawY1);
+                            if (drawX0 < bx0) fillZRect(drawX0, by0, bx0 - 1, by1 - 1);
+                            if (bx1 <= drawX1) fillZRect(bx1, by0, drawX1, by1 - 1);
+                        }
+                        else
+                        {
+                            fillZRect(drawX0, drawY0, drawX1, drawY1);
+                        }
+                    }
+                    else
+                    {
+                        for (int y = drawY0; y <= drawY1; ++y)
+                            for (int x = drawX0; x <= drawX1; ++x)
+                                writeZFn(m_vram, zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), z1);
+                    }
+                }
+                return;
+            }
+
+            for (int y = drawY0; y <= drawY1; ++y)
+            {
+                for (int x = drawX0; x <= drawX1; ++x)
+                {
+                    if (readZFn)
+                    {
+                        const uint32_t storedZ = readZFn(m_vram, zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                        const bool zpass = (ztestMethod == 2u) ? (z1 >= storedZ) : (z1 > storedZ);
+                        if (!zpass)
+                            continue;
+                    }
+                    if (mask.writesFramebuffer())
+                    {
+                        const uint32_t dstAddr = GSPSMCT32::addrPSMCT32(fbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) & (GSMem::MEMORY_SIZE - 1u);
+                        if (!abe && fbmsk == 0u && !preserveDstAlpha)
+                        {
+                            std::memcpy(m_vram + dstAddr, &solidPx, sizeof(solidPx));
+                        }
+                        else
+                        {
+                            uint32_t dstPx = 0u;
+                            std::memcpy(&dstPx, m_vram + dstAddr, sizeof(dstPx));
+                            uint8_t outR = r, outG = g, outB = b;
+                            if (abe)
+                            {
+                                const int dr = static_cast<int>(dstPx & 0xFFu);
+                                const int dg = static_cast<int>((dstPx >> 8) & 0xFFu);
+                                const int db = static_cast<int>((dstPx >> 16) & 0xFFu);
+                                const int da = static_cast<int>((dstPx >> 24) & 0xFFu);
+                                const int cAlpha = (csel == 0u) ? static_cast<int>(a) : ((csel == 1u) ? da : static_cast<int>(alphaFix));
+                                outR = clampU8(((pickRGB(asel, outR, dr) - pickRGB(bsel, outR, dr)) * cAlpha >> 7) + pickRGB(dsel, outR, dr));
+                                outG = clampU8(((pickRGB(asel, outG, dg) - pickRGB(bsel, outG, dg)) * cAlpha >> 7) + pickRGB(dsel, outG, dg));
+                                outB = clampU8(((pickRGB(asel, outB, db) - pickRGB(bsel, outB, db)) * cAlpha >> 7) + pickRGB(dsel, outB, db));
+                            }
+                            uint32_t outPx = pack32(outR, outG, outB, outABase);
+                            if (fbmsk != 0u)
+                                outPx = (outPx & ~fbmsk) | (dstPx & fbmsk);
+                            if (preserveDstAlpha)
+                                outPx = (outPx & 0x00FFFFFFu) | (dstPx & 0xFF000000u);
+                            std::memcpy(m_vram + dstAddr, &outPx, sizeof(outPx));
+                        }
+                    }
+                    if (mask.writeDepth && zWriteAllowed)
+                        writeZFn(m_vram, zbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), z1);
+                }
+            }
+            return;
+        }
+
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
@@ -1283,57 +1807,76 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
-
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    const int32_t x0 = static_cast<int32_t>(v0.x * 16.0f) - ctx.xyoffset.ofx;
+    const int32_t y0 = static_cast<int32_t>(v0.y * 16.0f) - ctx.xyoffset.ofy;
+    const int32_t x1 = static_cast<int32_t>(v1.x * 16.0f) - ctx.xyoffset.ofx;
+    const int32_t y1 = static_cast<int32_t>(v1.y * 16.0f) - ctx.xyoffset.ofy;
+    const int32_t x2 = static_cast<int32_t>(v2.x * 16.0f) - ctx.xyoffset.ofx;
+    const int32_t y2 = static_cast<int32_t>(v2.y * 16.0f) - ctx.xyoffset.ofy;
+    const auto ceilPixel = [](int32_t fixed) { return (fixed + 15) >> 4; };
+    const int minX = std::max<int>(ceilPixel(std::min({x0, x1, x2})), ctx.scissor.x0);
+    const int maxX = std::min<int>(ceilPixel(std::max({x0, x1, x2})) - 1, ctx.scissor.x1);
+    const int minY = std::max<int>(ceilPixel(std::min({y0, y1, y2})), ctx.scissor.y0);
+    const int maxY = std::min<int>(ceilPixel(std::max({y0, y1, y2})) - 1, ctx.scissor.y1);
+    if (minX > maxX || minY > maxY)
         return;
 
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
+    const int64_t area = static_cast<int64_t>(x1 - x0) * (y2 - y0) - static_cast<int64_t>(y1 - y0) * (x2 - x0);
+    if (area == 0)
+        return;
 
-    for (int y = minY; y <= maxY; ++y)
+    const int32_t winding = area > 0 ? 1 : -1;
+    const double invArea = 1.0 / static_cast<double>(area * winding);
+    struct Edge
     {
-        float py = static_cast<float>(y) + 0.5f;
-        for (int x = minX; x <= maxX; ++x)
+        int64_t start;
+        int32_t stepX;
+        int32_t stepY;
+        int64_t minimum;
+    };
+    // Evaluate coverage on the GS pixel grid. Shared edges belong to only one triangle.
+    const auto edge = [&](int32_t ax, int32_t ay, int32_t bx, int32_t by)
+    {
+        const int32_t dx = (bx - ax) * winding;
+        const int32_t dy = (by - ay) * winding;
+        const int64_t start = static_cast<int64_t>(dx) * (minY * 16 - ay) -
+                              static_cast<int64_t>(dy) * (minX * 16 - ax);
+        const bool topLeft = dy < 0 || (dy == 0 && dx > 0);
+        return Edge{start, -dy * 16, dx * 16, topLeft ? 0 : 1};
+    };
+    Edge edge0 = edge(x1, y1, x2, y2);
+    Edge edge1 = edge(x2, y2, x0, y0);
+    Edge edge2 = edge(x0, y0, x1, y1);
+
+    for (int y = minY; y <= maxY; ++y, edge0.start += edge0.stepY, edge1.start += edge1.stepY, edge2.start += edge2.stepY)
+    {
+        int64_t e0 = edge0.start;
+        int64_t e1 = edge1.start;
+        int64_t e2 = edge2.start;
+        for (int x = minX; x <= maxX; ++x, e0 += edge0.stepX, e1 += edge1.stepX, e2 += edge2.stepX)
         {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            if (e0 < edge0.minimum || e1 < edge1.minimum || e2 < edge2.minimum)
                 continue;
 
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const double weight0 = static_cast<double>(e0) * invArea;
+            const double weight1 = static_cast<double>(e1) * invArea;
+            const float w0 = static_cast<float>(weight0);
+            const float w1 = static_cast<float>(weight1);
+            const float w2 = static_cast<float>(static_cast<double>(e2) * invArea);
+            const double z = v2.z + (v0.z - v2.z) * weight0 + (v1.z - v2.z) * weight1;
+            const auto interpolateColor = [&](uint8_t c0, uint8_t c1, uint8_t c2)
+            {
+                const float result = c2 + (c0 - c2) * w0 + (c1 - c2) * w1;
+                return clampU8(static_cast<int>(result));
+            };
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
             {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                r = interpolateColor(v0.r, v1.r, v2.r);
+                g = interpolateColor(v0.g, v1.g, v2.g);
+                b = interpolateColor(v0.b, v1.b, v2.b);
+                a = interpolateColor(v0.a, v1.a, v2.a);
             }
             else
             {
@@ -1387,8 +1930,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 a = color.a;
             }
 
-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            const uint8_t fog = interpolateColor(v0.fog, v1.fog, v2.fog);
+            const double clampedZ = std::clamp(z, 0.0, static_cast<double>(std::numeric_limits<u32>::max()));
+            WritePixel(state, x, y, static_cast<u32>(clampedZ), r, g, b, a, fog);
         }
     }
 }
@@ -1490,97 +2034,102 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
     const uint32_t rrw = m_transfer.trxreg.rrw;
     const uint32_t dsax = m_transfer.trxpos.dsax;
+    const uint32_t xEnd = dsax + rrw;
+    const uint32_t totalPixels = m_transferState.totalPixels;
+    const WriteVramFunc writeFn = (dpsm < kPsmHandlerCount) ? m_writeVramFuncs[dpsm] : nullptr;
+    if (!writeFn)
+        return;
+
+    uint32_t copied = m_transferState.copiedPixels;
+    uint32_t curX = m_transferState.x;
+    uint32_t curY = m_transferState.y;
     uint32_t offset = 0u;
 
-    auto advancePixel = [&](uint32_t count)
+    auto stepOne = [&]()
     {
-        const uint32_t totalPixels = m_transferState.totalPixels;
-        m_transferState.copiedPixels =
-            std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
-
-        if (m_transferState.copiedPixels >= totalPixels)
+        ++copied;
+        if (++curX == xEnd)
         {
-            m_transferState.direction = 3u;
-            m_transferState.totalPixels = 0u;
-            return;
+            curX = dsax;
+            ++curY;
         }
-
-        m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
-        m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
     };
 
-    while (offset < sizeBytes && m_transferState.direction == 0u)
+    switch (dpsm)
     {
-        switch (dpsm)
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+        while (offset + 4u <= sizeBytes && copied < totalPixels)
         {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        {
-            if (sizeBytes - offset < 4u)
-                return;
             uint32_t value = 0u;
             std::memcpy(&value, data + offset, sizeof(value));
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+            writeFn(m_vram, dbp, dbw, curX, curY, value);
             offset += 4u;
-            advancePixel(1u);
-            break;
+            stepOne();
         }
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
+        break;
+    case GS_PSM_CT24:
+    case GS_PSM_Z24:
+        while (offset + 3u <= sizeBytes && copied < totalPixels)
         {
-            if (sizeBytes - offset < 3u)
-                return;
             const uint32_t value = static_cast<uint32_t>(data[offset]) |
                                    (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
                                    (static_cast<uint32_t>(data[offset + 2u]) << 16u);
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+            writeFn(m_vram, dbp, dbw, curX, curY, value);
             offset += 3u;
-            advancePixel(1u);
-            break;
+            stepOne();
         }
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
+        break;
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        while (offset + 2u <= sizeBytes && copied < totalPixels)
         {
-            if (sizeBytes - offset < 2u)
-                return;
             uint16_t value = 0u;
             std::memcpy(&value, data + offset, sizeof(value));
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+            writeFn(m_vram, dbp, dbw, curX, curY, value);
             offset += 2u;
-            advancePixel(1u);
-            break;
+            stepOne();
         }
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
-            advancePixel(1u);
-            break;
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
+        break;
+    case GS_PSM_T8:
+    case GS_PSM_T8H:
+        while (offset < sizeBytes && copied < totalPixels)
+        {
+            writeFn(m_vram, dbp, dbw, curX, curY, data[offset++]);
+            stepOne();
+        }
+        break;
+    case GS_PSM_T4:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        while (offset < sizeBytes && copied < totalPixels)
         {
             const uint8_t packed = data[offset++];
-            const uint32_t firstPixel = m_transferState.copiedPixels;
-            WriteVramUnlocked(dpsm, dbp, dbw,
-                              dsax + (firstPixel % rrw),
-                              m_transfer.trxpos.dsay + (firstPixel / rrw),
-                              packed & 0x0Fu);
-            if (firstPixel + 1u < m_transferState.totalPixels)
+            writeFn(m_vram, dbp, dbw, curX, curY, packed & 0x0Fu);
+            stepOne();
+            if (copied < totalPixels)
             {
-                const uint32_t secondPixel = firstPixel + 1u;
-                WriteVramUnlocked(dpsm, dbp, dbw,
-                                  dsax + (secondPixel % rrw),
-                                  m_transfer.trxpos.dsay + (secondPixel / rrw),
-                                  (packed >> 4u) & 0x0Fu);
+                writeFn(m_vram, dbp, dbw, curX, curY, (packed >> 4u) & 0x0Fu);
+                stepOne();
             }
-            advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
-            break;
         }
-        default:
-            return;
-        }
+        break;
+    default:
+        return;
+    }
+
+    m_transferState.copiedPixels = copied;
+    if (copied >= totalPixels)
+    {
+        m_transferState.direction = 3u;
+        m_transferState.totalPixels = 0u;
+    }
+    else
+    {
+        m_transferState.x = curX;
+        m_transferState.y = curY;
     }
 }
 

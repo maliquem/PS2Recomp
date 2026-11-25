@@ -204,6 +204,15 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    bool readMappedCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+    {
+        if (!dst || sectors == 0u || byteCount == 0u || !isResolvableCdLbn(lbn))
+        {
+            return false;
+        }
+        return readCdSectors(lbn, sectors, dst, byteCount);
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn

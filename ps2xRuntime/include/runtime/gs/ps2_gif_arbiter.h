@@ -17,7 +17,8 @@ struct GifArbiterPacket
     GifPathId pathId;
     bool path2DirectHl = false;
     bool path3Image = false;
-    std::vector<uint8_t> data;
+    uint32_t offset = 0u;
+    uint32_t size = 0u;
 };
 
 class GifArbiter
@@ -38,6 +39,7 @@ public:
 private:
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
+    std::vector<uint8_t> m_arena;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);

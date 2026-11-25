@@ -524,7 +524,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-void GS::latchHostPresentationFrame()
+void GS::latchHostPresentationFrame(uint32_t fullFrameHeight)
 {
     GSPresentationRequest request{};
     {
@@ -538,6 +538,23 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
+    }
+
+    if (fullFrameHeight != 0u && fullFrameHeight <= 2048u && (request.smode2 & 3u) == 1u)
+    {
+        constexpr uint64_t heightMask = 0x7FFull << 44u;
+        const auto expandField = [&](uint64_t &display)
+        {
+            const uint32_t fieldHeight = static_cast<uint32_t>((display & heightMask) >> 44u) + 1u;
+            if (fieldHeight * 2u != fullFrameHeight)
+                return false;
+            display = (display & ~heightMask) | (static_cast<uint64_t>(fullFrameHeight - 1u) << 44u);
+            return true;
+        };
+        const bool expandedDisplay1 = expandField(request.display1);
+        const bool expandedDisplay2 = expandField(request.display2);
+        if (expandedDisplay1 || expandedDisplay2)
+            request.smode2 &= ~1ull;
     }
 
     PresentationFrame frame{};
@@ -930,7 +947,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -967,7 +984,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1001,7 +1018,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
+        vtx.z = static_cast<double>((hi >> 4) & 0xFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1032,7 +1049,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
+        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;

@@ -161,10 +161,11 @@ namespace
     constexpr uint32_t kEeTimerModeEquf = 1u << 10;
     constexpr uint32_t kEeTimerModeOvff = 1u << 11;
     constexpr uint64_t kEeClockHz = 294912000ull;
+    constexpr std::array<unsigned, 3> kEeBusClockShifts{1u, 5u, 9u};
     constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
-        147456000ull,
-        9216000ull,
-        576000ull,
+        kEeClockHz >> kEeBusClockShifts[0],
+        kEeClockHz >> kEeBusClockShifts[1],
+        kEeClockHz >> kEeBusClockShifts[2],
         15734ull,
     };
 
@@ -329,6 +330,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
+    m_vif1PendingDirectQwc = 0u;
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
     resetEeTimers();
@@ -426,12 +428,27 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             continue;
         }
 
-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
-        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
-        const uint64_t remainingCycles = eeCycles % kEeClockHz;
-        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
-        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
-        timer.clockRemainder = scaled % kEeClockHz;
+        const uint32_t clock = timer.mode & kEeTimerModeClksMask;
+        const uint64_t clockHz = kEeTimerClockHz[clock];
+        uint64_t ticks;
+        if (clock < kEeBusClockShifts.size())
+        {
+            // The BUSCLK divisors are exact powers of two in EE cycles.
+            const unsigned shift = kEeBusClockShifts[clock];
+            const uint64_t cycleMask = (1ull << shift) - 1u;
+            const uint64_t scaled = (eeCycles & cycleMask) * clockHz + timer.clockRemainder;
+            const bool carry = scaled >= kEeClockHz;
+            ticks = (eeCycles >> shift) + carry;
+            timer.clockRemainder = scaled - (carry ? kEeClockHz : 0u);
+        }
+        else
+        {
+            const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+            const uint64_t remainingCycles = eeCycles % kEeClockHz;
+            const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+            ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+            timer.clockRemainder = scaled % kEeClockHz;
+        }
         if (ticks == 0u)
         {
             continue;
@@ -1229,6 +1246,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             {
                 const bool wasPath3Masked = m_path3Masked;
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                m_vif1PendingDirectQwc = 0u;
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
                 m_path3Masked = false;
@@ -1344,7 +1362,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    const int kMaxChainTags = 65536;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)

@@ -596,12 +596,21 @@ void register_ps2_vu1_tests()
             vu1.state().vf[2][0] = 10.0f;
             vu1.state().vf[3][0] = 2.0f;
             vu1.state().vf[4][0] = 3.0f;
+            vu1.state().acc[1] = 7.0f;
+            vu1.state().mac = 0xFF00u;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
-                        0u, 0u, 0u, 5u);
+                        0u, 0u, 0u, 1u);
 
             t.Equals(vu1.state().acc[0], 11.0f,
-                     "ADDA should forward ACC to the following upper instruction");
+                     "ADDA should forward ACC at the next cycle boundary");
+            t.Equals(vu1.state().acc[1], 7.0f,
+                     "ADDA should preserve accumulator lanes outside its destination mask");
+            t.Equals(vu1.state().mac, 0xFF00u,
+                     "ACC forwarding should preserve the FMAC flag latency");
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
+                       fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                       0u, 0u, 4u);
             t.Equals(vu1.state().vf[5][0], 17.0f,
                      "MADD should consume the forwarded ACC value without stalling");
             t.Equals(vu1.state().cycles, static_cast<uint64_t>(5u),
@@ -1688,6 +1697,301 @@ void register_ps2_vu1_tests()
                      "MAC flags should describe the final accumulated value");
             t.Equals(vu1.state().status, 0x140u,
                      "the underflowing product should set sticky Z and U");
+        });
+
+        tc.Run("broadcast MUL and MADD match vector results, masks and flags", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            constexpr uint8_t mask = 0xEu;
+            struct Operands
+            {
+                float multiplier;
+                float source[3];
+                float accumulator[3];
+            };
+            constexpr float minimum = std::numeric_limits<float>::min();
+            constexpr float maximum = std::numeric_limits<float>::max();
+            const Operands inputs[] = {
+                {-0.5f, {minimum, 2.0f, maximum}, {1.0f, 1.0f, -maximum}},
+                {-2.0f, {minimum, 2.0f, maximum}, {1.0f, 4.0f, -maximum}},
+                {-0.75f, {4.0f, -2.0f, 8.0f}, {2.0f, 0.75f, -0.5f}},
+                {std::nextafter(1.0f, 0.0f), {std::nextafter(2.0f * minimum, maximum), 1.0f, -0.0f},
+                 {-2.0f * minimum, -1.0f, -0.0f}},
+            };
+            for (bool writeAcc : {false, true})
+            {
+                for (bool add : {false, true})
+                {
+                    const uint8_t broadcastFunction = add ? 0x0Au : 0x1Au;
+                    const uint8_t vectorFunction = add ? 0x29u : 0x2Au;
+                    const uint32_t broadcastOp = writeAcc ? makeVuUpperSpecial(broadcastFunction, mask, 2u, 1u)
+                                                          : makeVuUpper(broadcastFunction, mask, 2u, 1u, 3u);
+                    const uint32_t vectorOp = writeAcc ? makeVuUpperSpecial(vectorFunction, mask, 2u, 1u)
+                                                       : makeVuUpper(vectorFunction, mask, 2u, 1u, 3u);
+                    for (const auto &input : inputs)
+                    {
+                        const auto run = [&](VU1Interpreter &vu, uint32_t op)
+                        {
+                            auto &state = vu.state();
+                            std::memcpy(state.vf[1], input.source, sizeof(input.source));
+                            std::memcpy(state.acc, input.accumulator, sizeof(input.accumulator));
+                            for (float &lane : state.vf[2])
+                                lane = input.multiplier;
+                            state.vf[1][3] = -2.0f;
+                            state.acc[3] = 8.0f;
+                            state.vf[3][3] = 9.0f;
+                            writeVuInstructionPair(fx.code, 0u, 0u, op);
+                            for (uint32_t pc = 8u; pc < 40u; pc += 8u)
+                                writeVuInstructionPair(fx.code, pc, 0u, kVuUpperNop);
+                            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs,
+                                       nullptr, 0u, 0u, 0u, 5u);
+                        };
+                        VU1Interpreter broadcast, vector;
+                        run(broadcast, broadcastOp);
+                        run(vector, vectorOp);
+                        const auto &actual = broadcast.state();
+                        const auto &expected = vector.state();
+                        t.Equals(std::memcmp(actual.vf[3], expected.vf[3], sizeof(actual.vf[3])), 0,
+                                 "destination bits must match the generic vector operation");
+                        t.Equals(std::memcmp(actual.acc, expected.acc, sizeof(actual.acc)), 0,
+                                 "accumulator bits must match the generic vector operation");
+                        t.Equals(actual.mac, expected.mac, "current flags must match");
+                        t.Equals(actual.status, expected.status, "current and product sticky flags must match");
+                    }
+                }
+            }
+        });
+
+        tc.Run("VU1 fast direct path matches cycle-accurate interpreter on eligible XGKICK loop", [](TestCase &t)
+        {
+            auto runProgram = [&](uint32_t maxCycles, VU1Interpreter &vuOut, std::vector<uint8_t> &vuDataOut,
+                                  std::vector<std::vector<uint8_t>> &packetsOut)
+            {
+                Vu1Fixture fx;
+                t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+                fx.mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    packetsOut.emplace_back(data, data + sizeBytes);
+                });
+
+                // Prepare VU1 data: qw0=GIFtag (NLOOP=2, PACKED, NREG=1, EOP=1), qw1=header (count=2),
+                // qw2..qw5 = 4x4 matrix, qw6..qw7 = 2 input vertices, qw10..qw11 = output buffer.
+                const uint64_t gifTag = makeGifTag(2u, GIF_FMT_PACKED, 1u, true);
+                std::memcpy(fx.data + 0u, &gifTag, sizeof(gifTag));
+                const uint32_t header[4] = {2u, 10u, 0u, 0u};
+                std::memcpy(fx.data + 16u, header, sizeof(header));
+                const float mat[4][4] = {
+                    {1.25f, 0.25f, 0.0f, 0.0f},
+                    {-0.5f, 1.5f, 0.125f, 0.0f},
+                    {0.0f, -0.25f, 2.0f, 0.0f},
+                    {10.5f, -3.25f, 4.0f, 1.0f},
+                };
+                std::memcpy(fx.data + 32u, mat, sizeof(mat));
+                const float verts[2][4] = {
+                    {2.0f, -1.5f, 0.5f, 1.0f},
+                    {-3.0f, 4.25f, -1.0f, 1.0f},
+                };
+                std::memcpy(fx.data + 96u, verts, sizeof(verts));
+
+                auto makeIsubiu = [](uint8_t it, uint8_t is, int16_t imm) -> uint32_t
+                {
+                    return (0x09u << 25) | (static_cast<uint32_t>(it & 0xFu) << 16) |
+                           (static_cast<uint32_t>(is & 0xFu) << 11) | (static_cast<uint32_t>(imm) & 0x7FFu);
+                };
+                auto makeIbgtz = [](uint8_t is, int16_t imm) -> uint32_t
+                {
+                    return (0x2Du << 25) | (static_cast<uint32_t>(is & 0xFu) << 11) |
+                           (static_cast<uint32_t>(imm) & 0x7FFu);
+                };
+                auto makeFcand = [](uint32_t imm24) -> uint32_t
+                {
+                    return (0x12u << 25) | (imm24 & 0xFFFFFFu);
+                };
+                auto makeDiv = [](uint8_t fs, uint8_t fsf, uint8_t ft, uint8_t ftf) -> uint32_t
+                {
+                    return makeVuLowerSpecial(0x38u, fs, ft, 0u, static_cast<uint8_t>((fsf & 3u) | ((ftf & 3u) << 2)));
+                };
+                auto makeMtir = [](uint8_t it, uint8_t fs, uint8_t fsf) -> uint32_t
+                {
+                    return makeVuLowerSpecial(0x3Cu, fs, it, 0u, fsf & 3u);
+                };
+
+                uint32_t pc = 0u;
+                auto emit = [&](uint32_t lower, uint32_t upper)
+                {
+                    writeVuInstructionPair(fx.code, pc, lower, upper);
+                    pc += 8u;
+                };
+
+                // Prologue with deterministic straight-line LQ -> MTIR stall and matrix loads.
+                emit(makeVuLq(0xFu, 1u, 0u, 1), kVuUpperNop);            // 0x00: LQ vf1, 1(vi0)
+                emit(makeMtir(2u, 1u, 0u), kVuUpperNop);                 // 0x08: MTIR vi2, vf1.x (stalls 3 cycles)
+                emit(makeVuLq(0xFu, 10u, 0u, 2), kVuUpperNop);           // 0x10: matrix rows vf10..vf13
+                emit(makeVuLq(0xFu, 11u, 0u, 3), kVuUpperNop);           // 0x18
+                emit(makeVuLq(0xFu, 12u, 0u, 4), kVuUpperNop);           // 0x20
+                emit(makeVuLq(0xFu, 13u, 0u, 5), kVuUpperNop);           // 0x28
+                emit(makeVuIaddiu(3u, 0u, 6), kVuUpperNop);              // 0x30: vi3 = input ptr (6)
+                emit(makeVuIaddiu(4u, 0u, 10), kVuUpperNop);             // 0x38: vi4 = output ptr (10)
+                emit(makeVuLq(0xFu, 20u, 3u, 0), kVuUpperNop);           // 0x40: preload first vertex
+
+                // Loop (pc = 0x48 = pair 9): transform, DIV/MULq, CLIP/FCAND, shadow SUB|SQ, branch.
+                const uint32_t loopPc = pc;
+                emit(0u, kVuUpperNop);                                   // pad to ensure vf20 ready
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                emit(0u, makeVuUpperSpecial(0x18u, 0xFu, 20u, 10u));     // MULAx ACC, vf10, vf20x
+                emit(0u, makeVuUpperSpecial(0x09u, 0xFu, 20u, 11u));     // MADDAy ACC, vf11, vf20y
+                emit(0u, makeVuUpperSpecial(0x0Au, 0xFu, 20u, 12u));     // MADDAz ACC, vf12, vf20z
+                emit(0u, makeVuUpper(0x0Bu, 0xFu, 20u, 13u, 21u));       // MADDw vf21, vf13, vf20w
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                emit(makeDiv(0u, 3u, 21u, 3u), makeVuUpperSpecial(0x1Fu, 0u, 21u, 21u)); // DIV Q, vf0w, vf21w | CLIPw vf21, vf21w
+                emit(makeVuIaddiu(3u, 3u, 1), kVuUpperNop);
+                emit(makeVuLq(0xFu, 20u, 3u, 0), kVuUpperNop);           // preload next vertex
+                emit(0u, kVuUpperNop);
+                emit(makeFcand(0x3Fu), kVuUpperNop);                     // FCAND vi1, 0x3F (4 cycles after CLIPw)
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                emit(0u, makeVuUpper(0x1Cu, 0xEu, 0u, 21u, 22u));        // MULq.xyz vf22, vf21, Q (7 cycles after DIV)
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                emit(0u, makeVuUpperSpecial(0x15u, 0xEu, 23u, 22u));     // FTOI4.xyz vf23, vf22
+                emit(makeIsubiu(2u, 2u, 1), kVuUpperNop);                // vi2 -= 1
+                emit(0u, kVuUpperNop);
+                emit(0u, kVuUpperNop);
+                // Same-pair shadow: upper writes vf23 while lower stores old vf23!
+                emit(makeVuSq(0xFu, 23u, 4u, 0), makeVuUpper(0x2Cu, 0xCu, 13u, 23u, 23u)); // SUB.xy vf23, vf23, vf13 | SQ vf23, 0(vi4)
+                const int16_t branchImm = static_cast<int16_t>((static_cast<int32_t>(loopPc) - static_cast<int32_t>(pc + 8u)) / 8);
+                emit(makeIbgtz(2u, branchImm), kVuUpperNop);             // IBGTZ vi2, loop
+                emit(makeVuIaddiu(4u, 4u, 1), kVuUpperNop);              // delay slot: vi4 += 1
+
+                // Copy GIFtag into output and XGKICK + E-bit.
+                emit(makeVuIaddiu(5u, 0u, 0), kVuUpperNop);
+                emit(makeVuLowerSpecial(0x6Cu, 5u), kVuUpperNop);        // XGKICK vi5
+                emit(0u, kVuUpperNop | 0x40000000u);                     // [E] NOP
+                emit(0u, kVuUpperNop);                                   // delay slot
+
+                vuOut.execute(fx.code, PS2_VU1_CODE_SIZE,
+                              fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                              0u, 0u, 0u, maxCycles);
+                vuDataOut.assign(fx.data, fx.data + PS2_VU1_DATA_SIZE);
+            };
+
+            VU1Interpreter refVu, fastVu;
+            std::vector<uint8_t> refData, fastData;
+            std::vector<std::vector<uint8_t>> refPkts, fastPkts;
+            runProgram(16383u, refVu, refData, refPkts);
+            runProgram(16384u, fastVu, fastData, fastPkts);
+
+            t.IsTrue(refVu.state().status != 0u, "reference interpreter should record FMAC status flags");
+            t.Equals(fastVu.state().status, 0u, "fast direct path should have executed (skipping dead STATUS flags)");
+            t.Equals(fastVu.state().cycles, refVu.state().cycles, "fast path cycles must match reference exactly");
+            t.Equals(fastVu.state().pc, refVu.state().pc, "fast path final PC must match reference");
+            t.Equals(fastVu.state().clip, refVu.state().clip, "fast path CLIP flags must match reference");
+            t.Equals(std::memcmp(fastVu.state().vf, refVu.state().vf, sizeof(refVu.state().vf)), 0,
+                     "fast path VF registers must match reference bit-for-bit");
+            t.Equals(std::memcmp(fastVu.state().acc, refVu.state().acc, sizeof(refVu.state().acc)), 0,
+                     "fast path ACC must match reference bit-for-bit");
+            t.Equals(std::memcmp(fastVu.state().vi, refVu.state().vi, sizeof(refVu.state().vi)), 0,
+                     "fast path VI registers must match reference");
+            t.Equals(std::memcmp(&fastVu.state().q, &refVu.state().q, sizeof(float)), 0,
+                     "fast path Q register must match reference bit-for-bit");
+            t.Equals(fastData == refData, true, "fast path VU1 data memory must match reference byte-for-byte");
+            t.Equals(fastPkts == refPkts, true, "fast path XGKICK GIF packet must match reference byte-for-byte");
+        });
+
+        tc.Run("VU1 fast path rejects cross-pair hazards and preserves exact fallback parity", [](TestCase &t)
+        {
+            auto checkFallbackParity = [&](auto buildCode, const char *label)
+            {
+                auto runOne = [&](uint32_t maxCycles, VU1Interpreter &vuOut, std::vector<uint8_t> &dataOut)
+                {
+                    Vu1Fixture fx;
+                    t.IsTrue(fx.initialize(), label);
+                    const uint64_t gifTag = makeGifTag(0u, GIF_FMT_PACKED, 1u, true);
+                    std::memcpy(fx.data, &gifTag, sizeof(gifTag));
+                    buildCode(fx);
+                    vuOut.state().vf[1][0] = 3.0f;
+                    vuOut.state().vf[2][0] = 2.0f;
+                    vuOut.execute(fx.code, PS2_VU1_CODE_SIZE,
+                                  fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                                  0u, 0u, 0u, maxCycles);
+                    dataOut.assign(fx.data, fx.data + 64u);
+                };
+
+                VU1Interpreter refVu, testVu;
+                std::vector<uint8_t> refData, testData;
+                runOne(16383u, refVu, refData);
+                runOne(16384u, testVu, testData);
+
+                t.Equals(testVu.state().cycles, refVu.state().cycles, label);
+                t.Equals(std::memcmp(testVu.state().vf, refVu.state().vf, sizeof(refVu.state().vf)), 0, label);
+                t.Equals(std::memcmp(testVu.state().vi, refVu.state().vi, sizeof(refVu.state().vi)), 0, label);
+                t.Equals(testData == refData, true, label);
+            };
+
+            // Case 1: Non-stalling CLIP -> FCAND hazard (d=1 < 4) must fall back and match reference.
+            checkFallbackParity([](Vu1Fixture &fx)
+            {
+                writeVuInstructionPair(fx.code, 0u, 0u, makeVuUpperSpecial(0x1Fu, 0u, 1u, 1u)); // CLIPw
+                writeVuInstructionPair(fx.code, 8u, (0x12u << 25) | 0x3Fu, kVuUpperNop);        // FCAND at d=1
+                writeVuInstructionPair(fx.code, 16u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 24u, 0u, kVuUpperNop | 0x40000000u);
+                writeVuInstructionPair(fx.code, 32u, 0u, kVuUpperNop);
+            }, "CLIP->FCAND hazard must fall back cleanly");
+
+            // Case 2: Non-stalling DIV -> MULq hazard (d=1 < 7) must fall back and match reference.
+            checkFallbackParity([](Vu1Fixture &fx)
+            {
+                writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(0x38u, 1u, 2u, 0u, 0u), kVuUpperNop); // DIV
+                writeVuInstructionPair(fx.code, 8u, 0u, makeVuUpper(0x1Cu, 0x8u, 0u, 1u, 3u));               // MULq at d=1
+                writeVuInstructionPair(fx.code, 16u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 24u, 0u, kVuUpperNop | 0x40000000u);
+                writeVuInstructionPair(fx.code, 32u, 0u, kVuUpperNop);
+            }, "DIV->MULq hazard must fall back cleanly");
+
+            // Case 3: Post-XGKICK store must fall back and preserve PATH1 timing/data order.
+            checkFallbackParity([](Vu1Fixture &fx)
+            {
+                writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 8u, makeVuSq(0xFu, 1u, 0u, 1), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 16u, 0u, kVuUpperNop | 0x40000000u);
+                writeVuInstructionPair(fx.code, 24u, 0u, kVuUpperNop);
+            }, "post-XGKICK store must fall back cleanly");
+
+            // Case 4: Overlapping entries with different stalls at a shared block must not corrupt committed cache.
+            {
+                Vu1Fixture fx;
+                t.IsTrue(fx.initialize(), "overlapping entry fixture should initialize");
+                const uint64_t gifTag = makeGifTag(0u, GIF_FMT_PACKED, 1u, true);
+                std::memcpy(fx.data, &gifTag, sizeof(gifTag));
+                // Entry A at pc=0x08 (no stall at pc=0x08); Entry B at pc=0x00 (LQ vf1 stalls pc=0x08 by 3 cycles).
+                writeVuInstructionPair(fx.code, 0u, makeVuLq(0xFu, 1u, 0u, 0), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 8u, makeVuLowerSpecial(0x3Cu, 1u, 2u, 0u, 0u), kVuUpperNop); // MTIR vi2, vf1.x
+                writeVuInstructionPair(fx.code, 16u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);             // XGKICK vi0
+                writeVuInstructionPair(fx.code, 24u, 0u, kVuUpperNop | 0x40000000u);                          // [E] NOP
+                writeVuInstructionPair(fx.code, 32u, 0u, kVuUpperNop);
+
+                VU1Interpreter vu, refA, refB;
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 8u, 0u, 0u, 16384u);
+                const uint64_t cA1 = vu.state().cycles;
+                refA.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 8u, 0u, 0u, 16383u);
+                t.Equals(cA1, refA.state().cycles, "entry A initial fast cycles must match reference");
+
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 16384u);
+                const uint64_t cB = vu.state().cycles - cA1;
+                refB.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 16383u);
+                t.Equals(cB, refB.state().cycles, "conflicting entry B must fall back with exact cycles");
+
+                const uint64_t beforeA2 = vu.state().cycles;
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 8u, 0u, 0u, 16384u);
+                const uint64_t cA2 = vu.state().cycles - beforeA2;
+                t.Equals(cA2, refA.state().cycles, "entry A fast cache must remain uncorrupted after entry B");
+            }
         });
 
         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)

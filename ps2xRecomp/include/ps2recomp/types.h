@@ -106,9 +106,11 @@ namespace ps2recomp
         std::string name;
         uint32_t address;
         uint32_t size;
-        bool isFunction;
-        bool isImported;
-        bool isExported;
+        bool isFunction = false;
+        bool isObject = false;
+        bool isSection = false;
+        bool isImported = false;
+        bool isExported = false;
     };
 
     // Section information

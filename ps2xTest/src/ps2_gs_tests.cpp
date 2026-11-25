@@ -4,8 +4,11 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_vulkan_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
@@ -644,16 +647,13 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
-            uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            const uint32_t clearedPixel = runtime.gs().ReadVram(GS_PSM_CT32, 0u, 10u, 0u, 0u);
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should execute the seeded clear packet against the active draw buffer");
 
             constexpr uint32_t kMidX = 320u;
             constexpr uint32_t kMidY = 200u;
-            const uint32_t kMidOffset = ((kMidY * 640u) + kMidX) * 4u;
-            uint32_t clearedMidPixel = 0u;
-            std::memcpy(&clearedMidPixel, runtime.memory().getGSVRAM() + kMidOffset, sizeof(clearedMidPixel));
+            const uint32_t clearedMidPixel = runtime.gs().ReadVram(GS_PSM_CT32, 0u, 10u, kMidX, kMidY);
             t.Equals(clearedMidPixel, kClearColor,
                      "sceGsSwapDBuffDc should clear the interior of the active draw buffer, not just the first pixel");
         });
@@ -699,8 +699,7 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
-            uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            const uint32_t clearedPixel = runtime.gs().ReadVram(GS_PSM_CT32, 0u, 10u, 0u, 0u);
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
         });
@@ -773,6 +772,62 @@ void register_ps2_gs_tests()
                      "XYZ3 should suppress the completed ABC triangle");
             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 4u, 4u), kColor,
                      "the next XYZ2 should draw BCD from the advanced strip queue");
+        });
+
+        tc.Run("Packed XYZ2 preserves constant 32-bit triangle depth", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull);
+            gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRIANGLE);
+
+            constexpr uint32_t kDepth = 0xFEDCBA97u;
+            const uint64_t packet[] = {
+                (1ull << 60) | 0x8003ull, GS_REG_XYZ2,
+                0ull, kDepth,
+                112ull, kDepth,
+                112ull << 32, kDepth,
+            };
+            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+
+            t.Equals(gs.ReadVram(GS_PSM_Z32, 32u, 1u, 1u, 1u), kDepth,
+                     "packed vertex depth should survive assembly and interpolation");
+            t.Equals(gs.ReadVram(GS_PSM_Z32, 32u, 1u, 4u, 1u), kDepth,
+                     "other pixels in a flat triangle should retain the same depth");
+        });
+
+        tc.Run("GS blended triangles cover shared edges once", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (4ull << 16) | (4ull << 48));
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, (0x80ull << 32) | 0x68ull);
+            gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRIANGLE | (1ull << 6));
+            gs.writeRegister(GS_REG_RGBAQ, 0x20ull);
+
+            constexpr uint64_t kRight = 64ull;
+            constexpr uint64_t kBottom = 64ull << 16;
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, kRight);
+            gs.writeRegister(GS_REG_XYZ2, kBottom);
+            gs.writeRegister(GS_REG_XYZ2, kRight);
+            gs.writeRegister(GS_REG_XYZ2, kBottom);
+            gs.writeRegister(GS_REG_XYZ2, kRight | kBottom);
+
+            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u), 0x20u,
+                     "the top-left pixel is covered");
+            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 2u), 0x20u,
+                     "the diagonal receives exactly one additive blend");
+            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 4u, 2u), 0u,
+                     "the outer right boundary is excluded");
         });
 
         tc.Run("GS fog blends the shaded color toward FOGCOL before framebuffer blending", [](TestCase &t)
@@ -1084,6 +1139,58 @@ void register_ps2_gs_tests()
                              "1:1 FST sprite copies should preserve each source texel without off-by-one edge skew");
                 }
             }
+        });
+
+        tc.Run("FST sprite skips texture cache fill for depth-rejected texels", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            constexpr uint32_t framePage = 1u;
+            constexpr uint32_t depthPage = 2u;
+            constexpr uint32_t textureBlock = 96u;
+            constexpr uint32_t red = 0x800000FFu;
+            constexpr uint32_t green = 0x8000FF00u;
+            constexpr uint32_t blue = 0x80FF0000u;
+            constexpr uint16_t depth = 5u;
+            for (uint32_t y = 0; y < 8; ++y)
+            {
+                for (uint32_t x = 8; x < 16; ++x)
+                {
+                    const auto address = GSPSMCT16::addrPSMZ16S(depthPage * 32u, 1u, x, y);
+                    std::memcpy(vram.data() + address, &depth, sizeof(depth));
+                }
+            }
+            gs.writeRegister(GS_REG_FRAME_1, framePage | (1ull << 16));
+            gs.writeRegister(GS_REG_ZBUF_1, depthPage | (0xAull << 24));
+            gs.writeRegister(GS_REG_SCISSOR_1, (15ull << 16) | (7ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x5000dull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0x44ull);
+            gs.writeRegister(GS_REG_CLAMP_1, 5ull);
+            gs.writeRegister(GS_REG_TEX0_1, textureBlock | (1ull << 14) | (4ull << 26) | (4ull << 30) | (1ull << 34));
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE | (1ull << 4) | (1ull << 6) | (1ull << 8));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            const auto draw = [&](uint64_t z) {
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_UV, 256ull | (128ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, 256ull | (128ull << 16) | (z << 32));
+            };
+            writeReferencePSMCT32Pixel(vram, textureBlock, 1u, 0u, 0u, red);
+            writeReferencePSMCT32Pixel(vram, textureBlock, 1u, 8u, 0u, green);
+            draw(3u);
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, framePage, 1u, 8u, 0u), 0u,
+                     "Earlier depth must reject the right texture block");
+
+            writeReferencePSMCT32Pixel(vram, textureBlock, 1u, 0u, 0u, green);
+            writeReferencePSMCT32Pixel(vram, textureBlock, 1u, 8u, 0u, blue);
+            draw(depth);
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, framePage, 1u, 0u, 0u), red,
+                     "The left block should retain the cached texel without TEXFLUSH");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, framePage, 1u, 8u, 0u), blue,
+                     "The right block should first fill the cache after depth passes");
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
@@ -1593,6 +1700,32 @@ void register_ps2_gs_tests()
                      "dual-circuit presentation should blend the second circuit blue channel under the first circuit");
             t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
                      "dual-circuit presentation should normalize the final host alpha");
+        });
+
+        tc.Run("full movie presentation preserves framebuffer lines below the configured field", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 1u;
+            regs.smode2 = 1u;
+            regs.dispfb1 = 10ull << 9u;
+            regs.display1 = (639ull << 32u) | (223ull << 44u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            writeReferenceFramePSMCT32Pixel(vram, 0u, 10u, 0u, 300u, 0x800000A5u);
+
+            std::vector<uint8_t> frame;
+            uint32_t width = 0, height = 0;
+            gs.latchHostPresentationFrame();
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height), "the ordinary field is readable");
+            t.Equals(height, 224u, "ordinary presentation retains the configured field height");
+
+            gs.latchHostPresentationFrame(448u);
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height), "the entire movie surface is readable");
+            t.Equals(height, 448u, "movie presentation exposes the complete frame");
+            t.IsTrue(frame.size() > 300u * 640u * 4u && frame[300u * 640u * 4u] == 0xA5u,
+                     "movie presentation keeps a source pixel below the first field");
+            t.Equals(regs.display1, (639ull << 32u) | (223ull << 44u), "the override only affects host presentation");
         });
 
         tc.Run("latched host presentation normalizes alpha for single-circuit display", [](TestCase &t)
@@ -3527,11 +3660,11 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
                 gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
-                gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, 128ull);
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
 
-                return readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                return readReferencePSMCT32Pixel(vram, 0u, 1u, 3u, 1u);
             };
 
             constexpr uint64_t kTex1Linear =
@@ -3695,13 +3828,13 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
-            gs.writeRegister(GS_REG_XYZ2, 64ull);
+            gs.writeRegister(GS_REG_XYZ2, 128ull);
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, (64ull << 16));
 
             const uint32_t pixel =
-                readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                readReferencePSMCT32Pixel(vram, 0u, 1u, 3u, 1u);
             t.Equals(pixel, kHomogeneousTexel,
                      "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
         });
@@ -3902,47 +4035,17 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 420u));
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(102u, 420u));
 
-            bool sawFilledRow = false;
-            for (uint32_t y = 6u; y <= 26u; ++y)
+            bool matchesCoverage = true;
+            for (uint32_t y = 6u; y <= 27u; ++y)
             {
-                int first = -1;
-                int last = -1;
-                for (uint32_t x = 6u; x <= 26u; ++x)
+                for (uint32_t x = 6u; x <= 27u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
-                    if ((pixel & 0x00FFFFFFu) != 0u)
-                    {
-                        if (first < 0)
-                        {
-                            first = static_cast<int>(x);
-                        }
-                        last = static_cast<int>(x);
-                    }
-                }
-
-                if (first < 0 || last < 0)
-                {
-                    continue;
-                }
-
-                sawFilledRow = true;
-                for (int x = first; x <= last; ++x)
-                {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
-                    if ((pixel & 0x00FFFFFFu) == 0u)
-                    {
-                        t.Fail("triangle fan quad should not leave interior holes within a covered row");
-                        break;
-                    }
+                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, x, y);
+                    const bool covered = x >= 7u && x <= 26u && y >= 7u && y <= 26u;
+                    matchesCoverage &= pixel == (covered ? 0x80FFFFFFu : 0u);
                 }
             }
-
-            t.IsTrue(sawFilledRow,
-                     "triangle fan quad should light at least one framebuffer row");
+            t.IsTrue(matchesCoverage, "subpixel quad should cover every integer sample from (7, 7) through (26, 26)");
         });
 
         tc.Run("sceGsExecLoadImage and sceGsExecStoreImage roundtrip and free guest packets", [](TestCase &t)
@@ -4671,6 +4774,289 @@ void register_ps2_gs_tests()
             }
             t.IsTrue(pattern2Ok,
                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+        });
+
+        tc.Run("GSVulkanBackend matches GSCpuBackend byte-for-byte on uploads, CLUT, sprites, triangles and present", [](TestCase &t)
+        {
+            std::string reason;
+            auto vkBackend = GSVulkanBackend::CreateIfAvailable(&reason);
+            if (!vkBackend)
+            {
+                // Clean skip only if running on a headless machine without a Vulkan compute GPU.
+                return;
+            }
+
+            std::vector<uint8_t> cpuVram(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> vkVram(PS2_GS_VRAM_SIZE, 0u);
+            GSCpuBackend cpuBackend;
+            cpuBackend.Initialize(cpuVram.data(), static_cast<uint32_t>(cpuVram.size()));
+            vkBackend->Initialize(vkVram.data(), static_cast<uint32_t>(vkVram.size()));
+
+            auto runOnBoth = [&](auto &&fn)
+            {
+                fn(cpuBackend);
+                fn(*vkBackend);
+            };
+
+            // 1. Host->Local uploads across PSMCT32, PSMT8, PSMT4, PSMCT16 and PSMZ16S.
+            std::vector<uint8_t> ct32Data(16u * 16u * 4u);
+            for (uint32_t i = 0u; i < 16u * 16u; ++i)
+            {
+                ct32Data[i * 4u + 0u] = static_cast<uint8_t>((i * 7u + 13u) & 0xFFu);
+                ct32Data[i * 4u + 1u] = static_cast<uint8_t>((i * 11u + 29u) & 0xFFu);
+                ct32Data[i * 4u + 2u] = static_cast<uint8_t>((i * 17u + 53u) & 0xFFu);
+                ct32Data[i * 4u + 3u] = (i % 5u == 0u) ? 0u : static_cast<uint8_t>((i * 3u + 40u) & 0x7Fu);
+            }
+            std::vector<uint8_t> t8Data(32u * 32u);
+            for (uint32_t i = 0u; i < 32u * 32u; ++i)
+                t8Data[i] = static_cast<uint8_t>((i * 13u + 5u) & 0xFFu);
+            std::vector<uint8_t> clutData(256u * 4u);
+            for (uint32_t i = 0u; i < 256u; ++i)
+            {
+                clutData[i * 4u + 0u] = static_cast<uint8_t>(i);
+                clutData[i * 4u + 1u] = static_cast<uint8_t>(255u - i);
+                clutData[i * 4u + 2u] = static_cast<uint8_t>((i * 3u) & 0xFFu);
+                clutData[i * 4u + 3u] = static_cast<uint8_t>(0x40u + (i & 0x3Fu));
+            }
+            std::vector<uint8_t> t4Data(16u * 16u / 2u);
+            for (uint32_t i = 0u; i < t4Data.size(); ++i)
+                t4Data[i] = static_cast<uint8_t>(((i * 5u) & 0x0Fu) | (((i * 9u + 3u) & 0x0Fu) << 4u));
+
+            runOnBoth([&](GSRasterBackend &b)
+            {
+                GSTransferCommand tr{};
+                tr.direction = 0u;
+                // Upload 16x16 PSMCT32 texture at block 6400 (page 200)
+                tr.bitbltbuf = {0u, 0u, 0u, 6400u, 1u, GS_PSM_CT32};
+                tr.trxpos = {0u, 0u, 0u, 0u, 0u};
+                tr.trxreg = {16u, 16u};
+                b.BeginTransfer(tr);
+                b.UploadImage(ct32Data.data(), static_cast<uint32_t>(ct32Data.size()));
+
+                // Upload 32x32 PSMT8 texture at block 6720 (page 210)
+                tr.bitbltbuf = {0u, 0u, 0u, 6720u, 2u, GS_PSM_T8};
+                tr.trxreg = {32u, 32u};
+                b.BeginTransfer(tr);
+                b.UploadImage(t8Data.data(), static_cast<uint32_t>(t8Data.size()));
+
+                // Upload 16x16 PSMCT32 CLUT at block 7040 (page 220)
+                tr.bitbltbuf = {0u, 0u, 0u, 7040u, 1u, GS_PSM_CT32};
+                tr.trxreg = {16u, 16u};
+                b.BeginTransfer(tr);
+                b.UploadImage(clutData.data(), static_cast<uint32_t>(clutData.size()));
+
+                // Upload 16x16 PSMT4 texture at block 7360 (page 230)
+                tr.bitbltbuf = {0u, 0u, 0u, 7360u, 2u, GS_PSM_T4};
+                tr.trxreg = {16u, 16u};
+                b.BeginTransfer(tr);
+                b.UploadImage(t4Data.data(), static_cast<uint32_t>(t4Data.size()));
+
+                // Load CLUT
+                GSTex0Reg tex0{};
+                tex0.psm = GS_PSM_T8;
+                tex0.cbp = 7040u;
+                tex0.cpsm = GS_PSM_CT32;
+                tex0.csm = 0u;
+                tex0.csa = 0u;
+                tex0.cld = 1u;
+                b.LoadClut(tex0, {});
+            });
+
+            // 2. Clear framebuffer (fbp=10, fbw=10, CT32) and Z-buffer (zbp=80, Z16S) via sprites.
+            runOnBoth([&](GSRasterBackend &b)
+            {
+                GSPrimitiveBatch clr{};
+                clr.vertexCount = 2u;
+                clr.state.prim.type = GS_PRIM_SPRITE;
+                clr.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                clr.state.context.zbuf = {80u, GS_PSM_Z16S, false};
+                clr.state.context.scissor = {0u, 639u, 0u, 223u};
+                clr.state.context.test = (1ull << 17u); // ZTEST ALWAYS
+                clr.vertices[0] = {0.0f, 0.0f, 100.0, 20, 30, 40, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                clr.vertices[1] = {640.0f, 224.0f, 100.0, 20, 30, 40, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                b.Submit(clr);
+
+                // Non-overlapping + overlapping 16x8 PSMCT32 sprites (source-alpha & fixed-alpha, Z16S).
+                for (int i = 0; i < 6; ++i)
+                {
+                    GSPrimitiveBatch sp{};
+                    sp.vertexCount = 2u;
+                    sp.state.prim.type = GS_PRIM_SPRITE;
+                    sp.state.prim.tme = true;
+                    sp.state.prim.abe = true;
+                    sp.state.prim.fst = true;
+                    sp.state.textureWidth = 16u;
+                    sp.state.textureHeight = 16u;
+                    sp.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                    sp.state.context.zbuf = {80u, GS_PSM_Z16S, false};
+                    sp.state.context.scissor = {0u, 639u, 0u, 223u};
+                    sp.state.context.test = 0x5000Dull;
+                    sp.state.context.alpha = (i % 2 == 0) ? 0x44ull : 0x4600000068ull;
+                    sp.state.context.clamp = 5ull;
+                    sp.state.context.tex0 = {6400u, 1u, GS_PSM_CT32, 4u, 4u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
+                    // Indices 4 and 5 intentionally overlap indices 0 and 1 to exercise wave barriers!
+                    const float sx = (i < 4) ? static_cast<float>(i * 16) : static_cast<float>((i - 4) * 8 + 4);
+                    const float sy = (i < 4) ? 16.0f : 18.0f;
+                    sp.vertices[0] = {sx, sy, 0.0, 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                    sp.vertices[1] = {sx + 16.0f, sy + 8.0f, static_cast<double>(200 + i * 10), 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 256, 128, 0};
+                    b.Submit(sp);
+                }
+
+                // 3. Textured bilinear Gouraud + flat triangles (PSMT8 + CLUT, Z16S, alpha blend, fba, fbmsk).
+                GSPrimitiveBatch tri{};
+                tri.vertexCount = 3u;
+                tri.state.prim.type = GS_PRIM_TRISTRIP;
+                tri.state.prim.iip = true;
+                tri.state.prim.tme = true;
+                tri.state.prim.abe = true;
+                tri.state.linearFilter = true;
+                tri.state.textureWidth = 32u;
+                tri.state.textureHeight = 32u;
+                tri.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                tri.state.context.zbuf = {80u, GS_PSM_Z16S, false};
+                tri.state.context.scissor = {0u, 639u, 0u, 223u};
+                tri.state.context.test = 0x5000Dull;
+                tri.state.context.alpha = 0x44ull;
+                tri.state.context.clamp = 5ull;
+                tri.state.context.fba = 1ull;
+                tri.state.context.tex0 = {6720u, 2u, GS_PSM_T8, 5u, 5u, 1u, 0u, 7040u, GS_PSM_CT32, 0u, 0u, 0u};
+                tri.vertices[0] = {100.0f, 40.0f, 500.0, 140, 100, 90, 0x80, 1.0f, 0.1f, 0.1f, 0, 0, 0};
+                tri.vertices[1] = {140.0f, 44.0f, 600.0, 90, 150, 110, 0x60, 1.0f, 0.9f, 0.2f, 0, 0, 0};
+                tri.vertices[2] = {118.0f, 82.0f, 550.0, 110, 120, 160, 0x70, 1.0f, 0.5f, 0.9f, 0, 0, 0};
+                b.Submit(tri);
+                // 3b. Interleaved 2-chunk 16x8 PSMCT32 scratch upload -> sprite -> overwrite -> sprite
+                //     (exercises deferred scratch staging bypass and WAR safety on the same tbp0).
+                std::vector<uint8_t> scratchA(16u * 8u * 4u);
+                std::vector<uint8_t> scratchB(16u * 8u * 4u);
+                for (uint32_t i = 0u; i < 16u * 8u; ++i)
+                {
+                    scratchA[i * 4u + 0u] = static_cast<uint8_t>((i * 5u + 11u) & 0xFFu);
+                    scratchA[i * 4u + 1u] = static_cast<uint8_t>((i * 3u + 70u) & 0xFFu);
+                    scratchA[i * 4u + 2u] = static_cast<uint8_t>((i * 7u + 20u) & 0xFFu);
+                    scratchA[i * 4u + 3u] = 0x80u;
+                    scratchB[i * 4u + 0u] = static_cast<uint8_t>((i * 9u + 120u) & 0xFFu);
+                    scratchB[i * 4u + 1u] = static_cast<uint8_t>((i * 11u + 15u) & 0xFFu);
+                    scratchB[i * 4u + 2u] = static_cast<uint8_t>((i * 13u + 90u) & 0xFFu);
+                    scratchB[i * 4u + 3u] = 0x60u;
+                }
+                GSTransferCommand scrTr{};
+                scrTr.direction = 0u;
+                scrTr.bitbltbuf = {0u, 0u, 0u, 6400u, 1u, GS_PSM_CT32};
+                scrTr.trxpos = {0u, 0u, 0u, 0u, 0u};
+                scrTr.trxreg = {16u, 8u};
+                b.BeginTransfer(scrTr);
+                b.UploadImage(scratchA.data(), static_cast<uint32_t>(scratchA.size() / 2u));
+                b.UploadImage(scratchA.data() + scratchA.size() / 2u, static_cast<uint32_t>(scratchA.size() / 2u));
+                b.TextureFlush();
+
+                GSPrimitiveBatch scrSp{};
+                scrSp.vertexCount = 2u;
+                scrSp.state.prim.type = GS_PRIM_SPRITE;
+                scrSp.state.prim.tme = true;
+                scrSp.state.prim.abe = true;
+                scrSp.state.prim.fst = true;
+                scrSp.state.textureWidth = 16u;
+                scrSp.state.textureHeight = 16u;
+                scrSp.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                scrSp.state.context.zbuf = {80u, GS_PSM_Z16S, false};
+                scrSp.state.context.scissor = {0u, 639u, 0u, 223u};
+                scrSp.state.context.test = 0x5000Dull;
+                scrSp.state.context.alpha = 0x44ull;
+                scrSp.state.context.clamp = 5ull;
+                scrSp.state.context.tex0 = {6400u, 1u, GS_PSM_CT32, 4u, 4u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
+                scrSp.vertices[0] = {104.0f, 48.0f, 0.0, 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                scrSp.vertices[1] = {120.0f, 56.0f, 650.0, 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 256, 128, 0};
+                b.Submit(scrSp);
+
+                // Overwrite exact same tbp0 with scratchB and draw another overlapping sprite.
+                b.BeginTransfer(scrTr);
+                b.UploadImage(scratchB.data(), static_cast<uint32_t>(scratchB.size() / 2u));
+                b.UploadImage(scratchB.data() + scratchB.size() / 2u, static_cast<uint32_t>(scratchB.size() / 2u));
+                b.TextureFlush();
+                scrSp.vertices[0].x = 112.0f;
+                scrSp.vertices[1].x = 128.0f;
+                scrSp.vertices[1].z = 700.0;
+                b.Submit(scrSp);
+
+                // Partial contiguous transfer interrupted by another BeginTransfer.
+                GSTransferCommand partTr{};
+                partTr.direction = 0u;
+                partTr.bitbltbuf = {0u, 0u, 0u, 7680u, 1u, GS_PSM_CT32};
+                partTr.trxpos = {0u, 0u, 0u, 0u, 0u};
+                partTr.trxreg = {8u, 4u};
+                b.BeginTransfer(partTr);
+                b.UploadImage(scratchA.data(), 8u * 2u * 4u); // only half of the 8x4 transfer
+                b.BeginTransfer(scrTr); // aborts partial transfer; first 16 pixels must still land
+                b.UploadImage(scratchB.data(), static_cast<uint32_t>(scratchB.size()));
+
+                // 3c. PSMCT16 render target alpha bit (a=0x90 sets bit 15, a=0x50 clears it, matching GSCpuBackend::WritePixel).
+                GSPrimitiveBatch rt16{};
+                rt16.vertexCount = 2u;
+                rt16.state.prim.type = GS_PRIM_SPRITE;
+                rt16.state.context.frame = {180u, 2u, GS_PSM_CT16, 0u};
+                rt16.state.context.zbuf = {80u, GS_PSM_Z16S, true};
+                rt16.state.context.scissor = {0u, 127u, 0u, 63u};
+                rt16.state.context.test = (1ull << 17u);
+                rt16.vertices[0] = {0.0f, 0.0f, 0.0, 200, 100, 50, 0x90, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                rt16.vertices[1] = {8.0f, 8.0f, 0.0, 200, 100, 50, 0x90, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                b.Submit(rt16);
+                rt16.vertices[0] = {8.0f, 0.0f, 0.0, 200, 100, 50, 0x50, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                rt16.vertices[1] = {16.0f, 8.0f, 0.0, 200, 100, 50, 0x50, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                b.Submit(rt16);
+            });
+
+            std::vector<uint8_t> snapCpu, snapVk;
+            cpuBackend.SnapshotVram(snapCpu);
+            vkBackend->SnapshotVram(snapVk);
+            t.Equals(snapVk.size(), snapCpu.size(), "Vulkan VRAM snapshot size must match CPU");
+            if (snapVk != snapCpu)
+            {
+                size_t diffs = 0u, firstOff = 0u;
+                for (size_t i = 0u; i < std::min(snapVk.size(), snapCpu.size()); ++i)
+                {
+                    if (snapVk[i] != snapCpu[i])
+                    {
+                        if (diffs == 0u) firstOff = i;
+                        ++diffs;
+                    }
+                }
+                std::cerr << "[vk-test] vram diffs=" << diffs << " firstOff=0x" << std::hex << firstOff
+                          << " page=" << std::dec << (firstOff / 8192u)
+                          << " cpu=" << int(snapCpu[firstOff]) << " vk=" << int(snapVk[firstOff]) << "\n";
+            }
+            t.Equals(snapVk == snapCpu, true, "Vulkan 4 MiB VRAM must match CPU byte-for-byte");
+
+            // 4. Non-intrusive Present parity: queue a draw into an unrelated buffer (fbp=140)
+            //    while presenting fbp=10, then verify both fbp=10 Present and final fbp=140 VRAM match.
+            runOnBoth([&](GSRasterBackend &b)
+            {
+                GSPrimitiveBatch backDraw{};
+                backDraw.vertexCount = 2u;
+                backDraw.state.prim.type = GS_PRIM_SPRITE;
+                backDraw.state.context.frame = {140u, 10u, GS_PSM_CT32, 0u};
+                backDraw.state.context.zbuf = {80u, GS_PSM_Z16S, true};
+                backDraw.state.context.scissor = {0u, 639u, 0u, 223u};
+                backDraw.state.context.test = (1ull << 17u);
+                backDraw.vertices[0] = {0.0f, 0.0f, 0.0, 99, 88, 77, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                backDraw.vertices[1] = {32.0f, 16.0f, 0.0, 99, 88, 77, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                b.Submit(backDraw);
+            });
+
+            GSPresentationRequest req{};
+            req.pmode = 0x1ull;
+            req.dispfb1 = 10ull | (10ull << 9u) | (static_cast<uint64_t>(GS_PSM_CT32) << 15u);
+            req.display1 = (3ull << 23u) | ((640ull * 4ull - 1ull) << 32u) | (223ull << 44u);
+            req.smode2 = 0x1ull; // interlaced field mode
+            req.vsyncTick = 1ull;
+            const PresentationFrame cpuFrame = cpuBackend.Present(req);
+            const PresentationFrame vkFrame = vkBackend->Present(req);
+            t.Equals(vkFrame.width, cpuFrame.width, "Vulkan present width must match CPU");
+            t.Equals(vkFrame.height, cpuFrame.height, "Vulkan present height must match CPU");
+            t.Equals(vkFrame.pixels == cpuFrame.pixels, true, "Vulkan 640x512 RGBA present output must match CPU byte-for-byte");
+
+            cpuBackend.SnapshotVram(snapCpu);
+            vkBackend->SnapshotVram(snapVk);
+            t.Equals(snapVk == snapCpu, true, "Pending unrelated buffer draw must survive non-intrusive Present");
         });
     });
 }

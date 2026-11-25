@@ -916,16 +916,38 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
+    namespace
+    {
+        // PS2 EE (R5900) COP1 only implements single-precision float; C double
+        // arguments and return values use 64-bit GPRs ($a0, $a1 -> $v0).
+        double readDoubleArg(const R5900Context *ctx, int reg)
+        {
+            if (!ctx)
+                return 0.0;
+            const uint64_t bits = GPR_U64(ctx, reg);
+            double value = 0.0;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        }
+
+        void writeDoubleReturn(R5900Context *ctx, double value)
+        {
+            if (!ctx)
+                return;
+            uint64_t bits = 0u;
+            std::memcpy(&bits, &value, sizeof(bits));
+            SET_GPR_U64(ctx, 2, bits);
+        }
+    }
+
     void sqrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sqrtf(arg);
+        writeDoubleReturn(ctx, std::sqrt(readDoubleArg(ctx, 4)));
     }
 
     void sin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sinf(arg);
+        writeDoubleReturn(ctx, std::sin(readDoubleArg(ctx, 4)));
     }
 
     void __kernel_sinf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -938,8 +960,7 @@ namespace ps2_stubs
 
     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::cosf(arg);
+        writeDoubleReturn(ctx, std::cos(readDoubleArg(ctx, 4)));
     }
 
     void __kernel_cosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -974,58 +995,47 @@ namespace ps2_stubs
 
     void tan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::tanf(arg);
+        writeDoubleReturn(ctx, std::tan(readDoubleArg(ctx, 4)));
     }
 
     void atan2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float y = ctx->f[12];
-        float x = ctx->f[14];
-        ctx->f[0] = ::atan2f(y, x);
+        writeDoubleReturn(ctx, std::atan2(readDoubleArg(ctx, 4), readDoubleArg(ctx, 5)));
     }
 
     void pow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float base = ctx->f[12];
-        float exp = ctx->f[14];
-        ctx->f[0] = ::powf(base, exp);
+        writeDoubleReturn(ctx, std::pow(readDoubleArg(ctx, 4), readDoubleArg(ctx, 5)));
     }
 
     void exp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::expf(arg);
+        writeDoubleReturn(ctx, std::exp(readDoubleArg(ctx, 4)));
     }
 
     void log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::logf(arg);
+        writeDoubleReturn(ctx, std::log(readDoubleArg(ctx, 4)));
     }
 
     void log10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::log10f(arg);
+        writeDoubleReturn(ctx, std::log10(readDoubleArg(ctx, 4)));
     }
 
     void ceil(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::ceilf(arg);
+        writeDoubleReturn(ctx, std::ceil(readDoubleArg(ctx, 4)));
     }
 
     void floor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::floorf(arg);
+        writeDoubleReturn(ctx, std::floor(readDoubleArg(ctx, 4)));
     }
 
     void fabs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::fabsf(arg);
+        writeDoubleReturn(ctx, std::fabs(readDoubleArg(ctx, 4)));
     }
     void abs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1040,21 +1050,7 @@ namespace ps2_stubs
 
     void atan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float in = ctx ? ctx->f[12] : 0.0f;
-        if (in == 0.0f)
-        {
-            uint32_t raw = getRegU32(ctx, 4);
-            std::memcpy(&in, &raw, sizeof(in));
-        }
-        const float out = std::atan(in);
-        if (ctx)
-        {
-            ctx->f[0] = out;
-        }
-
-        uint32_t outRaw = 0u;
-        std::memcpy(&outRaw, &out, sizeof(outRaw));
-        setReturnU32(ctx, outRaw);
+        writeDoubleReturn(ctx, std::atan(readDoubleArg(ctx, 4)));
     }
 
     void memchr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

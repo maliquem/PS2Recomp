@@ -1,7 +1,10 @@
 #ifndef PS2_VU1_DETAIL_H
 #define PS2_VU1_DETAIL_H
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 
 // Instruction field extraction helpers
 static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
@@ -24,6 +27,35 @@ static inline int16_t IMM15(uint32_t i)
     uint32_t hi4 = (i >> 21) & 0xF;
     uint32_t raw = (hi4 << 11) | lo11;
     return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+}
+
+static inline uint8_t vuNormalizeFmacExactResult(float &value, long double exactResult)
+{
+    const bool negative = std::signbit(exactResult);
+    const long double magnitude = std::fabs(exactResult);
+    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
+    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+    uint8_t flags = negative ? 0x2u : 0u;
+
+    uint32_t bits = negative ? 0x80000000u : 0u;
+    if (magnitude == 0.0L)
+    {
+        flags |= 0x1u;
+        std::memcpy(&value, &bits, sizeof(value));
+    }
+    else if (magnitude > maximum)
+    {
+        flags |= 0x8u;
+        bits |= 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+    }
+    else if (magnitude < minimum)
+    {
+        flags |= 0x5u;
+        std::memcpy(&value, &bits, sizeof(value));
+    }
+
+    return flags;
 }
 
 #endif

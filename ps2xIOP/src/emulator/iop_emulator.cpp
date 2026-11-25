@@ -18,6 +18,7 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -93,6 +94,20 @@ namespace ps2x::iop::detail
             uint32_t argument = 0u;
         };
 
+        struct AutoDmaState
+        {
+            bool active = false;
+            bool continuous = false;
+            int irq = 0;
+            uint32_t startMadr = 0u;
+            uint32_t currentMadr = 0u;
+            uint32_t totalBytes = 0u;
+            uint32_t bytesRemaining = 0u;
+        };
+
+        static constexpr uint32_t kAudioChunkFrames = 256u;
+        static constexpr uint64_t kAudioChunkCycles = static_cast<uint64_t>(kAudioChunkFrames) * 768u;
+
         explicit Impl(IopHost &hostRef)
             : host(hostRef),
               sysmem(host, memory),
@@ -129,8 +144,13 @@ namespace ps2x::iop::detail
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            idleUntil = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            cycleOvershoot = 0;
+            nextAudioCycle = kAudioChunkCycles;
+            audioStreamActive = false;
+            autoDma = {};
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -177,7 +197,109 @@ namespace ps2x::iop::detail
         void schedulePendingDma()
         {
             if (const auto dma = memory.takeDmaStart())
-                pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+            {
+                if (dma->autoDma && dma->byteSize >= 1024u)
+                {
+                    const uint32_t alignedBytes = dma->byteSize & ~1023u;
+                    auto &state = autoDma[static_cast<size_t>(dma->core & 1)];
+                    state.active = true;
+                    state.continuous = dma->continuous;
+                    state.irq = dma->irq;
+                    state.startMadr = dma->madr;
+                    state.currentMadr = dma->madr;
+                    state.totalBytes = alignedBytes;
+                    state.bytesRemaining = alignedBytes;
+                    if (nextAudioCycle <= totalCycles)
+                        nextAudioCycle = totalCycles + kAudioChunkCycles;
+                }
+                else
+                {
+                    if (dma->byteSize > 0u)
+                    {
+                        std::vector<uint8_t> buf(dma->byteSize);
+                        if (dma->toSpu)
+                        {
+                            if (memory.readRam(dma->madr, buf.data(), dma->byteSize))
+                                memory.spu2().dmaWrite(dma->core, buf.data(), dma->byteSize);
+                        }
+                        else
+                        {
+                            memory.spu2().dmaRead(dma->core, buf.data(), dma->byteSize);
+                            (void)memory.writeRam(dma->madr, buf.data(), dma->byteSize);
+                        }
+                    }
+                    pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+                }
+            }
+        }
+
+        void advanceSpu2Audio()
+        {
+            while (totalCycles >= nextAudioCycle)
+            {
+                nextAudioCycle += kAudioChunkCycles;
+
+                std::array<int16_t, kAudioChunkFrames * 2u> stereo{};
+                bool producedAudio = memory.spu2().render(stereo.data(), kAudioChunkFrames);
+
+                for (int c = 0; c < 2; ++c)
+                {
+                    AutoDmaState &state = autoDma[static_cast<size_t>(c)];
+                    if (!state.active)
+                        continue;
+
+                    if (!memory.spu2().isAutoDmaEnabled(c))
+                    {
+                        state.active = false;
+                        continue;
+                    }
+
+                    uint8_t raw[1024]{};
+                    if (memory.readRam(state.currentMadr, raw, sizeof(raw)))
+                    {
+                        int32_t volL = 0x7FFE;
+                        int32_t volR = 0x7FFE;
+                        memory.spu2().getAutoDmaVolume(c, volL, volR);
+                        const int16_t *left = reinterpret_cast<const int16_t *>(raw);
+                        const int16_t *right = reinterpret_cast<const int16_t *>(raw + 512u);
+                        for (uint32_t i = 0u; i < kAudioChunkFrames; ++i)
+                        {
+                            const int32_t sL = (static_cast<int32_t>(left[i]) * volL) >> 15;
+                            const int32_t sR = (static_cast<int32_t>(right[i]) * volR) >> 15;
+                            stereo[i * 2u] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(stereo[i * 2u]) + sL, -32768, 32767));
+                            stereo[i * 2u + 1u] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(stereo[i * 2u + 1u]) + sR, -32768, 32767));
+                        }
+                        producedAudio = true;
+                    }
+
+                    state.currentMadr += 1024u;
+                    state.bytesRemaining = (state.bytesRemaining > 1024u) ? (state.bytesRemaining - 1024u) : 0u;
+                    const uint32_t madrReg = (c == 0) ? 0x1F8010C0u : 0x1F801500u;
+                    if (state.bytesRemaining == 0u)
+                    {
+                        if (state.continuous)
+                        {
+                            state.currentMadr = state.startMadr;
+                            state.bytesRemaining = state.totalBytes;
+                        }
+                        else
+                        {
+                            state.active = false;
+                        }
+                        memory.setHardwareRegister32(madrReg, state.currentMadr);
+                        pendingDmaInterrupts[state.irq] = totalCycles;
+                    }
+                    else
+                    {
+                        memory.setHardwareRegister32(madrReg, state.currentMadr);
+                    }
+                }
+
+                if (producedAudio)
+                    audioStreamActive = true;
+                if (audioStreamActive)
+                    host.submitSpu2Pcm(0, stereo.data(), kAudioChunkFrames);
+            }
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -423,6 +545,7 @@ namespace ps2x::iop::detail
                               uint32_t gp,
                               uint32_t budget = kMaxCallInstructions)
         {
+            idleUntil = 0;
             struct CallDepthGuard
             {
                 uint32_t &depth;
@@ -555,23 +678,38 @@ namespace ps2x::iop::detail
 
         void runCycles(uint64_t cycles) noexcept
         {
+            const uint64_t target = totalCycles + cycles;
+            if (target <= totalCycles)
+                return;
+            if (target <= idleUntil)
+            {
+                totalCycles = target;
+                return;
+            }
+            idleUntil = 0;
+            ++runDepth;
             try
             {
-                const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    advanceSpu2Audio();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
+                        if (nextAudioCycle > totalCycles)
+                            nextWake = std::min(nextWake, nextAudioCycle);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        // A deadline at the end of the budget is serviced on the next advance.
+                        if (target <= nextWake && nextAudioCycle > totalCycles && runDepth == 1u && !activeCpu)
+                            idleUntil = nextWake;
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -586,6 +724,7 @@ namespace ps2x::iop::detail
             {
                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
             }
+            --runDepth;
         }
 
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
@@ -700,8 +839,14 @@ namespace ps2x::iop::detail
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
+        uint64_t idleUntil = 0;
+        uint32_t runDepth = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        uint64_t cycleOvershoot = 0;
+        uint64_t nextAudioCycle = kAudioChunkCycles;
+        bool audioStreamActive = false;
+        std::array<AutoDmaState, 2> autoDma{};
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -726,16 +871,19 @@ namespace ps2x::iop::detail
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->idleUntil = 0;
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->idleUntil = 0;
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->idleUntil = 0;
         return m_impl->stopModule(moduleId, result);
     }
 
@@ -744,12 +892,25 @@ namespace ps2x::iop::detail
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        if (iopCycles == 0u)
+            return;
+        if (m_impl->cycleOvershoot >= iopCycles)
+        {
+            m_impl->cycleOvershoot -= iopCycles;
+            return;
+        }
+        const uint64_t budget = iopCycles - m_impl->cycleOvershoot;
+        m_impl->cycleOvershoot = 0u;
+        const uint64_t before = m_impl->totalCycles;
+        m_impl->runCycles(budget);
+        const uint64_t elapsed = m_impl->totalCycles - before;
+        if (elapsed > budget)
+            m_impl->cycleOvershoot = elapsed - budget;
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        m_impl->idleUntil = 0;
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -760,6 +921,7 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->idleUntil = 0;
         m_impl->rpc.onSifTransfer(transfer);
     }
 

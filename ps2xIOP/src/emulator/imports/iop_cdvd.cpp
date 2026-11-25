@@ -667,8 +667,8 @@ namespace ps2x::iop::detail
             const size_t byteCount = static_cast<size_t>(byteCount64);
             std::vector<uint8_t> bytes(byteCount, 0u);
 
-            bool read = false;
-            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
+            bool read = host.readCdSectors(lsn, sectors, bytes.data(), byteCount);
+            const std::string imagePath = read ? std::string{} : host.hostPath(HostPathKind::CdImage);
             if (!imagePath.empty())
             {
                 if (imageHandle == 0u)

@@ -179,6 +179,7 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
     std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
+    std::array<uint8_t, 16> gMpegStreamCallbackPayload{};
     constexpr uint32_t kMpegCallbackStopPc = 0x00124FF0u;
     std::atomic<int32_t> gMpegWaitResult{-999};
     std::atomic<uint32_t> gMpegWaitStage{0u};
@@ -304,6 +305,9 @@ namespace
         gMpegStreamCallbackDataAddr.store(dataAddr, std::memory_order_release);
         gMpegStreamCallbackLen.store(len, std::memory_order_release);
         gMpegStreamCallbackUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        if (dataAddr < PS2_RAM_SIZE && len <= PS2_RAM_SIZE - dataAddr)
+            std::memcpy(gMpegStreamCallbackPayload.data(), rdram + dataAddr,
+                        std::min<size_t>(len, gMpegStreamCallbackPayload.size()));
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
         ctx->pc = 0u;
         runtime->requestStop();
@@ -608,10 +612,12 @@ void register_ps2_runtime_expansion_tests()
             registerGenericCallback(2u, 0xDEAD0002u);
             registerStreamCallback(0u, kVideoUserData);
             registerStreamCallback(2u, kAudioUserData);
+            registerStreamCallback(4u, kAudioUserData);
 
             const std::vector<uint8_t> videoPayload = {
                 0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
             const uint32_t videoPacketSize = writePesPacket(kVideoPacketAddr, 0xE0u, videoPayload);
+            ps2_stubs::notifyMpegCdStreamDataProduced(videoPacketSize, false);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
             prepareCallbackDispatch();
@@ -640,33 +646,54 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kVideoUserData,
                      "video callback should receive registered user data");
 
-            const std::vector<uint8_t> audioPayload = {0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
-            const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, audioPayload);
+            auto checkAudioPacket = [&](const std::vector<uint8_t> &payload, uint32_t expectedStreamType)
+            {
+                const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, payload);
+                const bool privatePcm = expectedStreamType == 4u;
+                ps2_stubs::notifyMpegCdStreamDataProduced(audioPacketSize, false);
+                if (privatePcm)
+                    ps2_stubs::notifyMpegCdStreamEof();
+                constexpr uint32_t kRingSize = 64u;
+                constexpr uint32_t kBytesBeforeWrap = 14u;
+                uint32_t packetAddr = kAudioPacketAddr;
+                if (privatePcm)
+                {
+                    packetAddr += kRingSize - kBytesBeforeWrap;
+                    std::memcpy(rdram.data() + packetAddr, rdram.data() + kAudioPacketAddr, kBytesBeforeWrap);
+                    std::memmove(rdram.data() + kAudioPacketAddr, rdram.data() + kAudioPacketAddr + kBytesBeforeWrap,
+                                 audioPacketSize - kBytesBeforeWrap);
+                }
+                gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+                prepareCallbackDispatch();
+                R5900Context audioDemuxCtx{};
+                setRegU32(audioDemuxCtx, 4, kMpegAddr);
+                setRegU32(audioDemuxCtx, 5, packetAddr);
+                setRegU32(audioDemuxCtx, 6, audioPacketSize);
+                setRegU32(audioDemuxCtx, 7, kAudioPacketAddr);
+                setRegU32(audioDemuxCtx, 8, privatePcm ? kRingSize : audioPacketSize);
+                ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &audioDemuxCtx, &runtime);
+                if (privatePcm)
+                    std::memset(rdram.data() + kAudioPacketAddr, 0xCC, kRingSize);
+                runtime.eeScheduler().run();
 
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
-            R5900Context audioDemuxCtx{};
-            setRegU32(audioDemuxCtx, 4, kMpegAddr);
-            setRegU32(audioDemuxCtx, 5, kAudioPacketAddr);
-            setRegU32(audioDemuxCtx, 6, audioPacketSize);
-            setRegU32(audioDemuxCtx, 7, kAudioPacketAddr);
-            setRegU32(audioDemuxCtx, 8, audioPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &audioDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
-
-            t.Equals(getRegS32(audioDemuxCtx, 2), static_cast<int32_t>(audioPacketSize),
-                     "sceMpegDemuxPssRing should consume the audio PES packet");
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
-                     "registered audio stream callback should be invoked");
-            t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 2u,
-                     "audio callback data should report PCM stream type");
-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
-                     "audio callback data should point at PES payload");
-            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
-                     static_cast<uint32_t>(audioPayload.size()),
-                     "audio callback data should report PES payload length");
-            t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kAudioUserData,
-                     "audio callback should receive registered user data");
+                t.Equals(getRegS32(audioDemuxCtx, 2), static_cast<int32_t>(audioPacketSize),
+                         "sceMpegDemuxPssRing should consume the audio PES packet");
+                t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                         "only the matching audio stream callback should be invoked");
+                t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), expectedStreamType,
+                         "audio callback data should report the matching stream type");
+                if (!privatePcm)
+                    t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
+                             "legacy audio callback data should point at the PES payload");
+                t.IsTrue(std::equal(payload.begin(), payload.end(), gMpegStreamCallbackPayload.begin()),
+                         "audio callback should read intact payload even after a private PCM ring wrap and reuse");
+                t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire), static_cast<uint32_t>(payload.size()),
+                         "audio callback data should report PES payload length");
+                t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kAudioUserData,
+                         "audio callback should receive registered user data");
+            };
+            checkAudioPacket({0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u}, 2u);
+            checkAudioPacket({0xFFu, 0x90u, 0x00u, 0x00u, 0x34u, 0x12u}, 4u);
 
             ps2_stubs::notifyMpegCdStreamEof();
 

@@ -1,11 +1,96 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <vector>
 
 namespace
 {
+    // shortcut: SPU2 AutoDMA PCM streaming plays 48 kHz 16-bit stereo directly without
+    // SPU2 mixer volume/reverb or 48-voice ADPCM synthesis. Upgrade when a full SPU2
+    // voice/mixer backend is integrated.
+    struct Spu2PcmRing
+    {
+        static constexpr size_t kCapacitySamples = 48000u * 2u; // 1s stereo at 48 kHz
+        static constexpr size_t kMaxBufferedSamples = 24000u * 2u; // 0.5s latency cap
+        std::array<int16_t, kCapacitySamples> data{};
+        size_t readPos = 0u;
+        size_t count = 0u;
+
+        void push(const int16_t *samples, size_t sampleCount)
+        {
+            if (sampleCount >= kMaxBufferedSamples)
+            {
+                samples += (sampleCount - kMaxBufferedSamples);
+                sampleCount = kMaxBufferedSamples;
+                readPos = 0u;
+                count = 0u;
+            }
+            if (count + sampleCount > kMaxBufferedSamples)
+            {
+                const size_t drop = (count + sampleCount) - kMaxBufferedSamples;
+                readPos = (readPos + drop) % kCapacitySamples;
+                count -= drop;
+            }
+            size_t writePos = (readPos + count) % kCapacitySamples;
+            const size_t first = std::min(sampleCount, kCapacitySamples - writePos);
+            std::memcpy(data.data() + writePos, samples, first * sizeof(int16_t));
+            if (sampleCount > first)
+            {
+                std::memcpy(data.data(), samples + first, (sampleCount - first) * sizeof(int16_t));
+            }
+            count += sampleCount;
+        }
+
+        void mixInto(int16_t *dst, size_t sampleCount, bool overwrite)
+        {
+            const size_t toRead = std::min(sampleCount, count);
+            if (overwrite)
+            {
+                for (size_t i = 0; i < toRead; ++i)
+                {
+                    dst[i] = data[(readPos + i) % kCapacitySamples];
+                }
+                if (toRead < sampleCount)
+                {
+                    std::memset(dst + toRead, 0, (sampleCount - toRead) * sizeof(int16_t));
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < toRead; ++i)
+                {
+                    const int32_t sum = static_cast<int32_t>(dst[i]) + data[(readPos + i) % kCapacitySamples];
+                    dst[i] = static_cast<int16_t>(std::clamp(sum, -32768, 32767));
+                }
+            }
+            readPos = (readPos + toRead) % kCapacitySamples;
+            count -= toRead;
+        }
+
+        void clear()
+        {
+            readPos = 0u;
+            count = 0u;
+        }
+    };
+
+    std::mutex g_spu2RingMutex;
+    std::array<Spu2PcmRing, 2> g_spu2Rings;
+
+#if !defined(PLATFORM_VITA)
+    void spu2AudioCallback(void *bufferData, unsigned int frames)
+    {
+        auto *out = static_cast<int16_t *>(bufferData);
+        const size_t sampleCount = static_cast<size_t>(frames) * 2u;
+        std::lock_guard<std::mutex> lock(g_spu2RingMutex);
+        g_spu2Rings[0].mixInto(out, sampleCount, true);
+        g_spu2Rings[1].mixInto(out, sampleCount, false);
+    }
+#endif
+
     std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
     {
         const uint32_t dataSize = static_cast<uint32_t>(sampleCount * 2);
@@ -77,6 +162,10 @@ struct PS2AudioBackend::Impl
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
+#if !defined(PLATFORM_VITA)
+    AudioStream spu2Stream{};
+    bool spu2StreamStarted = false;
+#endif
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -312,6 +401,36 @@ void PS2AudioBackend::stop(uint32_t voiceId)
     (void)voiceId;
 }
 
+void PS2AudioBackend::submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+{
+#if defined(PLATFORM_VITA)
+    (void)core;
+    (void)interleavedStereoPcm;
+    (void)frameCount;
+    return;
+#else
+    if (!m_audioReady || !interleavedStereoPcm || frameCount == 0u || core < 0 || core > 1)
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_spu2RingMutex);
+        g_spu2Rings[static_cast<size_t>(core)].push(interleavedStereoPcm, frameCount * 2u);
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_impl->spu2StreamStarted)
+    {
+        m_impl->spu2Stream = LoadAudioStream(48000u, 16u, 2u);
+        if (m_impl->spu2Stream.buffer != nullptr)
+        {
+            SetAudioStreamCallback(m_impl->spu2Stream, &spu2AudioCallback);
+            PlayAudioStream(m_impl->spu2Stream);
+            m_impl->spu2StreamStarted = true;
+        }
+    }
+#endif
+}
+
 void PS2AudioBackend::stopAll()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -324,5 +443,17 @@ void PS2AudioBackend::stopAll()
         UnloadSound(t.snd);
     }
     m_impl->activeSounds.clear();
+    if (m_impl->spu2StreamStarted)
+    {
+        StopAudioStream(m_impl->spu2Stream);
+        UnloadAudioStream(m_impl->spu2Stream);
+        m_impl->spu2Stream = AudioStream{};
+        m_impl->spu2StreamStarted = false;
+    }
+    {
+        std::lock_guard<std::mutex> ringLock(g_spu2RingMutex);
+        g_spu2Rings[0].clear();
+        g_spu2Rings[1].clear();
+    }
 #endif
 }

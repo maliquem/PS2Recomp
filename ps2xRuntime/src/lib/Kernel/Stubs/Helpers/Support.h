@@ -1811,9 +1811,12 @@ namespace
         if (!ptr)
             return false;
         GsDispEnvMem env{};
-        std::memcpy(&env, ptr, sizeof(env));
+        env.pmode = makePmode(0u, 1u, 1u, 0u, 0u, 0xFFu);
+        env.smode2 = (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
+                     (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
         env.dispfb = dispfb;
         env.display = display;
+        env.bgcolor = 0u;
         std::memcpy(ptr, &env, sizeof(env));
         return true;
     }

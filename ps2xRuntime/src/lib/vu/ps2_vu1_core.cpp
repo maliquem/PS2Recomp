@@ -5,6 +5,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -12,7 +13,12 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <vector>
 #include <ps2_log.h>
+
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 namespace
 {
@@ -24,7 +30,7 @@ namespace
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
 {
-    if (lanes == 0u)
+    if (reg == 0u || lanes == 0u)
         return;
     for (uint32_t index = 0; index < usage.vfReadCount; ++index)
     {
@@ -66,20 +72,17 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
-    m_flagPipeline = {};
+    m_flagPipeline.clear();
     m_fdiv = {};
     m_efu = {};
-    m_storePipeline = {};
-    m_vfWritePipeline = {};
-    m_viWritePipeline = {};
-    m_accWritePipeline = {};
-    m_xgkick = {};
+    m_storePipeline.clear();
+    m_vfWritePipeline.clear();
+    m_viWritePipeline.clear();
+    m_xgkick.reset();
     m_vfReady = {};
     m_viReady = {};
-    m_accReady = {};
     m_vfLatestWrite = {};
     m_viLatestWrite = {};
-    m_accLatestWrite = {};
     m_nextWriteSequence = 0;
     m_efuResourceReady = 0;
     m_workingClip = m_state.clip;
@@ -99,11 +102,6 @@ void VU1Interpreter::reset()
     m_state.r = 0x3F800000u;
     m_cycle = 0;
     resetScheduler();
-}
-
-float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
-{
-    return normalizeOperand(vf[bc & 3u]);
 }
 
 float VU1Interpreter::normalizeOperand(float value) const
@@ -197,11 +195,34 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
                                          uint8_t laneFlags[4])
 {
+    const uint32_t upper = m_currentUpperInstruction;
+    const uint32_t op = upper & 0x3Fu;
+    const uint32_t special = (upper & 3u) | ((upper >> 4) & 0x7Cu);
+    const uint32_t arithmetic = op >= 0x3Cu ? special : op;
+    const bool simple = arithmetic <= 0x07u ||
+                        (arithmetic >= 0x18u && arithmetic <= 0x1Cu) ||
+                        arithmetic == 0x1Eu || arithmetic == 0x20u ||
+                        arithmetic == 0x22u || arithmetic == 0x24u ||
+                        arithmetic == 0x26u || arithmetic == 0x28u ||
+                        arithmetic == 0x2Au || arithmetic == 0x2Cu ||
+                        (op >= 0x3Cu && arithmetic == 0x2Eu);
     for (uint32_t component = 0; component < 4u; ++component)
     {
         laneFlags[component] = 0u;
         if ((dest & laneForComponent(component)) == 0u)
             continue;
+
+        if (simple)
+        {
+            const uint32_t bits = std::bit_cast<uint32_t>(result[component]);
+            const uint32_t magnitude = bits & 0x7FFFFFFFu;
+            // A single operation rounded strictly inside the normal range can only set S.
+            if (magnitude > 0x00800000u && magnitude < 0x7F7FFFFFu)
+            {
+                laneFlags[component] = static_cast<uint8_t>((bits >> 30) & 2u);
+                continue;
+            }
+        }
 
         long double exactResult = 0.0L;
         if (calculateFmacExactResult(component, exactResult))
@@ -402,31 +423,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
 uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
                                                   long double exactResult) const
 {
-    const bool negative = std::signbit(exactResult);
-    const long double magnitude = std::fabs(exactResult);
-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
-    uint8_t flags = negative ? 0x2u : 0u;
-
-    uint32_t bits = negative ? 0x80000000u : 0u;
-    if (magnitude == 0.0L)
-    {
-        flags |= 0x1u;
-        std::memcpy(&value, &bits, sizeof(value));
-    }
-    else if (magnitude > maximum)
-    {
-        flags |= 0x8u;
-        bits |= 0x7F7FFFFFu;
-        std::memcpy(&value, &bits, sizeof(value));
-    }
-    else if (magnitude < minimum)
-    {
-        flags |= 0x5u;
-        std::memcpy(&value, &bits, sizeof(value));
-    }
-
-    return flags;
+    return vuNormalizeFmacExactResult(value, exactResult);
 }
 
 uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
@@ -514,23 +511,13 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
         status |= flags;
     }
 
-    FlagPipelineEntry *entry = nullptr;
-    for (FlagPipelineEntry &candidate : m_flagPipeline)
-    {
-        if (!candidate.valid)
-        {
-            entry = &candidate;
-            break;
-        }
-    }
+    FlagPipelineEntry *entry = m_flagPipeline.schedule();
     if (!entry)
     {
         reportReservedInstruction(true, 0xFFFFFFFFu);
         return;
     }
 
-    *entry = {};
-    entry->valid = true;
     entry->issueCycle = m_cycle;
     entry->readyCycle = m_cycle + kFmacLatency;
     entry->mac = mac;
@@ -558,24 +545,20 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 
 void VU1Interpreter::queueFsset(uint16_t immediate)
 {
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    m_flagPipeline.forEach([&](FlagPipelineEntry &entry)
     {
-        if (entry.valid && entry.issueCycle == m_cycle)
+        if (entry.issueCycle == m_cycle)
             entry.writesStatus = false;
-    }
+    });
 
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    if (auto *slot = m_flagPipeline.schedule())
     {
-        if (!entry.valid)
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
-            entry.writesSticky = true;
-            return;
-        }
+        auto &entry = *slot;
+        entry.issueCycle = m_cycle;
+        entry.readyCycle = m_cycle + kFmacLatency;
+        entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+        entry.writesSticky = true;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFFEu);
 }
@@ -583,18 +566,14 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
 void VU1Interpreter::queueClip(uint32_t clip)
 {
     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    if (auto *slot = m_flagPipeline.schedule())
     {
-        if (!entry.valid)
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            entry.clip = m_workingClip;
-            entry.writesClip = true;
-            return;
-        }
+        auto &entry = *slot;
+        entry.issueCycle = m_cycle;
+        entry.readyCycle = m_cycle + kFmacLatency;
+        entry.clip = m_workingClip;
+        entry.writesClip = true;
+        return;
     }
     reportReservedInstruction(true, 0xFFFFFFFDu);
 }
@@ -602,23 +581,19 @@ void VU1Interpreter::queueClip(uint32_t clip)
 void VU1Interpreter::queueFcset(uint32_t clip)
 {
     m_workingClip = clip & 0xFFFFFFu;
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    m_flagPipeline.forEach([&](FlagPipelineEntry &entry)
     {
-        if (entry.valid && entry.issueCycle == m_cycle)
+        if (entry.issueCycle == m_cycle)
             entry.writesClip = false;
-    }
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    });
+    if (auto *slot = m_flagPipeline.schedule())
     {
-        if (!entry.valid)
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            entry.clip = m_workingClip;
-            entry.writesClip = true;
-            return;
-        }
+        auto &entry = *slot;
+        entry.issueCycle = m_cycle;
+        entry.readyCycle = m_cycle + kFmacLatency;
+        entry.clip = m_workingClip;
+        entry.writesClip = true;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFFAu);
 }
@@ -654,17 +629,14 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
-    for (PendingStore &store : m_storePipeline)
+    if (auto *slot = m_storePipeline.schedule())
     {
-        if (!store.valid)
-        {
-            store.valid = true;
-            store.readyCycle = m_cycle + 1u;
-            store.address = address;
-            store.laneMask = laneMask;
-            std::copy(words, words + 4, store.words.begin());
-            return;
-        }
+        auto &store = *slot;
+        store.readyCycle = m_cycle + 1u;
+        store.address = address;
+        store.laneMask = laneMask;
+        std::copy(words, words + 4, store.words.begin());
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFFCu);
 }
@@ -674,24 +646,25 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
 {
     if (reg == 0u || laneMask == 0u)
         return;
-    for (PendingVfWrite &write : m_vfWritePipeline)
+    if (auto *slot = m_vfWritePipeline.schedule())
     {
-        if (!write.valid)
+        auto &write = *slot;
+        write.readyCycle = m_cycle + latency;
+        write.sequence = ++m_nextWriteSequence;
+        write.reg = reg;
+        write.laneMask = laneMask;
+        std::copy(value, value + 4, write.value.begin());
+        auto &ready = m_vfReady[reg];
+        auto &latest = m_vfLatestWrite[reg];
+        for (uint32_t component = 0; component < 4u; ++component)
         {
-            write = {};
-            write.valid = true;
-            write.readyCycle = m_cycle + latency;
-            write.sequence = ++m_nextWriteSequence;
-            write.reg = reg;
-            write.laneMask = laneMask;
-            std::copy(value, value + 4, write.value.begin());
-            for (uint32_t component = 0; component < 4u; ++component)
+            if ((laneMask & laneForComponent(component)) != 0u)
             {
-                if ((laneMask & laneForComponent(component)) != 0u)
-                    m_vfLatestWrite[reg][component] = write.sequence;
+                ready[component] = write.readyCycle;
+                latest[component] = write.sequence;
             }
-            return;
         }
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFF7u);
 }
@@ -700,54 +673,24 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
 {
     if (reg == 0u)
         return;
-    for (PendingViWrite &write : m_viWritePipeline)
+    if (auto *slot = m_viWritePipeline.schedule())
     {
-        if (!write.valid)
-        {
-            write = {};
-            write.valid = true;
-            write.readyCycle = m_cycle + latency;
-            write.sequence = ++m_nextWriteSequence;
-            write.reg = reg;
-            write.value = value;
-            m_viLatestWrite[reg] = write.sequence;
-            return;
-        }
+        auto &write = *slot;
+        write.readyCycle = m_cycle + latency;
+        write.sequence = ++m_nextWriteSequence;
+        write.reg = reg;
+        write.value = value;
+        m_viReady[reg] = write.readyCycle;
+        m_viLatestWrite[reg] = write.sequence;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFF6u);
 }
 
-void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency)
-{
-    if (laneMask == 0u)
-        return;
-    for (PendingAccWrite &write : m_accWritePipeline)
-    {
-        if (!write.valid)
-        {
-            write = {};
-            write.valid = true;
-            write.readyCycle = m_cycle + latency;
-            write.sequence = ++m_nextWriteSequence;
-            write.laneMask = laneMask;
-            std::copy(value, value + 4, write.value.begin());
-            for (uint32_t component = 0; component < 4u; ++component)
-            {
-                if ((laneMask & laneForComponent(component)) != 0u)
-                    m_accLatestWrite[component] = write.sequence;
-            }
-            return;
-        }
-    }
-    reportReservedInstruction(true, 0xFFFFFFF5u);
-}
-
 void VU1Interpreter::commitReadyPipelines()
 {
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    m_flagPipeline.commit(m_cycle, [&](const FlagPipelineEntry &entry)
     {
-        if (!entry.valid || entry.readyCycle > m_cycle)
-            continue;
 
         if (entry.writesMac)
             m_state.mac = entry.mac;
@@ -762,8 +705,7 @@ void VU1Interpreter::commitReadyPipelines()
         }
         if (entry.writesClip)
             m_state.clip = entry.clip;
-        entry = {};
-    }
+    });
 
     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
     {
@@ -782,10 +724,8 @@ void VU1Interpreter::commitReadyPipelines()
         }
     }
 
-    for (PendingStore &store : m_storePipeline)
+    m_storePipeline.commit(m_cycle, [&](const PendingStore &store)
     {
-        if (!store.valid || store.readyCycle > m_cycle)
-            continue;
         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
         {
             uint32_t oldWords[4]{};
@@ -797,13 +737,10 @@ void VU1Interpreter::commitReadyPipelines()
             }
             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
         }
-        store = {};
-    }
+    });
 
-    for (PendingVfWrite &write : m_vfWritePipeline)
+    m_vfWritePipeline.commit(m_cycle, [&](const PendingVfWrite &write)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
-            continue;
         for (uint32_t component = 0; component < 4u; ++component)
         {
             if ((write.laneMask & laneForComponent(component)) != 0u &&
@@ -812,32 +749,13 @@ void VU1Interpreter::commitReadyPipelines()
                 m_state.vf[write.reg][component] = write.value[component];
             }
         }
-        write = {};
-    }
+    });
 
-    for (PendingViWrite &write : m_viWritePipeline)
+    m_viWritePipeline.commit(m_cycle, [&](const PendingViWrite &write)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
-            continue;
         if (m_viLatestWrite[write.reg] == write.sequence)
             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
-        write = {};
-    }
-
-    for (PendingAccWrite &write : m_accWritePipeline)
-    {
-        if (!write.valid || write.readyCycle > m_cycle)
-            continue;
-        for (uint32_t component = 0; component < 4u; ++component)
-        {
-            if ((write.laneMask & laneForComponent(component)) != 0u &&
-                m_accLatestWrite[component] == write.sequence)
-            {
-                m_state.acc[component] = write.value[component];
-            }
-        }
-        write = {};
-    }
+    });
 }
 
 void VU1Interpreter::progressXgkick()
@@ -857,11 +775,12 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        for (uint32_t i = 0; i < 16u; ++i)
-        {
-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
-        }
+        const uint32_t source = (m_xgkick.sourceAddress + qwordOffset) % m_activeVuDataSize;
+        const uint32_t firstSize = std::min(16u, m_activeVuDataSize - source);
+        uint8_t *destination = m_xgkick.packet.data() + qwordOffset;
+        std::memcpy(destination, m_activeVuData + source, firstSize);
+        if (firstSize != 16u)
+            std::memcpy(destination + firstSize, m_activeVuData, 16u - firstSize);
         m_xgkick.copiedBytes += 16u;
 
         if (m_xgkick.currentTagEnd == 0u)
@@ -932,7 +851,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    m_xgkick.reset();
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
@@ -962,22 +881,8 @@ bool VU1Interpreter::pipelinesPending() const
     for (const ScalarPipelineEntry &entry : m_efu)
         if (entry.valid)
             return true;
-    for (const FlagPipelineEntry &entry : m_flagPipeline)
-        if (entry.valid)
-            return true;
-    for (const PendingStore &store : m_storePipeline)
-        if (store.valid)
-            return true;
-    for (const PendingVfWrite &write : m_vfWritePipeline)
-        if (write.valid)
-            return true;
-    for (const PendingViWrite &write : m_viWritePipeline)
-        if (write.valid)
-            return true;
-    for (const PendingAccWrite &write : m_accWritePipeline)
-        if (write.valid)
-            return true;
-    return false;
+    return m_flagPipeline.pending() || m_storePipeline.pending() ||
+           m_vfWritePipeline.pending() || m_viWritePipeline.pending();
 }
 
 void VU1Interpreter::flushPipelines()
@@ -994,8 +899,6 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
         &decoded.lowerUsage};
     for (const InstructionUsage *usage : usages)
     {
-        if (!usage)
-            continue;
         for (uint32_t index = 0; index < usage->vfReadCount; ++index)
         {
             const VfAccess &access = usage->vfRead[index];
@@ -1005,15 +908,9 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
                     ready = std::max(ready, m_vfReady[access.reg][component]);
             }
         }
-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+        for (uint32_t pendingReads = usage->viRead & ~1u; pendingReads != 0u; pendingReads &= pendingReads - 1u)
         {
-            if ((usage->viRead & (1u << reg)) != 0u)
-                ready = std::max(ready, m_viReady[reg]);
-        }
-        for (uint32_t component = 0; component < 4u; ++component)
-        {
-            if ((usage->accRead & laneForComponent(component)) != 0u)
-                ready = std::max(ready, m_accReady[component]);
+            ready = std::max(ready, m_viReady[std::countr_zero(pendingReads)]);
         }
     }
 
@@ -1063,15 +960,11 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
         }
     }
 
-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+    for (uint32_t pendingWrites = decoded.lowerUsage.viWrite & ~1u;
+         pendingWrites != 0u; pendingWrites &= pendingWrites - 1u)
     {
-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
-    }
-    for (uint32_t component = 0; component < 4u; ++component)
-    {
-        if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
-            m_accReady[component] = m_cycle + kAccForwardLatency;
+        m_viReady[std::countr_zero(pendingWrites)] = m_cycle +
+            (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
     }
 }
 
@@ -1095,13 +988,6 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper
             addVfRead(usage, ft, laneForComponent(op & 3u));
         else if (op >= 0x28u)
             addVfRead(usage, ft, op == 0x2Eu ? 0xEu : dest);
-        if (op == 0x08u || op == 0x09u || op == 0x0Au || op == 0x0Bu ||
-            op == 0x0Cu || op == 0x0Du || op == 0x0Eu || op == 0x0Fu ||
-            op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
-            op == 0x29u || op == 0x2Du || op == 0x2Eu)
-        {
-            usage.accRead = dest;
-        }
         return usage;
     }
 
@@ -1121,13 +1007,6 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper
                 addVfRead(usage, ft, laneForComponent(special & 3u));
             else if ((special >= 0x28u && special <= 0x2Eu))
                 addVfRead(usage, ft, special == 0x2Eu ? 0xEu : dest);
-            usage.accWrite = dest;
-            if ((special >= 0x08u && special <= 0x0Fu) ||
-                special == 0x21u || special == 0x23u || special == 0x25u ||
-                special == 0x27u || special == 0x29u || special == 0x2Du)
-            {
-                usage.accRead = dest;
-            }
         }
         else if (special >= 0x10u && special <= 0x17u)
         {
@@ -1145,7 +1024,11 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper
             addVfRead(usage, ft, 0x1u);
             usage.writesClip = true;
         }
-        else if (special != 0x2Fu && special != 0x30u)
+        else if (special == 0x2Fu || special == 0x30u)
+        {
+            usage.pipeline = PipelineNone;
+        }
+        else
         {
             usage.reserved = true;
         }
@@ -1538,6 +1421,8 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     for (uint32_t i = 0; i < pairCount; ++i)
         m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
 
+    m_fastEntryStatus.fill(0u);
+    m_fastPairCommitted.fill(0u);
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;
     m_cachedCodeSize = codeSize;
@@ -1545,17 +1430,14 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     m_decodedCodeCacheValid = true;
 }
 
-VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
-    const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
+const VU1Interpreter::DecodedInstructionPair *VU1Interpreter::getDecodedCodeCache(
+    const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory)
 {
-    if ((pc & 7u) != 0u)
-        return decodeInstructionPair(vuCode, pc);
-
     const bool trackedVu1Code = memory != nullptr &&
                                 ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
                                  (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
     if (!trackedVu1Code)
-        return decodeInstructionPair(vuCode, pc);
+        return nullptr;
 
     const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
     if (!m_decodedCodeCacheValid ||
@@ -1566,10 +1448,7 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
     {
         rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
     }
-    const uint32_t pairIndex = pc / 8u;
-    if (pairIndex >= kMaxDecodedPairs)
-        return decodeInstructionPair(vuCode, pc);
-    return m_decodedCodeCache[pairIndex];
+    return m_decodedCodeCache.data();
 }
 
 void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
@@ -1632,14 +1511,51 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
+    const auto *decodedCode = getDecodedCodeCache(vuCode, codeSize, memory);
+    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+
+    if (m_unit == Unit::VU1 &&
+        decodedCode != nullptr &&
+        vuData != nullptr &&
+        dataSize >= 16u &&
+        (dataSize & (dataSize - 1u)) == 0u &&
+        maxCycles >= 16384u &&
+        !m_stopRequested &&
+        !m_state.dBitEnabled &&
+        !m_state.tBitEnabled &&
+        !m_state.branchPending &&
+        !m_state.ebit &&
+        !m_state.haltAfterDelaySlot &&
+        !m_viBranchBackupValid &&
+        !pipelinesPending() &&
+        (m_state.pc & 7u) == 0u &&
+        (m_state.pc / 8u) < pairCount &&
+        isFastEntryEligible(m_state.pc / 8u, pairCount))
+    {
+        runFastDirect(vuData, dataSize, pairCount, budgetEnd);
+        if (useVuRounding && previousRoundingMode != -1)
+            std::fesetround(previousRoundingMode);
+        return;
+    }
+
     bool programEnded = false;
+    // advanceOneCycle commits pending writes before the next pair issues.
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
-        commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
             break;
 
-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        const uint32_t pc = m_state.pc;
+        DecodedInstructionPair uncached;
+        const DecodedInstructionPair *pair;
+        if (decodedCode && (pc & 7u) == 0u && pc / 8u < kMaxDecodedPairs)
+            pair = &decodedCode[pc / 8u];
+        else
+        {
+            uncached = decodeInstructionPair(vuCode, pc);
+            pair = &uncached;
+        }
+        const DecodedInstructionPair &decoded = *pair;
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
@@ -1660,17 +1576,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (m_cycle >= budgetEnd)
             break;
 
-        uint8_t writtenVi = 0u;
-        int32_t oldVi = 0;
-        for (uint32_t reg = 1; reg < 16u; ++reg)
-        {
-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            {
-                writtenVi = static_cast<uint8_t>(reg);
-                oldVi = m_state.vi[reg];
-                break;
-            }
-        }
+        const uint32_t viWriteMask = decoded.lowerUsage.viWrite & ~1u;
+        const uint8_t writtenVi = viWriteMask != 0u ? static_cast<uint8_t>(std::countr_zero(viWriteMask)) : 0u;
+        const int32_t oldVi = m_state.vi[writtenVi];
 
         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
         const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
@@ -1681,15 +1589,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         float newUpperVf[4]{};
         float oldLowerVf[4]{};
         float newLowerVf[4]{};
-        float oldAcc[4]{};
-        float newAcc[4]{};
         if (hasUpperWrite)
             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
         if (hasDistinctLowerWrite)
             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
-        if (decoded.upperUsage.accWrite != 0u)
-            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
+        // The lower instruction never reads ACC, and each pair advances a cycle before the next upper reads it.
         if (decoded.iBit)
         {
             execUpper(decoded.upper);
@@ -1718,8 +1623,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         else
         {
-            execUpper(decoded.upper);
-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+            if (decoded.upperUsage.pipeline == PipelineNone)
+                m_currentUpperInstruction = decoded.upper;
+            else
+                execUpper(decoded.upper);
+            if (decoded.lowerUsage.pipeline != PipelineNone)
+                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
         }
 
         m_viBranchBackupValid = false;
@@ -1743,15 +1652,6 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                          : decoded.lowerUsage.latency;
             queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
         }
-        if (decoded.upperUsage.accWrite != 0u)
-        {
-            std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
-            std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
-            // ACC is forwarded to the next upper instruction. Its arithmetic
-            // flags still use the normal four-cycle FMAC timeline.
-            queueAccWrite(decoded.upperUsage.accWrite, newAcc,
-                          kAccForwardLatency);
-        }
         if (writtenVi != 0u)
         {
             const int32_t newVi = m_state.vi[writtenVi];
@@ -1763,7 +1663,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             queueViWrite(writtenVi, newVi, latency);
         }
 
-        markPairWrites(decoded);
+        // Preserve the scoreboard on a stopped pair whose queue write could not be scheduled.
+        if (m_stopRequested)
+            markPairWrites(decoded);
         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
             recordViWriteForBranch(writtenVi, oldVi);
 
@@ -1835,4 +1737,1617 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_state.cycles = m_cycle;
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
+}
+
+namespace
+{
+    enum FastUpperOp : uint8_t
+    {
+        FU_NOP = 0,
+        FU_ADDbc,
+        FU_SUBbc,
+        FU_MADDbc,
+        FU_MSUBbc,
+        FU_MAXbc,
+        FU_MINIbc,
+        FU_MULbc,
+        FU_MULq,
+        FU_MAXi,
+        FU_MULi,
+        FU_MINIi,
+        FU_ADDq,
+        FU_MADDq,
+        FU_ADDi,
+        FU_MADDi,
+        FU_SUBq,
+        FU_MSUBq,
+        FU_SUBi,
+        FU_MSUBi,
+        FU_ADD,
+        FU_MADD,
+        FU_MUL,
+        FU_MAX,
+        FU_SUB,
+        FU_MSUB,
+        FU_OPMSUB,
+        FU_MINI,
+        FU_ADDAbc,
+        FU_SUBAbc,
+        FU_MADDAbc,
+        FU_MSUBAbc,
+        FU_MULAbc,
+        FU_MULAq,
+        FU_MULAi,
+        FU_ADDAq,
+        FU_MADDAq,
+        FU_ADDAi,
+        FU_MADDAi,
+        FU_SUBAq,
+        FU_MSUBAq,
+        FU_SUBAi,
+        FU_MSUBAi,
+        FU_ADDA,
+        FU_MADDA,
+        FU_MULA,
+        FU_SUBA,
+        FU_MSUBA,
+        FU_OPMULA,
+        FU_ITOF0,
+        FU_ITOF4,
+        FU_ITOF12,
+        FU_ITOF15,
+        FU_FTOI0,
+        FU_FTOI4,
+        FU_FTOI12,
+        FU_FTOI15,
+        FU_ABS,
+        FU_CLIPw
+    };
+
+    enum FastLowerOp : uint8_t
+    {
+        FL_NOP = 0,
+        FL_LOI,
+        FL_LQ,
+        FL_SQ,
+        FL_ILW,
+        FL_ISW,
+        FL_LQI,
+        FL_SQI,
+        FL_LQD,
+        FL_SQD,
+        FL_ILWR,
+        FL_ISWR,
+        FL_MOVE,
+        FL_MR32,
+        FL_MTIR,
+        FL_MFIR,
+        FL_IADD,
+        FL_ISUB,
+        FL_IADDI,
+        FL_IAND,
+        FL_IOR,
+        FL_IADDIU,
+        FL_ISUBIU,
+        FL_DIV,
+        FL_SQRT,
+        FL_RSQRT,
+        FL_WAITQ,
+        FL_FCEQ,
+        FL_FCAND,
+        FL_FCOR,
+        FL_B,
+        FL_IBEQ,
+        FL_IBNE,
+        FL_IBLTZ,
+        FL_IBGTZ,
+        FL_IBLEZ,
+        FL_IBGEZ,
+        FL_XTOP,
+        FL_XITOP,
+        FL_XGKICK
+    };
+
+    constexpr uint8_t kFastFlagEBit = 1u << 0;
+    constexpr uint8_t kFastFlagShadowLowerFirst = 1u << 1;
+    constexpr uint8_t kFastFlagIsBranch = 1u << 2;
+    constexpr uint8_t kFastFlagUncondBranch = 1u << 3;
+    constexpr uint8_t kFastFlagReadsQ = 1u << 4;
+    constexpr uint8_t kFastFlagIsStore = 1u << 5;
+
+    inline int32_t fastVuFloatToInt(float value, float scale)
+    {
+        const double scaled = static_cast<double>(value) * static_cast<double>(scale);
+        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+            return std::numeric_limits<int32_t>::max();
+        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
+            return std::numeric_limits<int32_t>::min();
+        return static_cast<int32_t>(scaled);
+    }
+
+#if defined(__SSE2__) || defined(_M_X64)
+    alignas(16) constexpr uint32_t kFastLaneMasks[16][4] = {
+        {0u, 0u, 0u, 0u},
+        {0u, 0u, 0u, ~0u},
+        {0u, 0u, ~0u, 0u},
+        {0u, 0u, ~0u, ~0u},
+        {0u, ~0u, 0u, 0u},
+        {0u, ~0u, 0u, ~0u},
+        {0u, ~0u, ~0u, 0u},
+        {0u, ~0u, ~0u, ~0u},
+        {~0u, 0u, 0u, 0u},
+        {~0u, 0u, 0u, ~0u},
+        {~0u, 0u, ~0u, 0u},
+        {~0u, 0u, ~0u, ~0u},
+        {~0u, ~0u, 0u, 0u},
+        {~0u, ~0u, 0u, ~0u},
+        {~0u, ~0u, ~0u, 0u},
+        {~0u, ~0u, ~0u, ~0u},
+    };
+
+    struct ScopedVuMxcsr
+    {
+        unsigned int saved;
+        ScopedVuMxcsr() : saved(_mm_getcsr())
+        {
+            // Flush-to-zero (bit 15), Round-toward-zero (bits 14:13), Denormals-are-zero (bit 6).
+            _mm_setcsr((saved & ~0x6000u) | 0xE040u);
+        }
+        ~ScopedVuMxcsr()
+        {
+            _mm_setcsr(saved);
+        }
+    };
+
+    inline __m128 sseBroadcastLane(__m128 v, uint8_t lane)
+    {
+        switch (lane)
+        {
+        case 0: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 0, 0, 0));
+        case 1: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(1, 1, 1, 1));
+        case 2: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 2, 2, 2));
+        default: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 3, 3, 3));
+        }
+    }
+
+    inline void sseApplyMask(__m128 &dst, __m128 val, uint8_t dest)
+    {
+        if (dest == 0xFu)
+        {
+            dst = val;
+            return;
+        }
+        const __m128 mask = _mm_load_ps(reinterpret_cast<const float *>(kFastLaneMasks[dest]));
+        dst = _mm_or_ps(_mm_and_ps(mask, val), _mm_andnot_ps(mask, dst));
+    }
+
+    inline __m128 sseClampVuInf(__m128 v)
+    {
+        const __m128i bits = _mm_castps_si128(v);
+        const __m128i expMask = _mm_set1_epi32(0x7F800000);
+        const __m128i isInfOrNan = _mm_cmpeq_epi32(_mm_and_si128(bits, expMask), expMask);
+        if (_mm_movemask_epi8(isInfOrNan) == 0)
+            return v;
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(INT32_MIN));
+        const __m128i clamped = _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF));
+        return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(isInfOrNan, clamped), _mm_andnot_si128(isInfOrNan, bits)));
+    }
+#endif
+}
+
+bool VU1Interpreter::buildFastPair(const DecodedInstructionPair &decoded,
+                                   uint32_t pairIndex,
+                                   uint32_t pairCount,
+                                   FastPair &out) const
+{
+    if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved ||
+        decoded.mBit || decoded.suppressedLowerVf != 0u)
+    {
+        return false;
+    }
+
+    out = {};
+    if (decoded.eBit)
+        out.flags |= kFastFlagEBit;
+    if (decoded.upperUsage.writesClip && decoded.lowerUsage.readsClip)
+        return false;
+
+    if (decoded.upperVfShadowReg != 0u)
+    {
+        // Reject simultaneous cross-shadow where lower writes a VF register that upper reads.
+        const uint8_t lowerWriteReg = decoded.lowerUsage.vfWrite.reg;
+        if (lowerWriteReg != 0u && vfReadLanes(decoded.upperUsage, lowerWriteReg) != 0u)
+            return false;
+        out.flags |= kFastFlagShadowLowerFirst;
+    }
+
+    // Decode upper instruction.
+    const uint32_t upper = decoded.upper;
+    const uint8_t uop = static_cast<uint8_t>(upper & 0x3Fu);
+    out.uDest = DEST(upper);
+    out.uFt = FT(upper);
+    out.uFs = FS(upper);
+    out.uFd = FD(upper);
+
+    if (uop <= 0x2Fu)
+    {
+        if (uop <= 0x03u) { out.upperOp = FU_ADDbc; out.uAux = uop & 3u; }
+        else if (uop <= 0x07u) { out.upperOp = FU_SUBbc; out.uAux = uop & 3u; }
+        else if (uop <= 0x0Bu) { out.upperOp = FU_MADDbc; out.uAux = uop & 3u; }
+        else if (uop <= 0x0Fu) { out.upperOp = FU_MSUBbc; out.uAux = uop & 3u; }
+        else if (uop <= 0x13u) { out.upperOp = FU_MAXbc; out.uAux = uop & 3u; }
+        else if (uop <= 0x17u) { out.upperOp = FU_MINIbc; out.uAux = uop & 3u; }
+        else if (uop <= 0x1Bu) { out.upperOp = FU_MULbc; out.uAux = uop & 3u; }
+        else
+        {
+            switch (uop)
+            {
+            case 0x1C: out.upperOp = FU_MULq; out.flags |= kFastFlagReadsQ; break;
+            case 0x1D: out.upperOp = FU_MAXi; break;
+            case 0x1E: out.upperOp = FU_MULi; break;
+            case 0x1F: out.upperOp = FU_MINIi; break;
+            case 0x20: out.upperOp = FU_ADDq; out.flags |= kFastFlagReadsQ; break;
+            case 0x21: out.upperOp = FU_MADDq; out.flags |= kFastFlagReadsQ; break;
+            case 0x22: out.upperOp = FU_ADDi; break;
+            case 0x23: out.upperOp = FU_MADDi; break;
+            case 0x24: out.upperOp = FU_SUBq; out.flags |= kFastFlagReadsQ; break;
+            case 0x25: out.upperOp = FU_MSUBq; out.flags |= kFastFlagReadsQ; break;
+            case 0x26: out.upperOp = FU_SUBi; break;
+            case 0x27: out.upperOp = FU_MSUBi; break;
+            case 0x28: out.upperOp = FU_ADD; break;
+            case 0x29: out.upperOp = FU_MADD; break;
+            case 0x2A: out.upperOp = FU_MUL; break;
+            case 0x2B: out.upperOp = FU_MAX; break;
+            case 0x2C: out.upperOp = FU_SUB; break;
+            case 0x2D: out.upperOp = FU_MSUB; break;
+            case 0x2E: out.upperOp = FU_OPMSUB; break;
+            case 0x2F: out.upperOp = FU_MINI; break;
+            default: return false;
+            }
+        }
+        if (out.uFd == 0u || out.uDest == 0u)
+            out.upperOp = FU_NOP;
+    }
+    else if (uop >= 0x3Cu)
+    {
+        const uint8_t sp = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
+        if (sp <= 0x03u) { out.upperOp = FU_ADDAbc; out.uAux = sp & 3u; }
+        else if (sp <= 0x07u) { out.upperOp = FU_SUBAbc; out.uAux = sp & 3u; }
+        else if (sp <= 0x0Bu) { out.upperOp = FU_MADDAbc; out.uAux = sp & 3u; }
+        else if (sp <= 0x0Fu) { out.upperOp = FU_MSUBAbc; out.uAux = sp & 3u; }
+        else if (sp >= 0x18u && sp <= 0x1Bu) { out.upperOp = FU_MULAbc; out.uAux = sp & 3u; }
+        else
+        {
+            switch (sp)
+            {
+            case 0x10: out.upperOp = FU_ITOF0; out.uFd = out.uFt; break;
+            case 0x11: out.upperOp = FU_ITOF4; out.uFd = out.uFt; break;
+            case 0x12: out.upperOp = FU_ITOF12; out.uFd = out.uFt; break;
+            case 0x13: out.upperOp = FU_ITOF15; out.uFd = out.uFt; break;
+            case 0x14: out.upperOp = FU_FTOI0; out.uFd = out.uFt; break;
+            case 0x15: out.upperOp = FU_FTOI4; out.uFd = out.uFt; break;
+            case 0x16: out.upperOp = FU_FTOI12; out.uFd = out.uFt; break;
+            case 0x17: out.upperOp = FU_FTOI15; out.uFd = out.uFt; break;
+            case 0x1C: out.upperOp = FU_MULAq; out.flags |= kFastFlagReadsQ; break;
+            case 0x1D: out.upperOp = FU_ABS; out.uFd = out.uFt; break;
+            case 0x1E: out.upperOp = FU_MULAi; break;
+            case 0x1F: out.upperOp = FU_CLIPw; break;
+            case 0x20: out.upperOp = FU_ADDAq; out.flags |= kFastFlagReadsQ; break;
+            case 0x21: out.upperOp = FU_MADDAq; out.flags |= kFastFlagReadsQ; break;
+            case 0x22: out.upperOp = FU_ADDAi; break;
+            case 0x23: out.upperOp = FU_MADDAi; break;
+            case 0x24: out.upperOp = FU_SUBAq; out.flags |= kFastFlagReadsQ; break;
+            case 0x25: out.upperOp = FU_MSUBAq; out.flags |= kFastFlagReadsQ; break;
+            case 0x26: out.upperOp = FU_SUBAi; break;
+            case 0x27: out.upperOp = FU_MSUBAi; break;
+            case 0x28: out.upperOp = FU_ADDA; break;
+            case 0x29: out.upperOp = FU_MADDA; break;
+            case 0x2A: out.upperOp = FU_MULA; break;
+            case 0x2C: out.upperOp = FU_SUBA; break;
+            case 0x2D: out.upperOp = FU_MSUBA; break;
+            case 0x2E: out.upperOp = FU_OPMULA; break;
+            case 0x2F:
+            case 0x30:
+                out.upperOp = FU_NOP;
+                break;
+            default:
+                return false;
+            }
+        }
+        if ((out.upperOp >= FU_ITOF0 && out.upperOp <= FU_ABS) && (out.uFd == 0u || out.uDest == 0u))
+            out.upperOp = FU_NOP;
+    }
+    else
+    {
+        return false;
+    }
+
+    // Reject lower-first shadow pairs where lower updates Q while upper reads Q.
+    if ((out.flags & kFastFlagShadowLowerFirst) != 0u &&
+        (out.flags & kFastFlagReadsQ) != 0u &&
+        decoded.lowerUsage.pipeline == PipelineFdiv)
+    {
+        return false;
+    }
+
+    // Decode lower instruction.
+    const uint32_t lower = decoded.lower;
+    if (decoded.iBit)
+    {
+        out.lowerOp = FL_LOI;
+        out.imm24 = lower;
+        return true;
+    }
+    if (lower == 0u || lower == 0x8000033Cu)
+    {
+        out.lowerOp = FL_NOP;
+        return true;
+    }
+
+    const uint8_t opHi = static_cast<uint8_t>((lower >> 25) & 0x7Fu);
+    const uint8_t vfT = FT(lower);
+    const uint8_t vfS = FS(lower);
+    const uint8_t viT = VIT(lower);
+    const uint8_t viS = VIS(lower);
+    const uint8_t viD = VID(lower);
+    const uint8_t dest = DEST(lower);
+    const uint32_t pcMask = microAddressMask();
+
+    auto setBranchTarget = [&]() -> bool
+    {
+        const int16_t imm11 = IMM11(lower);
+        const uint32_t targetPc = ((pairIndex * 8u) + 8u + static_cast<int32_t>(imm11) * 8) & pcMask;
+        const uint32_t targetIdx = targetPc / 8u;
+        if (targetIdx >= pairCount)
+            return false;
+        out.imm = static_cast<int16_t>(targetIdx);
+        out.flags |= kFastFlagIsBranch;
+        return true;
+    };
+
+    switch (opHi)
+    {
+    case 0x00: out.lowerOp = FL_LQ; out.lReg1 = vfT; out.lReg2 = viS; out.lDest = dest; out.imm = IMM11(lower); return true;
+    case 0x01: out.lowerOp = FL_SQ; out.lReg1 = vfS; out.lReg2 = viT; out.lDest = dest; out.imm = IMM11(lower); out.flags |= kFastFlagIsStore; return true;
+    case 0x04: out.lowerOp = FL_ILW; out.lReg1 = viT; out.lReg2 = viS; out.lDest = dest; out.imm = IMM11(lower); return true;
+    case 0x05: out.lowerOp = FL_ISW; out.lReg1 = viT; out.lReg2 = viS; out.lDest = dest; out.imm = IMM11(lower); out.flags |= kFastFlagIsStore; return true;
+    case 0x08: out.lowerOp = FL_IADDIU; out.lReg1 = viT; out.lReg2 = viS; out.imm = static_cast<int16_t>((lower & 0x7FFu) | ((lower >> 10) & 0x7800u)); return true;
+    case 0x09: out.lowerOp = FL_ISUBIU; out.lReg1 = viT; out.lReg2 = viS; out.imm = static_cast<int16_t>((lower & 0x7FFu) | ((lower >> 10) & 0x7800u)); return true;
+    case 0x10: out.lowerOp = FL_FCEQ; out.imm24 = lower & 0xFFFFFFu; return true;
+    case 0x12: out.lowerOp = FL_FCAND; out.imm24 = lower & 0xFFFFFFu; return true;
+    case 0x13: out.lowerOp = FL_FCOR; out.imm24 = lower & 0xFFFFFFu; return true;
+    case 0x20: out.lowerOp = FL_B; out.flags |= kFastFlagUncondBranch; return setBranchTarget();
+    case 0x28: out.lowerOp = FL_IBEQ; out.lReg1 = viS; out.lReg2 = viT; return setBranchTarget();
+    case 0x29: out.lowerOp = FL_IBNE; out.lReg1 = viS; out.lReg2 = viT; return setBranchTarget();
+    case 0x2C: out.lowerOp = FL_IBLTZ; out.lReg1 = viS; return setBranchTarget();
+    case 0x2D: out.lowerOp = FL_IBGTZ; out.lReg1 = viS; return setBranchTarget();
+    case 0x2E: out.lowerOp = FL_IBLEZ; out.lReg1 = viS; return setBranchTarget();
+    case 0x2F: out.lowerOp = FL_IBGEZ; out.lReg1 = viS; return setBranchTarget();
+    case 0x40:
+        break;
+    default:
+        return false;
+    }
+
+    const uint8_t direct = static_cast<uint8_t>(lower & 0x3Fu);
+    if (direct == 0x30u) { out.lowerOp = FL_IADD; out.lReg1 = viD; out.lReg2 = viS; out.lReg3 = viT; return true; }
+    if (direct == 0x31u) { out.lowerOp = FL_ISUB; out.lReg1 = viD; out.lReg2 = viS; out.lReg3 = viT; return true; }
+    if (direct == 0x32u)
+    {
+        int32_t imm5 = static_cast<int32_t>((lower >> 6) & 0x1Fu);
+        if (imm5 & 0x10)
+            imm5 |= ~0x1F;
+        out.lowerOp = FL_IADDI;
+        out.lReg1 = viT;
+        out.lReg2 = viS;
+        out.imm = static_cast<int16_t>(imm5);
+        return true;
+    }
+    if (direct == 0x34u) { out.lowerOp = FL_IAND; out.lReg1 = viD; out.lReg2 = viS; out.lReg3 = viT; return true; }
+    if (direct == 0x35u) { out.lowerOp = FL_IOR; out.lReg1 = viD; out.lReg2 = viS; out.lReg3 = viT; return true; }
+    if (direct < 0x3Cu)
+        return false;
+
+    const uint8_t sp = static_cast<uint8_t>((lower & 3u) | ((lower >> 4) & 0x7Cu));
+    switch (sp)
+    {
+    case 0x30:
+        out.lowerOp = (vfT == 0u || dest == 0u) ? FL_NOP : FL_MOVE;
+        out.lReg1 = vfT;
+        out.lReg2 = vfS;
+        out.lDest = dest;
+        return true;
+    case 0x31:
+        out.lowerOp = (vfT == 0u || dest == 0u) ? FL_NOP : FL_MR32;
+        out.lReg1 = vfT;
+        out.lReg2 = vfS;
+        out.lDest = dest;
+        return true;
+    case 0x34: out.lowerOp = FL_LQI; out.lReg1 = vfT; out.lReg2 = viS; out.lDest = dest; return true;
+    case 0x35: out.lowerOp = FL_SQI; out.lReg1 = vfS; out.lReg2 = viT; out.lDest = dest; out.flags |= kFastFlagIsStore; return true;
+    case 0x36: out.lowerOp = FL_LQD; out.lReg1 = vfT; out.lReg2 = viS; out.lDest = dest; return true;
+    case 0x37: out.lowerOp = FL_SQD; out.lReg1 = vfS; out.lReg2 = viT; out.lDest = dest; out.flags |= kFastFlagIsStore; return true;
+    case 0x38: out.lowerOp = FL_DIV; out.lReg1 = vfT; out.lReg2 = vfS; out.lDest = static_cast<uint8_t>(((lower >> 21) & 3u) | (((lower >> 23) & 3u) << 2)); return true;
+    case 0x39: out.lowerOp = FL_SQRT; out.lReg1 = vfT; out.lDest = static_cast<uint8_t>((lower >> 23) & 3u); return true;
+    case 0x3A: out.lowerOp = FL_RSQRT; out.lReg1 = vfT; out.lReg2 = vfS; out.lDest = static_cast<uint8_t>(((lower >> 21) & 3u) | (((lower >> 23) & 3u) << 2)); return true;
+    case 0x3B: out.lowerOp = FL_WAITQ; return true;
+    case 0x3C: out.lowerOp = FL_MTIR; out.lReg1 = viT; out.lReg2 = vfS; out.lDest = static_cast<uint8_t>((lower >> 21) & 3u); return true;
+    case 0x3D: out.lowerOp = FL_MFIR; out.lReg1 = vfT; out.lReg2 = viS; out.lDest = dest; return true;
+    case 0x3E: out.lowerOp = FL_ILWR; out.lReg1 = viT; out.lReg2 = viS; out.lDest = dest; return true;
+    case 0x3F: out.lowerOp = FL_ISWR; out.lReg1 = viT; out.lReg2 = viS; out.lDest = dest; out.flags |= kFastFlagIsStore; return true;
+    case 0x68: out.lowerOp = FL_XTOP; out.lReg1 = viT; return true;
+    case 0x69: out.lowerOp = FL_XITOP; out.lReg1 = viT; return true;
+    case 0x6C: out.lowerOp = FL_XGKICK; out.lReg1 = viS; return true;
+    default:
+        return false;
+    }
+}
+
+bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
+{
+    if (entryPair >= pairCount)
+        return false;
+    const uint8_t cached = m_fastEntryStatus[entryPair];
+    if (cached != 0u)
+        return cached == 1u;
+
+    m_fastEntryStatus[entryPair] = 2u;
+
+    // Pass 1: Reachability BFS + FastPair lowering + CFG edges into a staged table
+    // so a rejected or conflicting entry never mutates already-committed entries.
+    std::vector<FastPair> staged(pairCount);
+    std::array<uint8_t, kMaxDecodedPairs> visited{};
+    std::array<uint8_t, kMaxDecodedPairs> isDelaySlot{};
+    std::array<uint8_t, kMaxDecodedPairs> isTerminalDelay{};
+    std::array<uint8_t, kMaxDecodedPairs> inDegree{};
+    std::array<uint8_t, kMaxDecodedPairs> succCount{};
+    std::array<std::array<uint16_t, 2>, kMaxDecodedPairs> succ{};
+    std::array<uint16_t, kMaxDecodedPairs> queue{};
+    std::array<uint16_t, kMaxDecodedPairs> reachableList{};
+    uint32_t qHead = 0u, qTail = 0u, reachableCount = 0u;
+
+    auto enqueue = [&](uint32_t idx) -> bool
+    {
+        if (idx >= pairCount)
+            return false;
+        if (!visited[idx])
+        {
+            visited[idx] = 1u;
+            queue[qTail++] = static_cast<uint16_t>(idx);
+            reachableList[reachableCount++] = static_cast<uint16_t>(idx);
+        }
+        return true;
+    };
+
+    auto addEdge = [&](uint32_t from, uint32_t to) -> bool
+    {
+        if (to >= pairCount || succCount[from] >= 2u)
+            return false;
+        for (uint8_t k = 0u; k < succCount[from]; ++k)
+            if (succ[from][k] == to)
+                return true;
+        succ[from][succCount[from]++] = static_cast<uint16_t>(to);
+        if (inDegree[to] < 255u)
+            ++inDegree[to];
+        return enqueue(to);
+    };
+
+    enqueue(entryPair);
+    bool hasXgkick = false;
+    bool hasEBit = false;
+
+    while (qHead < qTail)
+    {
+        const uint32_t idx = queue[qHead++];
+        const DecodedInstructionPair &d = m_decodedCodeCache[idx];
+        FastPair fp{};
+        if (!buildFastPair(d, idx, pairCount, fp))
+            return false;
+        staged[idx] = fp;
+
+        if (fp.lowerOp == FL_XGKICK)
+            hasXgkick = true;
+
+        const uint32_t nextIdx = (idx + 1u < pairCount) ? (idx + 1u) : 0u;
+        if (isDelaySlot[idx])
+        {
+            if ((fp.flags & (kFastFlagIsBranch | kFastFlagEBit)) != 0u || fp.lowerOp == FL_XGKICK)
+                return false;
+            continue;
+        }
+
+        if ((fp.flags & kFastFlagEBit) != 0u)
+        {
+            hasEBit = true;
+            if ((fp.flags & kFastFlagIsBranch) != 0u)
+                return false;
+            isDelaySlot[nextIdx] = 1u;
+            isTerminalDelay[nextIdx] = 1u;
+            if (!addEdge(idx, nextIdx))
+                return false;
+            continue;
+        }
+
+        if ((fp.flags & kFastFlagIsBranch) != 0u)
+        {
+            const uint32_t delayIdx = nextIdx;
+            const uint32_t fallIdx = (delayIdx + 1u < pairCount) ? (delayIdx + 1u) : 0u;
+            const uint32_t targetIdx = static_cast<uint32_t>(fp.imm);
+            isDelaySlot[delayIdx] = 1u;
+            if (!addEdge(idx, delayIdx))
+                return false;
+            if (!addEdge(delayIdx, targetIdx))
+                return false;
+            if ((fp.flags & kFastFlagUncondBranch) == 0u)
+            {
+                if (!addEdge(delayIdx, fallIdx))
+                    return false;
+            }
+            continue;
+        }
+
+        if (!addEdge(idx, nextIdx))
+            return false;
+    }
+
+    if (!hasXgkick || !hasEBit)
+        return false;
+
+    // Delay slots must have unique entry from their branch/E-bit pair.
+    for (uint32_t r = 0u; r < reachableCount; ++r)
+    {
+        const uint32_t idx = reachableList[r];
+        if (isDelaySlot[idx] && inDegree[idx] != 1u)
+            return false;
+    }
+
+    // Verify every XGKICK is strictly terminal (cannot reach another XGKICK or any store, and reaches E-bit).
+    for (uint32_t r = 0u; r < reachableCount; ++r)
+    {
+        const uint32_t startIdx = reachableList[r];
+        if (staged[startIdx].lowerOp != FL_XGKICK)
+            continue;
+        std::array<uint8_t, kMaxDecodedPairs> seenAfter{};
+        uint32_t dHead = 0u, dTail = 0u;
+        for (uint8_t k = 0u; k < succCount[startIdx]; ++k)
+        {
+            const uint16_t s = succ[startIdx][k];
+            seenAfter[s] = 1u;
+            queue[dTail++] = s;
+        }
+        while (dHead < dTail)
+        {
+            const uint32_t cur = queue[dHead++];
+            const FastPair &cfp = staged[cur];
+            if (cfp.lowerOp == FL_XGKICK || (cfp.flags & kFastFlagIsStore) != 0u)
+                return false;
+            if (cur == startIdx)
+                return false;
+            for (uint8_t k = 0u; k < succCount[cur]; ++k)
+            {
+                const uint16_t s = succ[cur][k];
+                if (!seenAfter[s])
+                {
+                    seenAfter[s] = 1u;
+                    queue[dTail++] = s;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Monotone dataflow fixed-point over remaining pipeline latencies.
+    struct RemState
+    {
+        uint8_t vf[32][4]{};
+        uint8_t vi[16]{};
+        uint8_t clip = 0u;
+        uint8_t fdiv = 0u;
+        uint16_t branchDelayViMask = 0u;
+    };
+
+    std::vector<RemState> inState(pairCount);
+    std::array<uint8_t, kMaxDecodedPairs> inInit{};
+    std::array<uint8_t, kMaxDecodedPairs> inWork{};
+    std::array<uint16_t, kMaxDecodedPairs * 4u> worklist{};
+    uint32_t wHead = 0u, wTail = 0u;
+    const uint32_t wCap = static_cast<uint32_t>(worklist.size());
+
+    auto pushWork = [&](uint32_t idx)
+    {
+        if (!inWork[idx])
+        {
+            inWork[idx] = 1u;
+            worklist[wTail % wCap] = static_cast<uint16_t>(idx);
+            ++wTail;
+        }
+    };
+
+    inInit[entryPair] = 1u;
+    pushWork(entryPair);
+
+    uint32_t iterations = 0u;
+    const uint32_t maxIterations = pairCount * 16u + 64u;
+    while (wHead < wTail)
+    {
+        if (++iterations > maxIterations)
+            return false;
+
+        const uint32_t idx = worklist[wHead % wCap];
+        ++wHead;
+        inWork[idx] = 0u;
+
+        const DecodedInstructionPair &d = m_decodedCodeCache[idx];
+        FastPair &fp = staged[idx];
+        RemState st = inState[idx];
+
+        // Non-stalling hazards must be zero on entry.
+        if (d.lowerUsage.readsClip && st.clip > 0u)
+            return false;
+        if ((fp.flags & kFastFlagReadsQ) != 0u && st.fdiv > 0u)
+            return false;
+        if ((fp.flags & kFastFlagIsBranch) != 0u && (d.lowerUsage.viRead & st.branchDelayViMask) != 0u)
+            return false;
+
+        // Compute stall cycles matching calculatePairReadyCycle.
+        uint8_t stall = 0u;
+        const InstructionUsage *usages[2] = {&d.upperUsage, &d.lowerUsage};
+        for (const InstructionUsage *u : usages)
+        {
+            for (uint32_t i = 0u; i < u->vfReadCount; ++i)
+            {
+                const VfAccess &acc = u->vfRead[i];
+                for (uint32_t c = 0u; c < 4u; ++c)
+                {
+                    if ((acc.lanes & laneForComponent(c)) != 0u)
+                        stall = std::max(stall, st.vf[acc.reg][c]);
+                }
+            }
+            for (uint32_t pending = u->viRead & ~1u; pending != 0u; pending &= pending - 1u)
+                stall = std::max(stall, st.vi[std::countr_zero(pending)]);
+        }
+        if (d.lowerUsage.pipeline == PipelineFdiv || d.lowerUsage.waitQ)
+            stall = std::max(stall, st.fdiv);
+
+        // Merge points cannot have path-dependent stalls.
+        if (stall > 0u && inDegree[idx] > 1u)
+            return false;
+        fp.cycleStep = static_cast<uint8_t>(1u + stall);
+
+        auto advanceRem = [](RemState &s, uint8_t delta)
+        {
+            if (delta == 0u)
+                return;
+            for (uint32_t r = 1u; r < 32u; ++r)
+                for (uint32_t c = 0u; c < 4u; ++c)
+                    s.vf[r][c] = s.vf[r][c] > delta ? static_cast<uint8_t>(s.vf[r][c] - delta) : 0u;
+            for (uint32_t r = 1u; r < 16u; ++r)
+                s.vi[r] = s.vi[r] > delta ? static_cast<uint8_t>(s.vi[r] - delta) : 0u;
+            s.clip = s.clip > delta ? static_cast<uint8_t>(s.clip - delta) : 0u;
+            s.fdiv = s.fdiv > delta ? static_cast<uint8_t>(s.fdiv - delta) : 0u;
+        };
+
+        if (stall > 0u)
+            advanceRem(st, stall);
+
+        // Check WAW hazards (slower earlier write would overwrite faster later write).
+        auto applyVfWrite = [&](const InstructionUsage &u) -> bool
+        {
+            const VfAccess &w = u.vfWrite;
+            if (w.reg == 0u || w.lanes == 0u)
+                return true;
+            const uint8_t lat = u.vfLatency != 0u ? u.vfLatency : u.latency;
+            for (uint32_t c = 0u; c < 4u; ++c)
+            {
+                if ((w.lanes & laneForComponent(c)) != 0u)
+                {
+                    if (st.vf[w.reg][c] > lat)
+                        return false;
+                    st.vf[w.reg][c] = lat;
+                }
+            }
+            return true;
+        };
+
+        if (!applyVfWrite(d.lowerUsage))
+            return false;
+        if (!applyVfWrite(d.upperUsage))
+            return false;
+
+        if ((d.lowerUsage.viWrite & ~1u) != 0u)
+        {
+            const uint8_t lat = d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency;
+            for (uint32_t w = d.lowerUsage.viWrite & ~1u; w != 0u; w &= w - 1u)
+            {
+                const uint32_t reg = std::countr_zero(w);
+                if (st.vi[reg] > lat)
+                    return false;
+                st.vi[reg] = lat;
+            }
+        }
+        if (d.upperUsage.writesClip)
+            st.clip = kFmacLatency;
+        if (d.lowerUsage.pipeline == PipelineFdiv)
+            st.fdiv = d.lowerUsage.latency;
+
+        st.branchDelayViMask = d.lowerUsage.delaysNextBranchRead ? static_cast<uint16_t>(d.lowerUsage.viWrite & ~1u) : 0u;
+
+        // Advance 1 cycle at end of pair.
+        advanceRem(st, 1u);
+
+        if (isTerminalDelay[idx])
+        {
+            uint8_t maxRem = std::max(st.clip, st.fdiv);
+            for (uint32_t r = 1u; r < 32u; ++r)
+                for (uint32_t c = 0u; c < 4u; ++c)
+                    maxRem = std::max(maxRem, st.vf[r][c]);
+            for (uint32_t r = 1u; r < 16u; ++r)
+                maxRem = std::max(maxRem, st.vi[r]);
+            fp.tailLatency = maxRem;
+            continue;
+        }
+
+        for (uint8_t k = 0u; k < succCount[idx]; ++k)
+        {
+            const uint32_t s = succ[idx][k];
+            if (!inInit[s])
+            {
+                inState[s] = st;
+                inInit[s] = 1u;
+                pushWork(s);
+            }
+            else
+            {
+                RemState &dst = inState[s];
+                bool changed = false;
+                for (uint32_t r = 1u; r < 32u; ++r)
+                    for (uint32_t c = 0u; c < 4u; ++c)
+                        if (st.vf[r][c] > dst.vf[r][c]) { dst.vf[r][c] = st.vf[r][c]; changed = true; }
+                for (uint32_t r = 1u; r < 16u; ++r)
+                    if (st.vi[r] > dst.vi[r]) { dst.vi[r] = st.vi[r]; changed = true; }
+                if (st.clip > dst.clip) { dst.clip = st.clip; changed = true; }
+                if (st.fdiv > dst.fdiv) { dst.fdiv = st.fdiv; changed = true; }
+                const uint16_t newMask = static_cast<uint16_t>(dst.branchDelayViMask | st.branchDelayViMask);
+                if (newMask != dst.branchDelayViMask) { dst.branchDelayViMask = newMask; changed = true; }
+                if (changed)
+                    pushWork(s);
+            }
+        }
+    }
+
+    // If any terminal delay slot has nonzero tailLatency and the program has merges, reject so tail cycle count is always exact.
+    bool hasMerge = false;
+    for (uint32_t r = 0u; r < reachableCount; ++r)
+        if (inDegree[reachableList[r]] > 1u)
+            hasMerge = true;
+    if (hasMerge)
+    {
+        for (uint32_t r = 0u; r < reachableCount; ++r)
+            if (isTerminalDelay[reachableList[r]] && staged[reachableList[r]].tailLatency != 0u)
+                return false;
+    }
+
+    // Reject if any shared pair conflicts with an already-committed entry's static timing.
+    for (uint32_t r = 0u; r < reachableCount; ++r)
+    {
+        const uint32_t idx = reachableList[r];
+        if (m_fastPairCommitted[idx] &&
+            (m_fastCodeCache[idx].cycleStep != staged[idx].cycleStep ||
+             m_fastCodeCache[idx].tailLatency != staged[idx].tailLatency))
+        {
+            return false;
+        }
+    }
+
+    for (uint32_t r = 0u; r < reachableCount; ++r)
+    {
+        const uint32_t idx = reachableList[r];
+        m_fastCodeCache[idx] = staged[idx];
+        m_fastPairCommitted[idx] = 1u;
+    }
+
+    m_fastEntryStatus[entryPair] = 1u;
+    return true;
+}
+
+// shortcut: SSE2 fast path assumes finite VF inputs under RZ+FTZ+DAZ (skipping per-op Inf/NaN clamp and dead MAC/STATUS flags);
+// upgrade with sseClampVuInf on FMAC ops if a game feeds raw Inf/NaN bit patterns into eligible VU1 loops.
+void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t pairCount, uint64_t budgetEnd)
+{
+#if defined(__SSE2__) || defined(_M_X64)
+    ScopedVuMxcsr mxcsrGuard;
+    alignas(16) __m128 vf[32];
+    for (uint32_t r = 0u; r < 32u; ++r)
+        vf[r] = _mm_loadu_ps(m_state.vf[r]);
+    vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+    __m128 acc = _mm_loadu_ps(m_state.acc);
+
+    auto getLaneF = [&](uint8_t reg, uint8_t lane) -> float
+    {
+        alignas(16) float tmp[4];
+        _mm_store_ps(tmp, vf[reg]);
+        return tmp[lane];
+    };
+    auto getLaneU32 = [&](uint8_t reg, uint8_t lane) -> uint32_t
+    {
+        alignas(16) uint32_t tmp[4];
+        _mm_store_ps(reinterpret_cast<float *>(tmp), vf[reg]);
+        return tmp[lane];
+    };
+#else
+    alignas(16) float vf[32][4];
+    std::memcpy(vf, m_state.vf, sizeof(vf));
+    vf[0][0] = 0.0f; vf[0][1] = 0.0f; vf[0][2] = 0.0f; vf[0][3] = 1.0f;
+    float acc[4];
+    std::memcpy(acc, m_state.acc, sizeof(acc));
+
+    auto getLaneF = [&](uint8_t reg, uint8_t lane) -> float { return vf[reg][lane]; };
+    auto getLaneU32 = [&](uint8_t reg, uint8_t lane) -> uint32_t { return std::bit_cast<uint32_t>(vf[reg][lane]); };
+#endif
+
+    int32_t vi[16];
+    std::memcpy(vi, m_state.vi, sizeof(vi));
+    vi[0] = 0;
+
+    float q = m_state.q;
+    float iReg = m_state.i;
+    uint32_t clip = m_state.clip;
+    const uint32_t dataMask = dataSize - 1u;
+    uint64_t cycles = m_cycle;
+    uint32_t pcIdx = m_state.pc / 8u;
+    const FastPair *fast = m_fastCodeCache.data();
+
+    bool xgkickIssued = false;
+    uint64_t xgkickIssueCycle = 0u;
+    uint32_t xgkickSourceQword = 0u;
+
+    auto execFastUpper = [&](const FastPair &p)
+    {
+#if defined(__SSE2__) || defined(_M_X64)
+        switch (p.upperOp)
+        {
+        case FU_NOP:
+            return;
+        case FU_MULAbc:
+            sseApplyMask(acc, _mm_mul_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_MADDAbc:
+            sseApplyMask(acc, _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux))), p.uDest);
+            return;
+        case FU_MADDbc:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux))), p.uDest);
+            return;
+        case FU_MSUBbc:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux))), p.uDest);
+            return;
+        case FU_MSUBAbc:
+            sseApplyMask(acc, _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux))), p.uDest);
+            return;
+        case FU_MULbc:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_ADDbc:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_SUBbc:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_ADDAbc:
+            sseApplyMask(acc, _mm_add_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_SUBAbc:
+            sseApplyMask(acc, _mm_sub_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_MAXbc:
+            sseApplyMask(vf[p.uFd], _mm_max_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_MINIbc:
+            sseApplyMask(vf[p.uFd], _mm_min_ps(vf[p.uFs], sseBroadcastLane(vf[p.uFt], p.uAux)), p.uDest);
+            return;
+        case FU_MULq:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(vf[p.uFs], _mm_set1_ps(q)), p.uDest);
+            return;
+        case FU_MULi:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_ADDq:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(vf[p.uFs], _mm_set1_ps(q)), p.uDest);
+            return;
+        case FU_ADDi:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_SUBq:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(vf[p.uFs], _mm_set1_ps(q)), p.uDest);
+            return;
+        case FU_SUBi:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_MADDq:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(q))), p.uDest);
+            return;
+        case FU_MADDi:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(iReg))), p.uDest);
+            return;
+        case FU_MSUBq:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(q))), p.uDest);
+            return;
+        case FU_MSUBi:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(iReg))), p.uDest);
+            return;
+        case FU_MAXi:
+            sseApplyMask(vf[p.uFd], _mm_max_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_MINIi:
+            sseApplyMask(vf[p.uFd], _mm_min_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_ADD:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_SUB:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_MUL:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_MADD:
+            sseApplyMask(vf[p.uFd], _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], vf[p.uFt])), p.uDest);
+            return;
+        case FU_MSUB:
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], vf[p.uFt])), p.uDest);
+            return;
+        case FU_MAX:
+            sseApplyMask(vf[p.uFd], _mm_max_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_MINI:
+            sseApplyMask(vf[p.uFd], _mm_min_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_ADDA:
+            sseApplyMask(acc, _mm_add_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_SUBA:
+            sseApplyMask(acc, _mm_sub_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_MULA:
+            sseApplyMask(acc, _mm_mul_ps(vf[p.uFs], vf[p.uFt]), p.uDest);
+            return;
+        case FU_MADDA:
+            sseApplyMask(acc, _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], vf[p.uFt])), p.uDest);
+            return;
+        case FU_MSUBA:
+            sseApplyMask(acc, _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], vf[p.uFt])), p.uDest);
+            return;
+        case FU_MULAq:
+            sseApplyMask(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(q)), p.uDest);
+            return;
+        case FU_MULAi:
+            sseApplyMask(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_ADDAq:
+            sseApplyMask(acc, _mm_add_ps(vf[p.uFs], _mm_set1_ps(q)), p.uDest);
+            return;
+        case FU_ADDAi:
+            sseApplyMask(acc, _mm_add_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_SUBAq:
+            sseApplyMask(acc, _mm_sub_ps(vf[p.uFs], _mm_set1_ps(q)), p.uDest);
+            return;
+        case FU_SUBAi:
+            sseApplyMask(acc, _mm_sub_ps(vf[p.uFs], _mm_set1_ps(iReg)), p.uDest);
+            return;
+        case FU_MADDAq:
+            sseApplyMask(acc, _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(q))), p.uDest);
+            return;
+        case FU_MADDAi:
+            sseApplyMask(acc, _mm_add_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(iReg))), p.uDest);
+            return;
+        case FU_MSUBAq:
+            sseApplyMask(acc, _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(q))), p.uDest);
+            return;
+        case FU_MSUBAi:
+            sseApplyMask(acc, _mm_sub_ps(acc, _mm_mul_ps(vf[p.uFs], _mm_set1_ps(iReg))), p.uDest);
+            return;
+        case FU_OPMULA:
+        {
+            const __m128 a = _mm_shuffle_ps(vf[p.uFs], vf[p.uFs], _MM_SHUFFLE(3, 0, 2, 1));
+            const __m128 b = _mm_shuffle_ps(vf[p.uFt], vf[p.uFt], _MM_SHUFFLE(3, 1, 0, 2));
+            sseApplyMask(acc, _mm_mul_ps(a, b), p.uDest & 0xEu);
+            if (p.uDest & 1u)
+                sseApplyMask(acc, _mm_setzero_ps(), 1u);
+            return;
+        }
+        case FU_OPMSUB:
+        {
+            const __m128 a = _mm_shuffle_ps(vf[p.uFs], vf[p.uFs], _MM_SHUFFLE(3, 0, 2, 1));
+            const __m128 b = _mm_shuffle_ps(vf[p.uFt], vf[p.uFt], _MM_SHUFFLE(3, 1, 0, 2));
+            sseApplyMask(vf[p.uFd], _mm_sub_ps(acc, _mm_mul_ps(a, b)), p.uDest & 0xEu);
+            if (p.uDest & 1u)
+                sseApplyMask(vf[p.uFd], _mm_setzero_ps(), 1u);
+            return;
+        }
+        case FU_ABS:
+        {
+            const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+            sseApplyMask(vf[p.uFd], _mm_and_ps(sseClampVuInf(vf[p.uFs]), absMask), p.uDest);
+            return;
+        }
+        case FU_ITOF0:
+            sseApplyMask(vf[p.uFd], _mm_cvtepi32_ps(_mm_castps_si128(vf[p.uFs])), p.uDest);
+            return;
+        case FU_ITOF4:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(vf[p.uFs])), _mm_set1_ps(1.0f / 16.0f)), p.uDest);
+            return;
+        case FU_ITOF12:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(vf[p.uFs])), _mm_set1_ps(1.0f / 4096.0f)), p.uDest);
+            return;
+        case FU_ITOF15:
+            sseApplyMask(vf[p.uFd], _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(vf[p.uFs])), _mm_set1_ps(1.0f / 32768.0f)), p.uDest);
+            return;
+        case FU_FTOI0:
+        case FU_FTOI4:
+        case FU_FTOI12:
+        case FU_FTOI15:
+        {
+            const float scale = (p.upperOp == FU_FTOI0) ? 1.0f
+                              : (p.upperOp == FU_FTOI4) ? 16.0f
+                              : (p.upperOp == FU_FTOI12) ? 4096.0f : 32768.0f;
+            alignas(16) float src[4];
+            alignas(16) int32_t outI[4]{};
+            _mm_store_ps(src, vf[p.uFs]);
+            for (uint32_t c = 0u; c < 4u; ++c)
+                if ((p.uDest & (8u >> c)) != 0u)
+                    outI[c] = fastVuFloatToInt(normalizeOperand(src[c]), scale);
+            sseApplyMask(vf[p.uFd], _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i *>(outI))), p.uDest);
+            return;
+        }
+        case FU_CLIPw:
+        {
+            alignas(16) uint32_t sBits[4];
+            _mm_store_ps(reinterpret_cast<float *>(sBits), vf[p.uFs]);
+            const uint32_t wBits = getLaneU32(p.uFt, 3u);
+            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+            uint32_t flags = 0u;
+            if (static_cast<int32_t>(sBits[0]) > limit) flags |= 0x01u;
+            if (static_cast<int32_t>(sBits[0] ^ 0x80000000u) > limit) flags |= 0x02u;
+            if (static_cast<int32_t>(sBits[1]) > limit) flags |= 0x04u;
+            if (static_cast<int32_t>(sBits[1] ^ 0x80000000u) > limit) flags |= 0x08u;
+            if (static_cast<int32_t>(sBits[2]) > limit) flags |= 0x10u;
+            if (static_cast<int32_t>(sBits[2] ^ 0x80000000u) > limit) flags |= 0x20u;
+            clip = ((clip << 6u) | flags) & 0x00FFFFFFu;
+            return;
+        }
+        default:
+            return;
+        }
+#else
+        auto applyVec = [&](float dst[4], const float res[4], uint8_t mask)
+        {
+            if (mask & 8u) dst[0] = res[0];
+            if (mask & 4u) dst[1] = res[1];
+            if (mask & 2u) dst[2] = res[2];
+            if (mask & 1u) dst[3] = res[3];
+        };
+        float res[4]{};
+        const float *vs = vf[p.uFs];
+        const float *vt = vf[p.uFt];
+        switch (p.upperOp)
+        {
+        case FU_NOP: return;
+        case FU_MULAbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = vs[c] * bc; applyVec(acc, res, p.uDest); return; }
+        case FU_MADDAbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * bc; applyVec(acc, res, p.uDest); return; }
+        case FU_MADDbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_MSUBbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_MSUBAbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * bc; applyVec(acc, res, p.uDest); return; }
+        case FU_MULbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = vs[c] * bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_ADDbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = vs[c] + bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_SUBbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = vs[c] - bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_ADDAbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = vs[c] + bc; applyVec(acc, res, p.uDest); return; }
+        case FU_SUBAbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = vs[c] - bc; applyVec(acc, res, p.uDest); return; }
+        case FU_MAXbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = (vs[c] > bc) ? vs[c] : bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_MINIbc: { const float bc = vt[p.uAux]; for (int c = 0; c < 4; ++c) res[c] = (vs[c] < bc) ? vs[c] : bc; applyVec(vf[p.uFd], res, p.uDest); return; }
+        case FU_MULq: for (int c = 0; c < 4; ++c) res[c] = vs[c] * q; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MULi: for (int c = 0; c < 4; ++c) res[c] = vs[c] * iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_ADDq: for (int c = 0; c < 4; ++c) res[c] = vs[c] + q; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_ADDi: for (int c = 0; c < 4; ++c) res[c] = vs[c] + iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_SUBq: for (int c = 0; c < 4; ++c) res[c] = vs[c] - q; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_SUBi: for (int c = 0; c < 4; ++c) res[c] = vs[c] - iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MADDq: for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * q; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MADDi: for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MSUBq: for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * q; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MSUBi: for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MAXi: for (int c = 0; c < 4; ++c) res[c] = (vs[c] > iReg) ? vs[c] : iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MINIi: for (int c = 0; c < 4; ++c) res[c] = (vs[c] < iReg) ? vs[c] : iReg; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_ADD: for (int c = 0; c < 4; ++c) res[c] = vs[c] + vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_SUB: for (int c = 0; c < 4; ++c) res[c] = vs[c] - vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MUL: for (int c = 0; c < 4; ++c) res[c] = vs[c] * vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MADD: for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MSUB: for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MAX: for (int c = 0; c < 4; ++c) res[c] = (vs[c] > vt[c]) ? vs[c] : vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_MINI: for (int c = 0; c < 4; ++c) res[c] = (vs[c] < vt[c]) ? vs[c] : vt[c]; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_ADDA: for (int c = 0; c < 4; ++c) res[c] = vs[c] + vt[c]; applyVec(acc, res, p.uDest); return;
+        case FU_SUBA: for (int c = 0; c < 4; ++c) res[c] = vs[c] - vt[c]; applyVec(acc, res, p.uDest); return;
+        case FU_MULA: for (int c = 0; c < 4; ++c) res[c] = vs[c] * vt[c]; applyVec(acc, res, p.uDest); return;
+        case FU_MADDA: for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * vt[c]; applyVec(acc, res, p.uDest); return;
+        case FU_MSUBA: for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * vt[c]; applyVec(acc, res, p.uDest); return;
+        case FU_MULAq: for (int c = 0; c < 4; ++c) res[c] = vs[c] * q; applyVec(acc, res, p.uDest); return;
+        case FU_MULAi: for (int c = 0; c < 4; ++c) res[c] = vs[c] * iReg; applyVec(acc, res, p.uDest); return;
+        case FU_ADDAq: for (int c = 0; c < 4; ++c) res[c] = vs[c] + q; applyVec(acc, res, p.uDest); return;
+        case FU_ADDAi: for (int c = 0; c < 4; ++c) res[c] = vs[c] + iReg; applyVec(acc, res, p.uDest); return;
+        case FU_SUBAq: for (int c = 0; c < 4; ++c) res[c] = vs[c] - q; applyVec(acc, res, p.uDest); return;
+        case FU_SUBAi: for (int c = 0; c < 4; ++c) res[c] = vs[c] - iReg; applyVec(acc, res, p.uDest); return;
+        case FU_MADDAq: for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * q; applyVec(acc, res, p.uDest); return;
+        case FU_MADDAi: for (int c = 0; c < 4; ++c) res[c] = acc[c] + vs[c] * iReg; applyVec(acc, res, p.uDest); return;
+        case FU_MSUBAq: for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * q; applyVec(acc, res, p.uDest); return;
+        case FU_MSUBAi: for (int c = 0; c < 4; ++c) res[c] = acc[c] - vs[c] * iReg; applyVec(acc, res, p.uDest); return;
+        case FU_OPMULA: res[0] = vs[1] * vt[2]; res[1] = vs[2] * vt[0]; res[2] = vs[0] * vt[1]; res[3] = 0.0f; applyVec(acc, res, p.uDest); return;
+        case FU_OPMSUB: res[0] = acc[0] - vs[1] * vt[2]; res[1] = acc[1] - vs[2] * vt[0]; res[2] = acc[2] - vs[0] * vt[1]; res[3] = 0.0f; applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_ABS: for (int c = 0; c < 4; ++c) res[c] = std::fabs(normalizeOperand(vs[c])); applyVec(vf[p.uFd], res, p.uDest); return;
+        case FU_ITOF0: case FU_ITOF4: case FU_ITOF12: case FU_ITOF15: {
+            const float inv = (p.upperOp == FU_ITOF0) ? 1.0f : (p.upperOp == FU_ITOF4) ? (1.0f / 16.0f) : (p.upperOp == FU_ITOF12) ? (1.0f / 4096.0f) : (1.0f / 32768.0f);
+            for (int c = 0; c < 4; ++c) res[c] = static_cast<float>(std::bit_cast<int32_t>(vs[c])) * inv;
+            applyVec(vf[p.uFd], res, p.uDest); return;
+        }
+        case FU_FTOI0: case FU_FTOI4: case FU_FTOI12: case FU_FTOI15: {
+            const float scale = (p.upperOp == FU_FTOI0) ? 1.0f : (p.upperOp == FU_FTOI4) ? 16.0f : (p.upperOp == FU_FTOI12) ? 4096.0f : 32768.0f;
+            for (int c = 0; c < 4; ++c) if ((p.uDest & (8u >> c)) != 0u) res[c] = std::bit_cast<float>(fastVuFloatToInt(normalizeOperand(vs[c]), scale));
+            applyVec(vf[p.uFd], res, p.uDest); return;
+        }
+        case FU_CLIPw: {
+            const uint32_t wBits = std::bit_cast<uint32_t>(vt[3]);
+            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+            uint32_t flags = 0u;
+            const uint32_t bx = std::bit_cast<uint32_t>(vs[0]);
+            const uint32_t by = std::bit_cast<uint32_t>(vs[1]);
+            const uint32_t bz = std::bit_cast<uint32_t>(vs[2]);
+            if (static_cast<int32_t>(bx) > limit) flags |= 0x01u;
+            if (static_cast<int32_t>(bx ^ 0x80000000u) > limit) flags |= 0x02u;
+            if (static_cast<int32_t>(by) > limit) flags |= 0x04u;
+            if (static_cast<int32_t>(by ^ 0x80000000u) > limit) flags |= 0x08u;
+            if (static_cast<int32_t>(bz) > limit) flags |= 0x10u;
+            if (static_cast<int32_t>(bz ^ 0x80000000u) > limit) flags |= 0x20u;
+            clip = ((clip << 6u) | flags) & 0x00FFFFFFu;
+            return;
+        }
+        default: return;
+        }
+#endif
+    };
+
+    auto storeVfToMem = [&](uint32_t addr, uint8_t reg, uint8_t dest)
+    {
+        if (addr + 16u > dataSize)
+            return;
+#if defined(__SSE2__) || defined(_M_X64)
+        if (dest == 0xFu)
+        {
+            _mm_storeu_ps(reinterpret_cast<float *>(vuData + addr), vf[reg]);
+            return;
+        }
+        const __m128 cur = _mm_loadu_ps(reinterpret_cast<const float *>(vuData + addr));
+        const __m128 mask = _mm_load_ps(reinterpret_cast<const float *>(kFastLaneMasks[dest]));
+        _mm_storeu_ps(reinterpret_cast<float *>(vuData + addr), _mm_or_ps(_mm_and_ps(mask, vf[reg]), _mm_andnot_ps(mask, cur)));
+#else
+        for (uint32_t c = 0u; c < 4u; ++c)
+            if ((dest & (8u >> c)) != 0u)
+                std::memcpy(vuData + addr + c * 4u, &vf[reg][c], 4u);
+#endif
+    };
+
+    auto loadVfFromMem = [&](uint32_t addr, uint8_t reg, uint8_t dest)
+    {
+        if (reg == 0u || dest == 0u || addr + 16u > dataSize)
+            return;
+#if defined(__SSE2__) || defined(_M_X64)
+        const __m128 loaded = _mm_loadu_ps(reinterpret_cast<const float *>(vuData + addr));
+        sseApplyMask(vf[reg], loaded, dest);
+#else
+        for (uint32_t c = 0u; c < 4u; ++c)
+            if ((dest & (8u >> c)) != 0u)
+                std::memcpy(&vf[reg][c], vuData + addr + c * 4u, 4u);
+#endif
+    };
+
+    auto execFastLower = [&](const FastPair &p) -> bool
+    {
+        switch (p.lowerOp)
+        {
+        case FL_NOP:
+            return false;
+        case FL_LOI:
+            iReg = normalizeOperand(std::bit_cast<float>(p.imm24));
+            return false;
+        case FL_LQ:
+        {
+            const uint32_t addr = (static_cast<uint32_t>(vi[p.lReg2] + p.imm) * 16u) & dataMask;
+            loadVfFromMem(addr, p.lReg1, p.lDest);
+            return false;
+        }
+        case FL_SQ:
+        {
+            const uint32_t addr = (static_cast<uint32_t>(vi[p.lReg2] + p.imm) * 16u) & dataMask;
+            storeVfToMem(addr, p.lReg1, p.lDest);
+            return false;
+        }
+        case FL_LQI:
+        {
+            const uint32_t addr = (static_cast<uint32_t>(vi[p.lReg2]) * 16u) & dataMask;
+            loadVfFromMem(addr, p.lReg1, p.lDest);
+            if (p.lReg2 != 0u)
+                vi[p.lReg2] = static_cast<int16_t>(vi[p.lReg2] + 1);
+            return false;
+        }
+        case FL_SQI:
+        {
+            const uint32_t addr = (static_cast<uint32_t>(vi[p.lReg2]) * 16u) & dataMask;
+            storeVfToMem(addr, p.lReg1, p.lDest);
+            if (p.lReg2 != 0u)
+                vi[p.lReg2] = static_cast<int16_t>(vi[p.lReg2] + 1);
+            return false;
+        }
+        case FL_LQD:
+        {
+            if (p.lReg2 != 0u)
+                vi[p.lReg2] = static_cast<int16_t>(vi[p.lReg2] - 1);
+            const uint32_t addr = (static_cast<uint32_t>(vi[p.lReg2]) * 16u) & dataMask;
+            loadVfFromMem(addr, p.lReg1, p.lDest);
+            return false;
+        }
+        case FL_SQD:
+        {
+            if (p.lReg2 != 0u)
+                vi[p.lReg2] = static_cast<int16_t>(vi[p.lReg2] - 1);
+            const uint32_t addr = (static_cast<uint32_t>(vi[p.lReg2]) * 16u) & dataMask;
+            storeVfToMem(addr, p.lReg1, p.lDest);
+            return false;
+        }
+        case FL_ILW:
+        case FL_ILWR:
+        {
+            const int32_t idx = (p.lowerOp == FL_ILW) ? (vi[p.lReg2] + p.imm) : vi[p.lReg2];
+            const uint32_t addr = (static_cast<uint32_t>(idx) * 16u) & dataMask;
+            if (p.lReg1 != 0u && addr + 16u <= dataSize)
+            {
+                const uint32_t comp = (p.lDest & 8u) ? 0u : (p.lDest & 4u) ? 1u : (p.lDest & 2u) ? 2u : 3u;
+                uint32_t v = 0u;
+                std::memcpy(&v, vuData + addr + comp * 4u, 4u);
+                vi[p.lReg1] = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFu));
+            }
+            return false;
+        }
+        case FL_ISW:
+        case FL_ISWR:
+        {
+            const int32_t idx = (p.lowerOp == FL_ISW) ? (vi[p.lReg2] + p.imm) : vi[p.lReg2];
+            const uint32_t addr = (static_cast<uint32_t>(idx) * 16u) & dataMask;
+            if (addr + 16u <= dataSize)
+            {
+                const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(vi[p.lReg1] & 0xFFFF));
+                for (uint32_t c = 0u; c < 4u; ++c)
+                    if ((p.lDest & (8u >> c)) != 0u)
+                        std::memcpy(vuData + addr + c * 4u, &val, 4u);
+            }
+            return false;
+        }
+        case FL_MOVE:
+#if defined(__SSE2__) || defined(_M_X64)
+            sseApplyMask(vf[p.lReg1], vf[p.lReg2], p.lDest);
+#else
+            for (int c = 0; c < 4; ++c)
+                if ((p.lDest & (8u >> c)) != 0u)
+                    vf[p.lReg1][c] = vf[p.lReg2][c];
+#endif
+            return false;
+        case FL_MR32:
+#if defined(__SSE2__) || defined(_M_X64)
+            sseApplyMask(vf[p.lReg1], _mm_shuffle_ps(vf[p.lReg2], vf[p.lReg2], _MM_SHUFFLE(0, 3, 2, 1)), p.lDest);
+#else
+        {
+            const float rot[4] = {vf[p.lReg2][1], vf[p.lReg2][2], vf[p.lReg2][3], vf[p.lReg2][0]};
+            for (int c = 0; c < 4; ++c)
+                if ((p.lDest & (8u >> c)) != 0u)
+                    vf[p.lReg1][c] = rot[c];
+        }
+#endif
+            return false;
+        case FL_MTIR:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int32_t>(static_cast<int16_t>(getLaneU32(p.lReg2, p.lDest) & 0xFFFFu));
+            return false;
+        case FL_MFIR:
+            if (p.lReg1 != 0u)
+            {
+                const int32_t v = static_cast<int32_t>(static_cast<int16_t>(vi[p.lReg2] & 0xFFFF));
+#if defined(__SSE2__) || defined(_M_X64)
+                sseApplyMask(vf[p.lReg1], _mm_castsi128_ps(_mm_set1_epi32(v)), p.lDest);
+#else
+                const float fv = std::bit_cast<float>(v);
+                for (int c = 0; c < 4; ++c)
+                    if ((p.lDest & (8u >> c)) != 0u)
+                        vf[p.lReg1][c] = fv;
+#endif
+            }
+            return false;
+        case FL_IADD:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(vi[p.lReg2] + vi[p.lReg3]);
+            return false;
+        case FL_ISUB:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(vi[p.lReg2] - vi[p.lReg3]);
+            return false;
+        case FL_IADDI:
+        case FL_IADDIU:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(vi[p.lReg2] + p.imm);
+            return false;
+        case FL_ISUBIU:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(vi[p.lReg2] - p.imm);
+            return false;
+        case FL_IAND:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(vi[p.lReg2] & vi[p.lReg3]);
+            return false;
+        case FL_IOR:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(vi[p.lReg2] | vi[p.lReg3]);
+            return false;
+        case FL_DIV:
+        {
+            const float num = normalizeOperand(getLaneF(p.lReg2, p.lDest & 3u));
+            const float den = normalizeOperand(getLaneF(p.lReg1, (p.lDest >> 2) & 3u));
+            if (den == 0.0f)
+            {
+                q = (std::signbit(num) != std::signbit(den))
+                        ? -std::numeric_limits<float>::max()
+                        : std::numeric_limits<float>::max();
+            }
+            else
+            {
+                uint32_t ignored = 0u;
+                q = normalizeResult(num / den, ignored);
+            }
+            return false;
+        }
+        case FL_SQRT:
+        {
+            const float v = std::fabs(normalizeOperand(getLaneF(p.lReg1, p.lDest & 3u)));
+            uint32_t ignored = 0u;
+            q = normalizeResult(std::sqrt(v), ignored);
+            return false;
+        }
+        case FL_RSQRT:
+        {
+            const float num = normalizeOperand(getLaneF(p.lReg2, p.lDest & 3u));
+            const float den = std::fabs(normalizeOperand(getLaneF(p.lReg1, (p.lDest >> 2) & 3u)));
+            if (den == 0.0f)
+            {
+                q = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+            }
+            else
+            {
+                uint32_t ignored = 0u;
+                q = normalizeResult(num / std::sqrt(den), ignored);
+            }
+            return false;
+        }
+        case FL_WAITQ:
+            return false;
+        case FL_FCAND:
+            vi[1] = ((clip & p.imm24) != 0u) ? 1 : 0;
+            return false;
+        case FL_FCEQ:
+            vi[1] = ((clip & 0xFFFFFFu) == p.imm24) ? 1 : 0;
+            return false;
+        case FL_FCOR:
+            vi[1] = ((clip | p.imm24) == 0xFFFFFFu) ? 1 : 0;
+            return false;
+        case FL_B:
+            return true;
+        case FL_IBEQ:
+            return static_cast<int16_t>(vi[p.lReg1]) == static_cast<int16_t>(vi[p.lReg2]);
+        case FL_IBNE:
+            return static_cast<int16_t>(vi[p.lReg1]) != static_cast<int16_t>(vi[p.lReg2]);
+        case FL_IBLTZ:
+            return static_cast<int16_t>(vi[p.lReg1]) < 0;
+        case FL_IBGTZ:
+            return static_cast<int16_t>(vi[p.lReg1]) > 0;
+        case FL_IBLEZ:
+            return static_cast<int16_t>(vi[p.lReg1]) <= 0;
+        case FL_IBGEZ:
+            return static_cast<int16_t>(vi[p.lReg1]) >= 0;
+        case FL_XTOP:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(m_state.top & 0x3FFu);
+            return false;
+        case FL_XITOP:
+            if (p.lReg1 != 0u)
+                vi[p.lReg1] = static_cast<int16_t>(m_state.itop & 0x3FFu);
+            return false;
+        case FL_XGKICK:
+            xgkickIssued = true;
+            xgkickIssueCycle = cycles + static_cast<uint64_t>(p.cycleStep - 1u);
+            xgkickSourceQword = static_cast<uint16_t>(vi[p.lReg1]);
+            return false;
+        default:
+            return false;
+        }
+    };
+
+    auto execPair = [&](const FastPair &p) -> bool
+    {
+        if ((p.flags & kFastFlagShadowLowerFirst) != 0u)
+        {
+            const bool taken = execFastLower(p);
+            if (p.upperOp != FU_NOP)
+                execFastUpper(p);
+            return taken;
+        }
+        if (p.upperOp != FU_NOP)
+            execFastUpper(p);
+        return (p.lowerOp != FL_NOP) ? execFastLower(p) : false;
+    };
+
+    bool programEnded = false;
+    uint8_t terminalTailLatency = 0u;
+
+    while (cycles < budgetEnd)
+    {
+        const FastPair &p = fast[pcIdx];
+        const uint64_t nextCycles = cycles + p.cycleStep;
+        if (nextCycles > budgetEnd)
+        {
+            cycles = budgetEnd;
+            break;
+        }
+
+        const bool taken = execPair(p);
+        cycles = nextCycles;
+
+        if ((p.flags & (kFastFlagIsBranch | kFastFlagEBit)) == 0u)
+        {
+            pcIdx = (pcIdx + 1u < pairCount) ? (pcIdx + 1u) : 0u;
+            continue;
+        }
+
+        const uint32_t delayIdx = (pcIdx + 1u < pairCount) ? (pcIdx + 1u) : 0u;
+        const FastPair &delay = fast[delayIdx];
+        if (cycles + delay.cycleStep > budgetEnd)
+        {
+            pcIdx = delayIdx;
+            if ((p.flags & kFastFlagEBit) != 0u)
+            {
+                m_state.ebit = true;
+                m_state.haltAfterDelaySlot = true;
+            }
+            else if (taken)
+            {
+                m_state.branchPending = true;
+                m_state.branchTarget = static_cast<uint32_t>(p.imm) * 8u;
+                m_state.branchDelay = 1u;
+            }
+            cycles = budgetEnd;
+            break;
+        }
+        (void)execPair(delay);
+        cycles += delay.cycleStep;
+
+        if ((p.flags & kFastFlagEBit) != 0u)
+        {
+            pcIdx = (delayIdx + 1u < pairCount) ? (delayIdx + 1u) : 0u;
+            terminalTailLatency = delay.tailLatency;
+            programEnded = true;
+            break;
+        }
+
+        pcIdx = taken ? static_cast<uint32_t>(p.imm)
+                      : ((delayIdx + 1u < pairCount) ? (delayIdx + 1u) : 0u);
+    }
+
+    // Write back local register state.
+#if defined(__SSE2__) || defined(_M_X64)
+    for (uint32_t r = 1u; r < 32u; ++r)
+        _mm_storeu_ps(m_state.vf[r], vf[r]);
+    _mm_storeu_ps(m_state.acc, acc);
+#else
+    std::memcpy(m_state.vf + 1, vf + 1, sizeof(m_state.vf) - sizeof(m_state.vf[0]));
+    std::memcpy(m_state.acc, acc, sizeof(acc));
+#endif
+    m_state.vf[0][0] = 0.0f; m_state.vf[0][1] = 0.0f; m_state.vf[0][2] = 0.0f; m_state.vf[0][3] = 1.0f;
+    std::memcpy(m_state.vi + 1, vi + 1, sizeof(m_state.vi) - sizeof(m_state.vi[0]));
+    m_state.vi[0] = 0;
+    m_state.q = q;
+    m_state.i = iReg;
+    m_state.clip = clip;
+    m_workingClip = clip;
+    m_state.pc = pcIdx * 8u;
+
+    if (programEnded)
+    {
+        cycles += terminalTailLatency;
+        if (xgkickIssued)
+        {
+            const uint32_t sourceAddress = (xgkickSourceQword * 16u) & dataMask;
+            uint32_t copiedBytes = 0u;
+            bool validPacket = true;
+            for (;;)
+            {
+                if (copiedBytes > XgkickPipeline::kBufferSize - 16u)
+                {
+                    reportReservedInstruction(false, 0xFFFFFFFBu);
+                    validPacket = false;
+                    break;
+                }
+                const uint32_t tagSrc = (sourceAddress + copiedBytes) & dataMask;
+                uint64_t tagLo = 0u;
+                std::memcpy(&tagLo, vuData + tagSrc, sizeof(tagLo));
+                const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+                const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+                uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                uint64_t tagBytes = 16u;
+                if (format == 0u)
+                    tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+                else if (format == 1u)
+                    tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
+                else if (format == 2u || format == 3u)
+                    tagBytes += static_cast<uint64_t>(nloop) * 16u;
+                else
+                {
+                    reportReservedInstruction(false, 0xFFFFFFF8u);
+                    validPacket = false;
+                    break;
+                }
+                if (tagBytes > XgkickPipeline::kBufferSize - copiedBytes)
+                {
+                    reportReservedInstruction(false, 0xFFFFFFFBu);
+                    validPacket = false;
+                    break;
+                }
+                const uint32_t copyLen = static_cast<uint32_t>(tagBytes);
+                uint32_t remaining = copyLen;
+                uint32_t srcPos = (sourceAddress + copiedBytes) & dataMask;
+                uint8_t *dstPtr = m_xgkick.packet.data() + copiedBytes;
+                while (remaining > 0u)
+                {
+                    const uint32_t chunk = std::min(remaining, dataSize - srcPos);
+                    std::memcpy(dstPtr, vuData + srcPos, chunk);
+                    dstPtr += chunk;
+                    srcPos = (srcPos + chunk) & dataMask;
+                    remaining -= chunk;
+                }
+                copiedBytes += copyLen;
+                const bool eop = ((tagLo >> 15) & 1u) != 0u;
+                if (eop)
+                    break;
+            }
+            if (validPacket)
+            {
+                const uint64_t totalQwords = copiedBytes / 16u;
+                const uint64_t xgkickDoneCycle = xgkickIssueCycle + (totalQwords > 0u ? (2u * totalQwords - 1u) : 0u);
+                if (xgkickDoneCycle > cycles)
+                    cycles = xgkickDoneCycle;
+                if (m_activeMemory)
+                    m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), copiedBytes);
+                else if (m_activeGs)
+                    m_activeGs->processGIFPacket(m_xgkick.packet.data(), copiedBytes);
+            }
+        }
+        m_state.ebit = false;
+        m_state.haltAfterDelaySlot = false;
+        m_pendingHaltD = false;
+        m_pendingHaltT = false;
+    }
+    else if (xgkickIssued)
+    {
+        m_cycle = xgkickIssueCycle;
+        startXgkick(xgkickSourceQword);
+        while (m_cycle < cycles)
+        {
+            ++m_cycle;
+            progressXgkick();
+        }
+    }
+
+    m_cycle = cycles;
+    m_state.cycles = m_cycle;
 }

@@ -2,6 +2,8 @@
 #define PS2_VU1_H
 
 #include <array>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 
 class GS;
@@ -88,8 +90,6 @@ private:
         uint8_t vfReadCount = 0;
         uint16_t viRead = 0;
         uint16_t viWrite = 0;
-        uint8_t accRead = 0;
-        uint8_t accWrite = 0;
         uint8_t latency = 0;
         uint8_t vfLatency = 0;
         uint8_t viLatency = 0;
@@ -125,7 +125,6 @@ private:
         uint32_t status = 0;
         uint32_t extraSticky = 0;
         uint32_t clip = 0;
-        bool valid = false;
         bool writesMac = false;
         bool writesStatus = false;
         bool writesSticky = false;
@@ -146,7 +145,6 @@ private:
         uint32_t address = 0;
         std::array<uint32_t, 4> words{};
         uint8_t laneMask = 0;
-        bool valid = false;
     };
 
     struct PendingVfWrite
@@ -156,7 +154,6 @@ private:
         std::array<float, 4> value{};
         uint8_t reg = 0;
         uint8_t laneMask = 0;
-        bool valid = false;
     };
 
     struct PendingViWrite
@@ -165,16 +162,53 @@ private:
         uint64_t sequence = 0;
         int32_t value = 0;
         uint8_t reg = 0;
-        bool valid = false;
     };
 
-    struct PendingAccWrite
+    template <typename Entry, std::size_t Capacity>
+    struct PendingPipeline
     {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        std::array<float, 4> value{};
-        uint8_t laneMask = 0;
-        bool valid = false;
+        static_assert(Capacity > 0 && Capacity < 32);
+
+        Entry *schedule()
+        {
+            const uint32_t freeSlots = ((1u << Capacity) - 1u) & ~occupied;
+            if (!freeSlots)
+                return nullptr;
+            const auto index = std::countr_zero(freeSlots);
+            occupied |= 1u << index;
+            entries[index] = {};
+            return &entries[index];
+        }
+
+        template <typename Update>
+        void forEach(Update update)
+        {
+            for (uint32_t slots = occupied; slots; slots &= slots - 1u)
+                update(entries[std::countr_zero(slots)]);
+        }
+
+        template <typename Commit>
+        void commit(uint64_t cycle, Commit apply)
+        {
+            // Keep slot order when multiple writes become visible on the same cycle.
+            for (uint32_t slots = occupied; slots; slots &= slots - 1u)
+            {
+                const auto index = std::countr_zero(slots);
+                Entry &entry = entries[index];
+                if (entry.readyCycle <= cycle)
+                {
+                    apply(entry);
+                    occupied &= ~(1u << index);
+                }
+            }
+        }
+
+        bool pending() const { return occupied != 0; }
+        void clear() { occupied = 0; }
+
+    private:
+        std::array<Entry, Capacity> entries{};
+        uint32_t occupied = 0;
     };
 
     struct XgkickPipeline
@@ -189,40 +223,66 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        void reset()
+        {
+            // PATH1 overwrites each qword before parsing or submitting it.
+            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0;
+            issueCycle = 0;
+            active = currentTagEop = false;
+        }
+    };
+
+    struct FastPair
+    {
+        uint8_t upperOp = 0;
+        uint8_t uDest = 0;
+        uint8_t uFd = 0;
+        uint8_t uFs = 0;
+        uint8_t uFt = 0;
+        uint8_t uAux = 0;
+        uint8_t lowerOp = 0;
+        uint8_t lDest = 0;
+        uint8_t lReg1 = 0;
+        uint8_t lReg2 = 0;
+        uint8_t lReg3 = 0;
+        uint8_t flags = 0;
+        uint8_t cycleStep = 1;
+        uint8_t tailLatency = 0;
+        int16_t imm = 0;
+        uint32_t imm24 = 0;
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
-    static constexpr uint32_t kAccForwardLatency = 1u;
     static constexpr uint32_t kMaxFlagEntries = 8u;
     static constexpr uint32_t kMaxPendingStores = 8u;
     static constexpr uint32_t kMaxPendingVfWrites = 16u;
     static constexpr uint32_t kMaxPendingViWrites = 8u;
-    static constexpr uint32_t kMaxPendingAccWrites = 8u;
     static constexpr uint32_t kMaxDecodedPairs = 0x4000u / 8u;
 
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    std::array<FastPair, kMaxDecodedPairs> m_fastCodeCache{};
+    std::array<uint8_t, kMaxDecodedPairs> m_fastPairCommitted{};
+    std::array<uint8_t, kMaxDecodedPairs> m_fastEntryStatus{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
 
-    std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+    PendingPipeline<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
-    std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
-    std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
-    std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
-    std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    PendingPipeline<PendingStore, kMaxPendingStores> m_storePipeline{};
+    PendingPipeline<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
+    PendingPipeline<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
-    std::array<uint64_t, 4> m_accReady{};
     std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
     std::array<uint64_t, 16> m_viLatestWrite{};
-    std::array<uint64_t, 4> m_accLatestWrite{};
 
     uint64_t m_cycle = 0;
     uint64_t m_nextWriteSequence = 0;
@@ -250,8 +310,11 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair *getDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+    bool buildFastPair(const DecodedInstructionPair &decoded, uint32_t pairIndex, uint32_t pairCount, FastPair &out) const;
+    bool isFastEntryEligible(uint32_t entryPair, uint32_t pairCount);
+    void runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t pairCount, uint64_t budgetEnd);
 
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
@@ -273,7 +336,6 @@ private:
     void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
     void queueVfWrite(uint8_t reg, uint8_t laneMask, const float value[4], uint32_t latency);
     void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
-    void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
     void startXgkick(uint32_t qwordAddress);
 
     void resetScheduler();
@@ -293,7 +355,6 @@ private:
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
-    float broadcast(const float *vf, uint8_t bc);
 };
 
 #endif

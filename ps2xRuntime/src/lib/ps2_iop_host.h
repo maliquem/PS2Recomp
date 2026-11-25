@@ -60,6 +60,7 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
+    void submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount) override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
     std::string translateGuestPath(std::string_view path) const override;
@@ -71,6 +72,7 @@ public:
                       size_t size,
                       size_t &bytesRead) override;
     void closeHostFile(uint64_t handle) override;
+    bool readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t byteCount) override;
 
     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
 

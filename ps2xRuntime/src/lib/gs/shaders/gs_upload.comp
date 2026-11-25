@@ -1,0 +1,160 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1) in;
+
+layout(binding = 0, std430) buffer LocalMemory { uint vram[]; };
+layout(binding = 1, std430) buffer ClutMemory  { uint clut[]; };
+layout(binding = 2, std430) readonly buffer Staging { uint staging[]; };
+
+#include "gs_common.glsl"
+
+// Modes:
+// 0 = Host->Local upload (reads staging[] starting at stagingByteOffset)
+// 1 = Local->Local transfer (reads vram[] at src coords -> writes vram[] at dst coords)
+// 2 = LoadClut (reads vram[] -> writes clut[])
+layout(push_constant, std430) uniform TransferParams
+{
+    uint mode;
+    uint dbp, dbw, dpsm;
+    uint dsax, dsay, rrw, rrh;
+    uint startPixel, pixelCount, stagingByteOffset, dir;
+    uint sbp, sbw, spsm, ssax;
+    uint ssay, csm, csa, texclutPacked;
+} pc;
+
+uint readStagingByte(uint byteIdx)
+{
+    return (staging[byteIdx >> 2u] >> ((byteIdx & 3u) * 8u)) & 0xFFu;
+}
+
+uint readStagingU16(uint byteIdx)
+{
+    return readStagingByte(byteIdx) | (readStagingByte(byteIdx + 1u) << 8u);
+}
+
+uint readStagingU32(uint byteIdx)
+{
+    if ((byteIdx & 3u) == 0u)
+        return staging[byteIdx >> 2u];
+    return readStagingByte(byteIdx) |
+           (readStagingByte(byteIdx + 1u) << 8u) |
+           (readStagingByte(byteIdx + 2u) << 16u) |
+           (readStagingByte(byteIdx + 3u) << 24u);
+}
+
+void writeClutU16(uint idx, uint val)
+{
+    uint wordIdx = idx >> 1u;
+    uint shift = (idx & 1u) * 16u;
+    uint mask = 0xFFFFu << shift;
+    uint cur = atomicOr(clut[wordIdx], 0u);
+    for (;;)
+    {
+        uint next = (cur & ~mask) | ((val & 0xFFFFu) << shift);
+        if (next == cur)
+            return;
+        uint prev = atomicCompSwap(clut[wordIdx], cur, next);
+        if (prev == cur)
+            return;
+        cur = prev;
+    }
+}
+
+uint swizzleClutCSM1(uint index)
+{
+    return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (pc.mode == 0u)
+    {
+        if (i >= pc.pixelCount)
+            return;
+        uint p = pc.startPixel + i;
+        uint x = pc.dsax + (p % pc.rrw);
+        uint y = pc.dsay + (p / pc.rrw);
+        uint val = 0u;
+        uint psm = pc.dpsm;
+        if (psm == PSM_CT32 || psm == PSM_Z32)
+            val = readStagingU32(pc.stagingByteOffset + i * 4u);
+        else if (psm == PSM_CT24 || psm == PSM_Z24)
+        {
+            uint o = pc.stagingByteOffset + i * 3u;
+            val = readStagingByte(o) | (readStagingByte(o + 1u) << 8u) | (readStagingByte(o + 2u) << 16u);
+        }
+        else if (psm == PSM_CT16 || psm == PSM_CT16S || psm == PSM_Z16 || psm == PSM_Z16S)
+            val = readStagingU16(pc.stagingByteOffset + i * 2u);
+        else if (psm == PSM_T8 || psm == PSM_T8H)
+            val = readStagingByte(pc.stagingByteOffset + i);
+        else if (psm == PSM_T4 || psm == PSM_T4HL || psm == PSM_T4HH)
+        {
+            uint b = readStagingByte(pc.stagingByteOffset + (i >> 1u));
+            val = ((i & 1u) != 0u) ? ((b >> 4u) & 0x0Fu) : (b & 0x0Fu);
+        }
+        writeVram(psm, pc.dbp, max(pc.dbw, 1u), x, y, val);
+        return;
+    }
+
+    if (pc.mode == 1u)
+    {
+        if (i >= pc.pixelCount)
+            return;
+        uint x = i % pc.rrw;
+        uint y = i / pc.rrw;
+        if ((pc.dir & 2u) != 0u)
+            x = pc.rrw - x - 1u;
+        if ((pc.dir & 1u) != 0u)
+            y = pc.rrh - y - 1u;
+        uint val = readVram(pc.spsm, pc.sbp, max(pc.sbw, 1u), x + pc.ssax, y + pc.ssay);
+        writeVram(pc.dpsm, pc.dbp, max(pc.dbw, 1u), x + pc.dsax, y + pc.dsay, val);
+        return;
+    }
+
+    // mode == 2: LoadClut
+    uint entryCount = pc.pixelCount; // 16 or 256
+    uint firstEntry = pc.startPixel;
+    if (i < firstEntry || i >= entryCount)
+        return;
+
+    uint cpsm = pc.dpsm;
+    bool sixteen = (cpsm == PSM_CT16 || cpsm == PSM_CT16S);
+    bool fourBit = (entryCount == 16u);
+    uint csaMask = sixteen ? 0x1Fu : 0x0Fu;
+    uint dstBase = (pc.csa & csaMask) << 4u;
+    bool loadCsm1Suffix = (pc.csm == 0u && !sixteen && !fourBit);
+
+    uint sx = 0u;
+    uint sy = 0u;
+    uint sw = 1u;
+    if (pc.csm == 0u)
+    {
+        uint si = swizzleClutCSM1(i);
+        sx = si & 0x0Fu;
+        sy = si >> 4u;
+    }
+    else
+    {
+        uint cbw = max(pc.texclutPacked & 0x3Fu, 1u);
+        uint cou = (pc.texclutPacked >> 6u) & 0x3Fu;
+        uint cov = (pc.texclutPacked >> 12u) & 0x3FFu;
+        sw = cbw;
+        sx = (cou << 4u) + i;
+        sy = cov;
+    }
+
+    uint dstIdx = loadCsm1Suffix ? i : ((dstBase + i) & (sixteen ? 0x1FFu : 0x0FFu));
+    uint raw = readVram(cpsm, pc.dbp, sw, sx, sy);
+    if (sixteen)
+    {
+        writeClutU16(dstIdx, raw & 0xFFFFu);
+    }
+    else
+    {
+        uint c32 = (cpsm == PSM_CT24) ? (raw & 0x00FFFFFFu) : raw;
+        writeClutU16(dstIdx, c32 & 0xFFFFu);
+        writeClutU16(dstIdx + 256u, (c32 >> 16u) & 0xFFFFu);
+    }
+}

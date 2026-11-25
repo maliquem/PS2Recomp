@@ -18,6 +18,7 @@ public:
     void onSoundCommand(uint32_t sid, uint32_t rpcNum,
                         const uint8_t *sendBuf, uint32_t sendSize,
                         uint8_t *recvBuf, uint32_t recvSize);
+    void submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount);
 
     void play(uint32_t sampleAddr, float pitch = 1.0f, float volume = 1.0f,
               uint32_t voiceIndex = 0xFFFFFFFFu);

@@ -37,6 +37,7 @@ namespace ps2x::iop::detail
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
+        m_spu2.reset();
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -64,6 +65,8 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        if ((phys & 1u) == 0u && phys >= Spu2Base && phys < Spu2Base + 0x800u)
+            return m_spu2.read16(phys);
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
@@ -81,6 +84,11 @@ namespace ps2x::iop::detail
             uint32_t value;
             std::memcpy(&value, m_scratch.data() + (phys - ScratchBase), sizeof(value));
             return value;
+        }
+        if ((phys & 3u) == 0u && phys >= Spu2Base && phys < Spu2Base + 0x800u)
+        {
+            return static_cast<uint32_t>(m_spu2.read16(phys)) |
+                   (static_cast<uint32_t>(m_spu2.read16(phys + 2u)) << 16u);
         }
         if ((phys & 3u) == 0u && isHardwareAddress(phys))
             return readHardware32(phys);
@@ -121,6 +129,11 @@ namespace ps2x::iop::detail
             markOwned(phys, sizeof(value));
             return;
         }
+        if ((phys & 1u) == 0u && phys >= Spu2Base && phys < Spu2Base + 0x800u)
+        {
+            m_spu2.write16(phys, value);
+            return;
+        }
         write8(address, static_cast<uint8_t>(value));
         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
     }
@@ -137,6 +150,12 @@ namespace ps2x::iop::detail
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
         {
             std::memcpy(m_scratch.data() + (phys - ScratchBase), &value, sizeof(value));
+            return;
+        }
+        if ((phys & 3u) == 0u && phys >= Spu2Base && phys < Spu2Base + 0x800u)
+        {
+            m_spu2.write16(phys, static_cast<uint16_t>(value & 0xFFFFu));
+            m_spu2.write16(phys + 2u, static_cast<uint16_t>(value >> 16u));
             return;
         }
         if ((phys & 3u) == 0u)
@@ -251,16 +270,13 @@ namespace ps2x::iop::detail
             return;
 
         const bool secondCore = address == kDmaSpu1Chcr;
+        const int coreIndex = secondCore ? 1 : 0;
         m_hardware[address] = value & ~kDmaStart;
 
-        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
-        const uint32_t alignedStatus = statusAddress & ~3u;
-        const uint32_t shift = (statusAddress & 2u) * 8u;
-        uint32_t status = 0u;
-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
-            status = current->second;
-        status |= 0x80u << shift;
-        m_hardware[alignedStatus] = status;
+        const uint32_t madrAddress = address - 2u * sizeof(uint32_t);
+        uint32_t madr = 0u;
+        if (const auto current = m_hardware.find(madrAddress); current != m_hardware.end())
+            madr = current->second;
 
         const uint32_t blockControlAddress = address - sizeof(uint32_t);
         uint32_t blockControl = 0u;
@@ -269,9 +285,20 @@ namespace ps2x::iop::detail
         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+        const bool toSpu = (value & 1u) != 0u;
+        const bool continuous = (value & 0x40000000u) != 0u;
+        const bool isAutoDma = m_spu2.isAutoDmaEnabled(coreIndex) && toSpu;
+        // SPU2 AutoDMA streams 48 kHz 16-bit stereo PCM (1 word/sample -> 36.864 MHz / 48 kHz = 768 IOP cycles/word).
+        const uint64_t cyclesPerWord = isAutoDma ? 768u : 2u;
         m_dmaStart = DmaStart{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
-            std::max<uint64_t>(transferWords * 2u, 64u),
+            std::max<uint64_t>(transferWords * cyclesPerWord, 64u),
+            isAutoDma,
+            toSpu,
+            continuous,
+            coreIndex,
+            madr,
+            static_cast<uint32_t>(std::min<uint64_t>(transferWords * 4u, RamSize)),
         };
     }
 

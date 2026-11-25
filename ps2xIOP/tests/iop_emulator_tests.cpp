@@ -1097,8 +1097,26 @@ int main()
     if (!expect(!cdRootError, "Could not create the virtual-CD test directory")) return 1;
     host.cdRoot = virtualCdRoot.string();
     writeCdvdPvdReadIrx(host, 0x100u);
+    iop.runEeCycles(8u); // Establish an idle interval before the module queues work.
+    const uint64_t beforeLoad = iop.debugSnapshot().emulatorCycles;
     const ModuleLoadResult cdvdPvdRead = iop.loadModuleBuffer(0x100u);
-    iop.runEeCycles(4096u);
+    // This fixture reaches sceCdRead in 13 instructions and schedules completion 128 cycles later.
+    const uint64_t completion = beforeLoad + 13u + 128u;
+    const uint64_t afterLoad = iop.debugSnapshot().emulatorCycles;
+    uint32_t cdvdCallbackReason = 0u;
+    bool completionPending = false;
+    if (afterLoad + 1u < completion)
+    {
+        iop.runEeCycles(1u);
+        iop.runEeCycles(7u);
+        iop.runEeCycles(8u * (completion - afterLoad - 1u));
+        completionPending = iop.debugSnapshot().emulatorCycles == completion &&
+                            iop.readMemory(0x000101C0u, &cdvdCallbackReason, sizeof(cdvdCallbackReason)) &&
+                            cdvdCallbackReason == 0u;
+    }
+    const uint64_t beforeCallbackInstructions = iop.debugSnapshot().emulatorInstructions;
+    iop.runEeCycles(8u);
+    const uint64_t callbackInstructions = iop.debugSnapshot().emulatorInstructions - beforeCallbackInstructions;
     iop.onSifTransfer({
         SifTransferKind::GetOtherData,
         SifTransferPhase::BeforeCopy,
@@ -1106,14 +1124,14 @@ int main()
         0x1000u,
         sizeof(uint32_t),
     });
-    uint32_t cdvdCallbackReason = 0u;
     if (!expect(iop.readMemory(0x000101C0u, &cdvdCallbackReason, sizeof(cdvdCallbackReason)),
                 "Could not read the physical CDVD callback result")) return 1;
     host.cdRoot.clear();
     std::filesystem::remove(virtualCdRoot, cdRootError);
     if (!expect(cdvdPvdRead.handled && cdvdPvdRead.startResult == 0,
                 "CDVD did not expose the extracted CD root as an ISO9660 PVD")) return 1;
-    if (!expect(cdvdCallbackReason == 1u,
+    if (!expect(completionPending, "CDVD completion must remain pending at the end of the budget")) return 1;
+    if (!expect(cdvdCallbackReason == 1u && callbackInstructions == 5u,
                 "CDVD read completion did not invoke the registered guest callback")) return 1;
 
     iop.reset();

@@ -24,43 +24,52 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
-    GifArbiterPacket pkt;
+    const size_t offset = m_arena.size();
+    m_arena.resize(offset + sizeBytes);
+    std::memcpy(m_arena.data() + offset, data, sizeBytes);
+
+    GifArbiterPacket pkt{};
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
-    m_queue.push_back(std::move(pkt));
+    pkt.offset = static_cast<uint32_t>(offset);
+    pkt.size = sizeBytes;
+    m_queue.push_back(pkt);
 }
 
 void GifArbiter::drain()
 {
-    if (!m_processFn)
+    if (!m_processFn || m_queue.empty())
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+    if (m_queue.size() > 1u)
+    {
+        std::stable_sort(m_queue.begin(), m_queue.end(),
+                         [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                          {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
+                             // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+                             if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+                             {
+                                 if (a.path3Image && b.path2DirectHl)
+                                     return true;
+                                 if (a.path2DirectHl && b.path3Image)
+                                     return false;
+                             }
+                             return pathPriority(a.pathId) < pathPriority(b.pathId);
+                         });
+    }
 
+    const uint8_t *base = m_arena.data();
     for (size_t i = 0; i < m_queue.size(); ++i)
     {
-        auto &pkt = m_queue[i];
-        if (!pkt.data.empty())
+        const auto &pkt = m_queue[i];
+        if (pkt.size != 0u)
         {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            m_processFn(base + pkt.offset, pkt.size);
         }
     }
     m_queue.clear();
+    m_arena.clear();
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

@@ -142,10 +142,13 @@ namespace
 
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
-        if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+        for (int i = 1; i < argc; ++i)
         {
-            std::cout << "Using argv boot path" << std::endl;
-            return std::filesystem::path(argv[1]);
+            if (argv[i] && argv[i][0] != '\0' && std::string_view(argv[i]) != "--hidden-window")
+            {
+                std::cout << "Using argv boot path" << std::endl;
+                return std::filesystem::path(argv[i]);
+            }
         }
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
@@ -173,6 +176,17 @@ int main(int argc, char *argv[])
 
     try
     {
+        for (int i = 1; i < argc; ++i)
+        {
+            if (argv[i] && std::string_view(argv[i]) == "--hidden-window")
+            {
+#if defined(_WIN32)
+                _putenv("PS2X_HIDDEN_WINDOW=1");
+#else
+                setenv("PS2X_HIDDEN_WINDOW", "1", 1);
+#endif
+            }
+        }
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
 
         std::string filePathStr = pathObj.string();

@@ -310,18 +310,16 @@ void register_ps2_vu_tests()
                 9, 10, 11, 12,
                 13, 14, 15, 16};
             float expected[16]{};
-            for (int i = 0; i < 4; ++i)
+            for (int column = 0; column < 4; ++column)
             {
-                for (int j = 0; j < 4; ++j)
+                for (int row = 0; row < 4; ++row)
                 {
                     float sum = 0.0f;
                     for (int k = 0; k < 4; ++k)
                     {
-                        // expected = mulVuMatrix(m0, m1) = m0 * m1 (arg1 * arg2);
-                        // mulVuMatrix is file-local to VU.cpp, so mirror its formula here.
-                        sum += m1[4 * k + j] * m0[4 * i + k];
+                        sum += m0[4 * k + row] * m1[4 * column + k];
                     }
-                    expected[4 * i + j] = sum;
+                    expected[4 * column + row] = sum;
                 }
             }
             writeMat4(env, kA, m0);
@@ -340,7 +338,7 @@ void register_ps2_vu_tests()
                     allMatch = false;
                 }
             }
-            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal m0*m1 (mulVuMatrix(m0,m1), arg1*arg2)");
+            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal the column-major product m0*m1");
         });
 
         tc.Run("RotMatrix_Z_matches_RotMatrixZ", [](TestCase &t)

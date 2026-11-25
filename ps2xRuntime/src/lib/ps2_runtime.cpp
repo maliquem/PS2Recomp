@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_vulkan_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -373,7 +374,8 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
+                        bool useFullMpegFrame)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -390,7 +392,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        rt->gs().latchHostPresentationFrame(useFullMpegFrame ? ps2_stubs::mpegPresentationHeight() : 0u);
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -414,7 +416,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLACK);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -665,6 +667,27 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    {
+        const char *backendEnv = std::getenv("PS2X_GS_BACKEND");
+        const bool forceCpu = backendEnv && (std::strcmp(backendEnv, "cpu") == 0 || std::strcmp(backendEnv, "CPU") == 0);
+        if (!forceCpu)
+        {
+            std::string vkReason;
+            if (auto vkBackend = GSVulkanBackend::CreateIfAvailable(&vkReason))
+            {
+                std::fprintf(stderr, "[GS] backend=vulkan (%s)\n", vkBackend->deviceName().c_str());
+                m_gs.setRasterBackend(std::move(vkBackend));
+            }
+            else
+            {
+                std::fprintf(stderr, "[GS] backend=cpu (vulkan unavailable: %s)\n", vkReason.c_str());
+            }
+        }
+        else
+        {
+            std::fprintf(stderr, "[GS] backend=cpu (PS2X_GS_BACKEND=cpu)\n");
+        }
+    }
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -731,7 +754,12 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
+        if (const char *hidden = std::getenv("PS2X_HIDDEN_WINDOW"); hidden && hidden[0] != '\0' && hidden[0] != '0')
+        {
+            windowFlags |= FLAG_WINDOW_HIDDEN;
+        }
+        SetConfigFlags(windowFlags);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -1448,8 +1476,11 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
 {
-    // VCALLMS and VCALLMSR both route here.
-    executeVU0Microprogram(rdram, ctx, address);
+    // VCALLMSR always starts VU0 at CMSAR0 ($vi27) * 8; legacy recompiled code passed ctx->vi[27].
+    const uint32_t target = ctx ? ((ctx->vu0_cmsar0 & 0x1FFu) << 3u) : address;
+    if (ctx)
+        ctx->vu0_pc = target;
+    executeVU0Microprogram(rdram, ctx, target);
 }
 
 void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
@@ -2385,6 +2416,9 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    // Shadow Hearts stores the full movie in VRAM while leaving DISPLAY at one field.
+    const auto elfName = getIoPaths().elfPath.filename().string();
+    const bool useFullMpegFrame = elfName == "SLUS_203.47" || elfName == "slus_203.47";
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
@@ -2422,17 +2456,19 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        UploadFrame(frameTex, this, presentWidth, presentHeight, useFullMpegFrame);
 
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+        // NTSC/PAL single-field buffers (e.g. 640x224) display at double vertical pixel aspect (4:3).
+        const float displayHeight = (srcWidth >= srcHeight * 2.0f) ? (srcHeight * 2.0f) : srcHeight;
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+        const float scale = std::min(screenWidth / srcWidth, screenHeight / displayHeight);
         const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        const float dstHeight = displayHeight * scale;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,

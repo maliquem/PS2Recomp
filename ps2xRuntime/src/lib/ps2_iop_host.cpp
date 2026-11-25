@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
+#include "Kernel/Stubs/CD.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
@@ -267,6 +268,11 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             receive.size);
 }
 
+void PS2IopHostAdapter::submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+{
+    m_runtime.audioBackend().submitSpu2Pcm(core, interleavedStereoPcm, frameCount);
+}
+
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 {
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
@@ -403,6 +409,11 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
     {
         std::fclose(stream);
     }
+}
+
+bool PS2IopHostAdapter::readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t byteCount)
+{
+    return ps2_stubs::readMappedCdSectors(lsn, sectors, static_cast<uint8_t *>(destination), byteCount);
 }
 
 int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request)
