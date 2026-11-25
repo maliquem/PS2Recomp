@@ -98,7 +98,7 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
-    // Read-only REV=0x1B, ID=0x55 of a retail GS (PCSX2 reports the same). Games read REV:
+    // Read-only REV=0x1B, ID=0x55 of a retail GS (PCSX2 reports the same REV/ID). Games read REV:
     // Shadow Hearts programs its 1 ms game clock (EE Timer 0) only when REV >= 7.
     constexpr uint64_t kGsCsrRevId = 0x551Bull << 16;
     constexpr uint64_t kGsCsrReadOnlyMask = 0xFFFF0000ull;
@@ -755,6 +755,11 @@ int32_t PS2Memory::tlbProbe(uint32_t vpn) const
 
 uint8_t PS2Memory::read8(uint32_t address)
 {
+    if (isGsPrivReg(address))
+    {
+        return static_cast<uint8_t>(read32(address & ~3u) >> ((address & 3u) * 8u));
+    }
+
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
@@ -789,6 +794,11 @@ uint16_t PS2Memory::read16(uint32_t address)
     if (address & 1)
     {
         throw std::runtime_error("Unaligned 16-bit read at address: 0x" + std::to_string(address));
+    }
+
+    if (isGsPrivReg(address))
+    {
+        return static_cast<uint16_t>(read32(address & ~3u) >> ((address & 2u) * 8u));
     }
 
     const bool scratch = isScratchpad(address);

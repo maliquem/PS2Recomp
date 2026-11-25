@@ -426,6 +426,8 @@ void register_ps2_gs_tests()
             constexpr uint32_t kGsImr = 0x12001010u;
 
             t.Equals(mem.read32(kGsCsr) >> 16, 0x551Bu, "CSR should report a retail GS (ID 0x55, REV 0x1B) after reset");
+            t.Equals(mem.read16(kGsCsr + 2u), static_cast<uint16_t>(0x551Bu), "16-bit CSR read should see ID/REV");
+            t.Equals(mem.read8(kGsCsr + 2u), static_cast<uint8_t>(0x1Bu), "8-bit CSR read should see REV");
 
             // Bits 16..31 (REV/ID) are read-only; every other non-status bit keeps what was written.
             const uint64_t csrPattern = 0xA1B2C3D4E5F60718ull;
