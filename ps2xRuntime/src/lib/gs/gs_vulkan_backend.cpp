@@ -2385,7 +2385,10 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
     if (displayDirtyInPending)
         submitPendingUnlocked(false, false);
     const bool submitted = submitPresentUnlocked(push, presentHeight);
-    lock.unlock();
+    // The black-output CPU fallback below must read this field's VRAM, so keep the EE out until it is decided.
+    const bool mayFallback = !usedPreferred && displayFbp == 0u && !(valid1 && valid2);
+    if (!mayFallback)
+        lock.unlock();
 
     if (submitted &&
         m_vk.vkWaitForFences(m_device, 1u, &m_presentFence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
@@ -2397,7 +2400,7 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
     result.sourceFbp = sourceFbp;
     result.usedPreferred = usedPreferred;
 
-    if (!usedPreferred && displayFbp == 0u && !(valid1 && valid2))
+    if (mayFallback)
     {
         const uint32_t *px = reinterpret_cast<const uint32_t *>(result.pixels.data());
         bool anyNonBlack = false;
@@ -2415,7 +2418,6 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
         }
         if (!anyNonBlack)
         {
-            lock.lock();
             syncGpuToCpuUnlocked();
             return m_cpuFallback.Present(request);
         }

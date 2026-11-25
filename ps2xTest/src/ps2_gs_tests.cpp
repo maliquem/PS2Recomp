@@ -5144,18 +5144,15 @@ void register_ps2_gs_tests()
             }
             t.Equals(presentsMatch, true, "Presents interleaved with async flushes must match the CPU present");
 
+            auto vramMatchesCpu = [&]()
             {
-                std::vector<uint8_t> a, b;
-                cpuBackend.SnapshotVram(a);
-                vkBackend->SnapshotVram(b);
-                size_t diffs = 0u, firstOff = 0u;
-                for (size_t k = 0u; k < a.size(); ++k)
-                    if (a[k] != b[k] && diffs++ == 0u)
-                        firstOff = k;
-                if (diffs != 0u)
-                    std::cerr << "[vk-test] after loop diffs=" << diffs << " firstOff=" << firstOff << "\n";
-                t.Equals(diffs, size_t{0u}, "VRAM after async flush/present slot swaps must match CPU");
-            }
+                std::vector<uint8_t> snapCpu, snapVk;
+                cpuBackend.SnapshotVram(snapCpu);
+                vkBackend->SnapshotVram(snapVk);
+                return snapVk == snapCpu;
+            };
+            t.Equals(vramMatchesCpu(), true, "VRAM after async flush/present slot swaps must match CPU");
+
             // More sprites than one slot holds (kMaxSprites = 32768): forces async overflow submits mid-batch.
             for (GSRasterBackend *b : {static_cast<GSRasterBackend *>(&cpuBackend), static_cast<GSRasterBackend *>(vkBackend.get())})
             {
@@ -5164,24 +5161,34 @@ void register_ps2_gs_tests()
                                           static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 3u), static_cast<uint8_t>(i >> 6u)));
             }
             t.Equals(presentMatchesCpu(100u), true, "Present after slot overflow must match the CPU present");
+            t.Equals(vramMatchesCpu(), true, "VRAM after many slot swaps and overflow must match CPU byte-for-byte");
 
-            std::vector<uint8_t> snapCpu, snapVk;
-            cpuBackend.SnapshotVram(snapCpu);
-            vkBackend->SnapshotVram(snapVk);
-            if (snapVk != snapCpu)
+            // Present runs on the UI thread and waits outside m_mutex while the EE thread keeps recording and flushing.
+            std::atomic<bool> stop{false};
+            std::atomic<uint32_t> presents{0u};
+            std::thread ui([&]()
             {
-                size_t diffs = 0u, firstOff = 0u, lastOff = 0u;
-                for (size_t k = 0u; k < std::min(snapVk.size(), snapCpu.size()); ++k)
-                    if (snapVk[k] != snapCpu[k])
-                    {
-                        if (diffs++ == 0u)
-                            firstOff = k;
-                        lastOff = k;
-                    }
-                std::cerr << "[vk-test] slots vram diffs=" << diffs << " firstOff=" << firstOff << " lastOff=" << lastOff
-                          << " cpu=" << int(snapCpu[firstOff]) << " vk=" << int(snapVk[firstOff]) << "\n";
+                GSPresentationRequest uiReq = req;
+                while (!stop.load())
+                {
+                    uiReq.vsyncTick = presents.fetch_add(1u);
+                    vkBackend->Present(uiReq);
+                }
+            });
+            while (presents.load() == 0u)
+                std::this_thread::yield();
+            for (uint32_t i = 0u; i < 200u; ++i)
+            {
+                cpuBackend.Submit(blendSprite(static_cast<float>(i % 48u), static_cast<float>(i % 24u), 16.0f, 8.0f,
+                                              static_cast<uint8_t>(i * 7u), static_cast<uint8_t>(i * 3u), 200u));
+                vkBackend->Submit(blendSprite(static_cast<float>(i % 48u), static_cast<float>(i % 24u), 16.0f, 8.0f,
+                                              static_cast<uint8_t>(i * 7u), static_cast<uint8_t>(i * 3u), 200u));
+                vkBackend->Flush();
             }
-            t.Equals(snapVk == snapCpu, true, "VRAM after many slot swaps and overflow must match CPU byte-for-byte");
+            stop.store(true);
+            ui.join();
+            t.Equals(vramMatchesCpu(), true, "VRAM after flushes racing a UI-thread Present must match CPU");
+            t.Equals(presentMatchesCpu(300u), true, "Present after the race must match the CPU present");
         });
     });
 }
