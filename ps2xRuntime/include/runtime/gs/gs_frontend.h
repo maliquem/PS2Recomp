@@ -130,6 +130,10 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame(uint32_t fullFrameHeight = 0u);
+    // Latches the field into the backend's GPU buffer without reading it back; false when there is
+    // no frame (out is cleared). Use only when hostGpuContext() is non-null.
+    bool latchHostPresentationFrameGpu(uint32_t fullFrameHeight, GSGpuFrame &out);
+    const GSHostGpuContext *hostGpuContext() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -173,6 +177,9 @@ private:
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     GSPresentationRequest buildPresentationRequestUnlocked() const;
+    bool buildHostPresentationRequest(uint32_t fullFrameHeight, GSPresentationRequest &request);
+    void storeLatchedFrameInfo(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t height,
+                               uint32_t displayFbp, uint32_t sourceFbp, bool usedPreferred, bool hasFrame);
 
 
     GSContext &activeContext();

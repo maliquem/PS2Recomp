@@ -12,8 +12,7 @@
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
-#include "rlImGui.h"
-#include "raylib.h"
+#include "ps2_host_backend.h"
 #endif
 
 #include <algorithm>
@@ -2181,8 +2180,7 @@ void PS2DebugPanel::initialize()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
-        rlImGuiSetup(true);
-        m_initialized = true;
+        m_initialized = ps2host::imguiInit();
     }
 #endif
 }
@@ -2192,7 +2190,7 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-        rlImGuiShutdown();
+        ps2host::imguiShutdown();
         m_initialized = false;
     }
 #endif
@@ -2216,7 +2214,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    rlImGuiBegin();
+    if (!ps2host::imguiBeginFrame())
+        return;
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2303,7 +2302,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
-    rlImGuiEnd();
+    ps2host::imguiEndFrame();
 #else
     (void)runtime;
 #endif

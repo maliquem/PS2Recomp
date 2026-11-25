@@ -26,6 +26,10 @@ public:
 
     const std::string &deviceName() const { return m_deviceName; }
 
+    // Instance extensions a windowed host needs for its surface (from SDL). Set before CreateIfAvailable;
+    // when non-empty the device also enables VK_KHR_swapchain so the host can present from it.
+    static void SetHostInstanceExtensions(std::vector<std::string> extensions);
+
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
 
@@ -38,6 +42,8 @@ public:
     void TextureFlush() override;
     void Sync(GSSyncReason reason) override;
     PresentationFrame Present(const GSPresentationRequest &request) override;
+    bool PresentGpu(const GSPresentationRequest &request, GSGpuFrame &out) override;
+    const GSHostGpuContext *HostGpuContext() const override;
 
     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
@@ -200,6 +206,8 @@ private:
     bool submitPresentUnlocked(const PresentPush &presentPush, uint32_t presentHeight) const;
     void syncGpuToCpuUnlocked() const;
     void syncCpuToGpuUnlocked();
+    PresentationFrame presentImpl(const GSPresentationRequest &request, GSGpuFrame *gpuOut);
+    PresentationFrame presentCpuFallbackUnlocked(const GSPresentationRequest &request, GSGpuFrame *gpuOut);
 
     void flushPartialContiguousTransferUnlocked() const;
     void closeTileBatchUnlocked() const;
@@ -224,6 +232,7 @@ private:
     ps2vk::VkDevice m_device = nullptr;
     ps2vk::VkQueue m_queue = nullptr;
     uint32_t m_queueFamily = 0;
+    GSHostGpuContext m_hostContext{};
     ps2vk::VkPhysicalDeviceMemoryProperties m_memProps{};
     std::string m_deviceName;
 

@@ -72,18 +72,36 @@ else()
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
     if(PS2X_IS_ANDROID)
+        # Android keeps raylib until its own host port.
         set(PLATFORM "Android" CACHE STRING "" FORCE)
-    endif()
 
-    FetchContent_Declare(
-        raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_PROGRESS TRUE
-    )
-    FetchContent_MakeAvailable(raylib)
+        FetchContent_Declare(
+            raylib
+            GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
+            GIT_TAG "5.5"
+            GIT_PROGRESS TRUE
+        )
+        FetchContent_MakeAvailable(raylib)
+    else()
+        # Desktop host: SDL3 window/input/audio, a Vulkan swapchain on the GS backend's device, ImGui.
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+            GIT_TAG "release-3.2.30"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG "v1.4.335"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(SDL3 vulkan_headers)
 
-    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
             imgui
             GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -104,28 +122,14 @@ else()
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
         )
-        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
-
-        FetchContent_Declare(
-            rlImGui
-            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-            GIT_TAG "Raylib_5_5"
-            GIT_SHALLOW TRUE
-        )
-        FetchContent_GetProperties(rlImGui)
-
-        if(NOT rlimgui_POPULATED)
-            FetchContent_Populate(rlImGui)
-        endif()
-
-        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-        add_library(rlImGui STATIC
-            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-        )
-        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-        target_link_libraries(rlImGui PUBLIC raylib imgui)
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}" "${PS2X_IMGUI_SOURCE_DIR}/backends")
+        # Vulkan entry points come from the GS backend's loader, never from a linked vulkan-1.
+        target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES)
+        target_link_libraries(imgui PUBLIC SDL3::SDL3-static Vulkan::Headers)
     endif()
 endif()
 
@@ -234,12 +238,10 @@ if(PS2X_IS_VITA)
         c
         pthread
     )
+elseif(PS2X_IS_ANDROID)
+    target_link_libraries(ps2_host_backend INTERFACE raylib log android)
 else()
-    target_link_libraries(ps2_host_backend INTERFACE raylib)
-
-    if(PS2X_IS_ANDROID)
-        target_link_libraries(ps2_host_backend INTERFACE log android)
-    endif()
+    target_link_libraries(ps2_host_backend INTERFACE imgui)
 endif()
 
 if(PS2X_IS_ANDROID)
@@ -513,6 +515,13 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    target_sources(ps2_runtime PRIVATE
+        src/lib/host/ps2_host_sdl.cpp
+        src/lib/host/ps2_vk_presenter.cpp
+    )
+    target_include_directories(ps2_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/host)
+endif()
 if(UNIX AND NOT PS2X_IS_VITA)
     target_link_libraries(ps2_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
@@ -525,7 +534,7 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    target_link_libraries(ps2EntryRunner PRIVATE imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()
 
@@ -581,7 +590,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     endif()
 endif()
 
-# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+# Kept from the raylib host (WinAPI CloseWindow clash); generated recomp code may still rely on it.
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
 endif()

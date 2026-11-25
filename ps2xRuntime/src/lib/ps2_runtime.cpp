@@ -374,6 +374,7 @@ namespace
     }
 }
 
+#if PS2X_HOST_RAYLIB
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
                         bool useFullMpegFrame)
 {
@@ -478,6 +479,44 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outHeight = height;
     s_hasUploadedFrame = true;
 }
+#else
+namespace
+{
+    struct HostLatch
+    {
+        uint64_t lastTick = std::numeric_limits<uint64_t>::max();
+        bool latched = false;
+        GSGpuFrame gpu{};
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0u;
+        uint32_t height = 0u;
+    };
+
+    // Latches once per guest vsync tick, as UploadFrame does; true when a new field was latched.
+    // The GPU path keeps the field in the GS backend's output buffer (no readback).
+    bool LatchHostFrame(PS2Runtime *rt, HostLatch &s, bool useFullMpegFrame)
+    {
+        const uint64_t tick = rt->eeScheduler().currentVSyncTick();
+        if (s.latched && tick == s.lastTick)
+            return false;
+        s.lastTick = tick;
+        s.latched = true;
+        const uint32_t fullFrameHeight = useFullMpegFrame ? ps2_stubs::mpegPresentationHeight() : 0u;
+        if (ps2host::gpuPresent())
+        {
+            rt->gs().latchHostPresentationFrameGpu(fullFrameHeight, s.gpu);
+            return true;
+        }
+        rt->gs().latchHostPresentationFrame(fullFrameHeight);
+        if (!rt->gs().copyLatchedHostPresentationFrame(s.pixels, s.width, s.height))
+        {
+            s.width = 0u;
+            s.height = 0u;
+        }
+        return true;
+    }
+}
+#endif
 
 PS2Runtime::PS2Runtime()
 {
@@ -533,7 +572,7 @@ PS2Runtime::~PS2Runtime()
         requestStop();
         m_iopSubsystem.reset();
         m_iopHost.reset();
-#if defined(PLATFORM_VITA)
+#if defined(PLATFORM_VITA) || !PS2X_HOST_RAYLIB
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
 #else
@@ -549,10 +588,14 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
+#if PS2X_HOST_RAYLIB
         if (IsWindowReady())
         {
             CloseWindow();
         }
+#else
+        ps2host::shutdown();
+#endif
 
         m_loadedModules.clear();
     }
@@ -751,6 +794,13 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
+#if !PS2X_HOST_RAYLIB
+        // SDL first: the Vulkan GS backend created below needs the window's instance extensions.
+        if (!ps2host::preInit())
+        {
+            return false;
+        }
+#endif
         if (!syncCoreSubsystems())
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
@@ -758,7 +808,7 @@ bool PS2Runtime::initialize(const char *title)
         }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#else
+#elif PS2X_HOST_RAYLIB
         unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
         if (const char *hidden = std::getenv("PS2X_HIDDEN_WINDOW"); hidden && hidden[0] != '\0' && hidden[0] != '0')
         {
@@ -769,7 +819,16 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+#if PS2X_HOST_RAYLIB
         SetTargetFPS(60);
+#else
+        if (!ps2host::openWindow(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, m_gs))
+        {
+            std::cerr << "Failed to open the host window" << std::endl;
+            return false;
+        }
+        m_audioBackend.setAudioReady(ps2host::audioReady());
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -2393,10 +2452,14 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
+#if PS2X_HOST_RAYLIB
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+#else
+    HostLatch hostLatch;
+#endif
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2459,6 +2522,29 @@ void PS2Runtime::run()
 
             }
         });
+#if !PS2X_HOST_RAYLIB
+        if (!ps2host::pumpEvents())
+        {
+            RUNTIME_LOG("[run] window close requested, breaking out of loop");
+            requestStop();
+            break;
+        }
+        ps2host::beginFrame();
+        const bool freshField = LatchHostFrame(this, hostLatch, useFullMpegFrame);
+        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        {
+            m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        if (ps2host::gpuPresent())
+        {
+            ps2host::presentGpuFrame(hostLatch.gpu, freshField);
+        }
+        else
+        {
+            ps2host::presentPixels(hostLatch.pixels.data(), hostLatch.width, hostLatch.width, hostLatch.height, freshField);
+        }
+        ps2host::waitNextFrame();
+#else
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight, useFullMpegFrame);
@@ -2493,6 +2579,7 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+#endif
     }
 
     requestStop();
@@ -2506,8 +2593,15 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+#if PS2X_HOST_RAYLIB
     UnloadTexture(frameTex);
     CloseWindow();
+#else
+    // Sounds and the SPU2 stream are SDL objects: release them before SDL goes away.
+    m_audioBackend.stopAll();
+    m_audioBackend.setAudioReady(false);
+    ps2host::shutdown();
+#endif
 
     RUNTIME_LOG("[run] exiting loop");
 }

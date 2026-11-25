@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 enum GSPrimType : uint8_t
@@ -303,6 +304,37 @@ struct PresentationFrame
     {
         return !pixels.empty() && width != 0u && height != 0u;
     }
+};
+
+// A presented field that stays on the GPU: rows of `rowPixels` RGBA8 texels in a device buffer.
+// `mapped` lets a caller read it back on demand (captures, parity); valid until the next latch.
+struct GSGpuFrame
+{
+    uint64_t buffer = 0;        // VkBuffer handle
+    const uint8_t *mapped = nullptr;
+    uint32_t rowPixels = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t displayFbp = 0;
+    uint32_t sourceFbp = 0;
+    bool usedPreferred = false;
+
+    explicit operator bool() const { return buffer != 0u && width != 0u && height != 0u; }
+};
+
+// Vulkan objects a host presenter may share with the GS backend (handles as opaque pointers so this
+// header needs no Vulkan include). When `queueLock` is set, the queue is the one the GS backend
+// submits on and every host vkQueueSubmit/vkQueuePresentKHR must hold that lock.
+struct GSHostGpuContext
+{
+    void *instance = nullptr;
+    void *physicalDevice = nullptr;
+    void *device = nullptr;
+    void *queue = nullptr;
+    uint32_t queueFamily = 0;
+    void *getInstanceProcAddr = nullptr;
+    std::mutex *queueLock = nullptr;
+    bool swapchainEnabled = false;
 };
 
 enum class GSSyncReason : uint8_t
