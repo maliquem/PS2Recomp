@@ -108,6 +108,19 @@ void register_ps2_vu_tests()
             t.IsTrue(nearlyEqual(env.ctx.f[0], 32.0f), "InnerProduct should sum xyz only, like libvu0");
         });
 
+        tc.Run("Normalize_xyz_only_w_zero", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 3.0f, 0.0f, 4.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[4]{};
+            readVec4f(env, kDst, out);
+            t.IsTrue(nearlyEqual(out[0], 0.6f) && nearlyEqual(out[1], 0.0f) && nearlyEqual(out[2], 0.8f) && out[3] == 0.0f,
+                     "Normalize should use xyz for the length and clear w, like libvu0");
+        });
+
         tc.Run("ScaleVectorXYZ_scales_xyz", [](TestCase &t)
         {
             VuEnv env;

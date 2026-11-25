@@ -732,11 +732,12 @@ namespace ps2_stubs
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
-            if (len > 1.0e-6f)
+            // As libvu0: length from xyz only, xyz scaled, w = 0 (vmul.xyz, vsqrt, vdiv, vmulq.xyz on a zeroed vf).
+            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]));
+            if (len > 0.0f)
             {
                 const float invLen = 1.0f / len;
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 3; ++i)
                 {
                     out[i] = src[i] * invLen;
                 }
