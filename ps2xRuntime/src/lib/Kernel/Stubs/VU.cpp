@@ -247,10 +247,12 @@ namespace ps2_stubs
             };
             auto normalize = [](const float (&s)[4], float (&o)[4])
             {
-                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]) + (s[3] * s[3]));
+                // libvu0 normalizes xyz only (w out = 0); a w=1 input must not shrink the axis by 1/sqrt(2).
+                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]));
                 const float inv = (len > 1.0e-6f) ? (1.0f / len) : 0.0f;
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 3; ++i)
                     o[i] = s[i] * inv;
+                o[3] = 0.0f;
             };
             float rawCross[4]{}, row0[4]{}, row1[4]{}, row2[4]{};
             cross(up, fwd, rawCross);
@@ -731,11 +733,12 @@ namespace ps2_stubs
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
+            // libvu0: xyz length, xyz scaled, w out = 0.
+            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]));
             if (len > 1.0e-6f)
             {
                 const float invLen = 1.0f / len;
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 3; ++i)
                 {
                     out[i] = src[i] * invLen;
                 }
@@ -758,10 +761,12 @@ namespace ps2_stubs
         {
             auto negNormalize = [](const float (&s)[4], float (&o)[4])
             {
-                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]) + (s[3] * s[3]));
+                // xyz only, w = 0 (as libvu0).
+                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]));
                 const float inv = (len > 1.0e-6f) ? (1.0f / len) : 0.0f;
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 3; ++i)
                     o[i] = -s[i] * inv;
+                o[3] = 0.0f;
             };
             float r0[4]{}, r1[4]{}, r2[4]{};
             negNormalize(l0, r0);
