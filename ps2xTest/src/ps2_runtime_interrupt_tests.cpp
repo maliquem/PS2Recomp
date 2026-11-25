@@ -190,11 +190,31 @@ namespace
         runtime->requestStop();
     }
 
-    void runSpin(const std::vector<uint32_t> &loopCode)
+    // A checkpoint for some other backward edge to the loop head, with the flag already clear:
+    // the pure loop would exit at once, so nothing may be skipped.
+    void spinExitEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->memory().writeIORegister(0x10000010u, 0x80u);
+        rdram[kSpinFlagAddr] = 0u;
+        setRegU32(*ctx, 4, kSpinFlagAddr);
+        for (int i = 0; i < 64; ++i)
+        {
+            ctx->pc = kSpinLoopPc;
+            if (runtime->eeCheckpointDue())
+            {
+                break;
+            }
+        }
+        g_spinTimerCount = runtime->memory().readIORegister(0x10000000u);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void runSpin(const std::vector<uint32_t> &loopCode, PS2Runtime::RecompiledFunction entry = spinEntry)
     {
         TestEnv env;
         env.runtime.memory().initialize();
-        env.runtime.registerFunction(kSpinEntryPc, spinEntry);
+        env.runtime.registerFunction(kSpinEntryPc, entry);
         env.runtime.registerFunction(kSpinLoopPc, spinLoop);
         env.runtime.registerFunction(kSpinHandlerPc, spinHandler);
         std::memcpy(env.rdram.data() + kSpinLoopPc, loopCode.data(), loopCode.size() * sizeof(uint32_t));
@@ -616,6 +636,12 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(pureCount, g_spinTimerCount, "skipping must leave the timer where every iteration leaves it");
             t.IsTrue(g_spinIterations > 100000u, "the unskipped loop spins until the VBlank IRQ");
             t.IsTrue(pureIterations * 10u < g_spinIterations, "the pure loop must actually be skipped");
+            // 64 checkpoints of 32 EE cycles are 1024 bus-clock ticks.
+            runSpin({0x90820000u, 0x1440FFFEu, 0u}, spinExitEntry);
+            t.Equals(g_spinTimerCount, 1024u, "a loop about to exit must not be skipped");
+            // b loop; nop -- a one-instruction loop is pure too.
+            runSpin({0x1000FFFFu, 0u}, spinExitEntry);
+            t.IsTrue(g_spinTimerCount > 1024u, "a one-instruction loop is skipped");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)

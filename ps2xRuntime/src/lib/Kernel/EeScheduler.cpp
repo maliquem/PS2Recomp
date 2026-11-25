@@ -391,8 +391,9 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 namespace
 {
     // True when the loop starting at ctx.pc only reloads RAM and recomputes registers from values
-    // it does not change, closing with a branch back to ctx.pc whose delay slot is a nop. While
-    // memory is unchanged every further iteration leaves exactly the same state.
+    // it does not change, and one more iteration from the current state ends in a taken branch
+    // back to ctx.pc with a nop delay slot. While memory is unchanged every further iteration then
+    // does the same, whichever edge reached the head.
     bool isPureSpinLoop(const R5900Context &ctx, const uint8_t *rdram) noexcept
     {
         constexpr uint32_t kMaxWords = 16u;
@@ -401,10 +402,15 @@ namespace
         {
             return false;
         }
-        uint32_t reads[kMaxWords]{};
-        uint32_t writes[kMaxWords]{};
-        uint32_t allWrites = 0u;
-        uint32_t loadBases = 0u;
+        uint64_t gpr[32];
+        for (uint32_t reg = 0; reg < 32u; ++reg)
+        {
+            gpr[reg] = GPR_U64((&ctx), reg);
+        }
+        const auto sext32 = [](uint64_t value)
+        { return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(value))); };
+        uint32_t written = 0u;
+        uint32_t readFirst = 0u; // read before this iteration writes them
         for (uint32_t i = 0; i < kMaxWords; ++i)
         {
             const uint32_t pc = head + i * 4u;
@@ -417,88 +423,117 @@ namespace
             const uint32_t rs = (word >> 21) & 31u;
             const uint32_t rt = (word >> 16) & 31u;
             const uint32_t rd = (word >> 11) & 31u;
+            const uint32_t sa = (word >> 6) & 31u;
+            const uint64_t s = gpr[rs];
+            const uint64_t t = gpr[rt];
+            const uint64_t simm = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(word & 0xFFFFu)));
+            const uint64_t zimm = word & 0xFFFFu;
             const auto bit = [](uint32_t reg)
             { return reg == 0u ? 0u : 1u << reg; };
 
-            bool branch = false;
+            uint32_t reads = bit(rs) | bit(rt);
+            uint32_t dest = rt;
+            uint64_t value = 0u;
+            int taken = -1; // branch outcome; -1 for a non-branch
             switch (op)
             {
             case 0x00:
+                dest = rd;
                 switch (word & 63u)
                 {
-                case 0x00: case 0x02: case 0x03: case 0x38: case 0x3A: case 0x3B: case 0x3C: case 0x3E: case 0x3F:
-                    reads[i] = bit(rt);
-                    writes[i] = bit(rd);
-                    break;
-                case 0x04: case 0x06: case 0x07: case 0x14: case 0x16: case 0x17:
-                case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x2A: case 0x2B: case 0x2D: case 0x2F:
-                    reads[i] = bit(rs) | bit(rt);
-                    writes[i] = bit(rd);
-                    break;
-                default:
-                    return false;
+                case 0x00: reads = bit(rt); value = sext32(static_cast<uint32_t>(t) << sa); break;
+                case 0x02: reads = bit(rt); value = sext32(static_cast<uint32_t>(t) >> sa); break;
+                case 0x03: reads = bit(rt); value = sext32(static_cast<uint32_t>(static_cast<int32_t>(t) >> sa)); break;
+                case 0x38: reads = bit(rt); value = t << sa; break;
+                case 0x3A: reads = bit(rt); value = t >> sa; break;
+                case 0x3B: reads = bit(rt); value = static_cast<uint64_t>(static_cast<int64_t>(t) >> sa); break;
+                case 0x3C: reads = bit(rt); value = t << (sa + 32u); break;
+                case 0x3E: reads = bit(rt); value = t >> (sa + 32u); break;
+                case 0x3F: reads = bit(rt); value = static_cast<uint64_t>(static_cast<int64_t>(t) >> (sa + 32u)); break;
+                case 0x04: value = sext32(static_cast<uint32_t>(t) << (s & 31u)); break;
+                case 0x06: value = sext32(static_cast<uint32_t>(t) >> (s & 31u)); break;
+                case 0x07: value = sext32(static_cast<uint32_t>(static_cast<int32_t>(t) >> (s & 31u))); break;
+                case 0x14: value = t << (s & 63u); break;
+                case 0x16: value = t >> (s & 63u); break;
+                case 0x17: value = static_cast<uint64_t>(static_cast<int64_t>(t) >> (s & 63u)); break;
+                case 0x21: value = sext32(s + t); break;
+                case 0x23: value = sext32(s - t); break;
+                case 0x24: value = s & t; break;
+                case 0x25: value = s | t; break;
+                case 0x26: value = s ^ t; break;
+                case 0x27: value = ~(s | t); break;
+                case 0x2A: value = static_cast<int64_t>(s) < static_cast<int64_t>(t) ? 1u : 0u; break;
+                case 0x2B: value = s < t ? 1u : 0u; break;
+                case 0x2D: value = s + t; break;
+                case 0x2F: value = s - t; break;
+                default: return false;
                 }
                 break;
-            case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x19:
-                reads[i] = bit(rs);
-                writes[i] = bit(rt);
-                break;
-            case 0x0F:
-                writes[i] = bit(rt);
-                break;
+            case 0x09: reads = bit(rs); value = sext32(s + simm); break;
+            case 0x0A: reads = bit(rs); value = static_cast<int64_t>(s) < static_cast<int64_t>(simm) ? 1u : 0u; break;
+            case 0x0B: reads = bit(rs); value = s < simm ? 1u : 0u; break;
+            case 0x0C: reads = bit(rs); value = s & zimm; break;
+            case 0x0D: reads = bit(rs); value = s | zimm; break;
+            case 0x0E: reads = bit(rs); value = s ^ zimm; break;
+            case 0x19: reads = bit(rs); value = s + simm; break;
+            case 0x0F: reads = 0u; value = sext32(zimm << 16); break;
             case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
             {
-                const uint32_t address = GPR_U32((&ctx), rs) + static_cast<uint32_t>(static_cast<int16_t>(word & 0xFFFFu));
-                if (PS2Runtime::isSpecialAddress(address))
+                reads = bit(rs);
+                const uint32_t address = static_cast<uint32_t>(s + simm);
+                const uint32_t size = op == 0x37 ? 8u : (op == 0x23 || op == 0x27) ? 4u : (op == 0x21 || op == 0x25) ? 2u : 1u;
+                if ((address & (size - 1u)) != 0u || PS2Runtime::isSpecialAddress(address))
                 {
                     return false;
                 }
-                reads[i] = bit(rs);
-                writes[i] = bit(rt);
-                loadBases |= bit(rs);
+                switch (op)
+                {
+                case 0x20: value = static_cast<uint64_t>(static_cast<int8_t>(Ps2FastRead8(rdram, address))); break;
+                case 0x24: value = Ps2FastRead8(rdram, address); break;
+                case 0x21: value = static_cast<uint64_t>(static_cast<int16_t>(Ps2FastRead16(rdram, address))); break;
+                case 0x25: value = Ps2FastRead16(rdram, address); break;
+                case 0x23: value = sext32(Ps2FastRead32(rdram, address)); break;
+                case 0x27: value = Ps2FastRead32(rdram, address); break;
+                default: value = Ps2FastRead64(rdram, address); break;
+                }
                 break;
             }
-            case 0x04: case 0x05: case 0x14: case 0x15:
-                branch = true;
-                break;
-            case 0x06: case 0x07: case 0x16: case 0x17:
-                branch = rt == 0u;
-                if (!branch)
+            case 0x04: case 0x14: taken = s == t; break;
+            case 0x05: case 0x15: taken = s != t; break;
+            case 0x06: case 0x16: case 0x07: case 0x17:
+                reads = bit(rs);
+                if (rt != 0u)
                 {
                     return false;
                 }
+                taken = (op & 1u) != 0u ? static_cast<int64_t>(s) > 0 : static_cast<int64_t>(s) <= 0;
                 break;
             case 0x01:
-                branch = rt <= 3u;
-                if (!branch)
+                reads = bit(rs);
+                if (rt > 3u)
                 {
                     return false;
                 }
+                taken = (rt & 1u) != 0u ? static_cast<int64_t>(s) >= 0 : static_cast<int64_t>(s) < 0;
                 break;
             default:
                 return false;
             }
 
-            if (!branch)
+            readFirst |= reads & ~written;
+            if (taken < 0)
             {
-                allWrites |= writes[i];
+                if (dest != 0u)
+                {
+                    gpr[dest] = value;
+                    written |= 1u << dest;
+                }
                 continue;
             }
-            const uint32_t target = pc + 4u + (static_cast<uint32_t>(static_cast<int16_t>(word & 0xFFFFu)) << 2);
-            if (i == 0u || target != head || Ps2FastRead32(rdram, pc + 4u) != 0u || (loadBases & allWrites) != 0u)
-            {
-                return false;
-            }
-            uint32_t written = 0u;
-            for (uint32_t j = 0; j < i; ++j)
-            {
-                if ((reads[j] & allWrites & ~written) != 0u)
-                {
-                    return false; // loop-carried register
-                }
-                written |= writes[j];
-            }
-            return true;
+            const uint32_t target = pc + 4u + (static_cast<uint32_t>(simm) << 2);
+            // readFirst & written: a loop-carried register, so the next iteration differs.
+            return taken != 0 && target == head && Ps2FastRead32(rdram, pc + 4u) == 0u &&
+                   (readFirst & written) == 0u;
         }
         return false;
     }
@@ -521,10 +556,11 @@ bool EeScheduler::loopCheckpointDue(uint32_t cycles) noexcept
         --m_spinProbeCountdown;
         return false;
     }
+    // Probe again soon only after a skip; a failed probe or an empty skip waits a while.
+    m_spinProbeCountdown = kSpinProbeInterval;
     const R5900Context *ctx = currentContext();
     if (ctx == nullptr || !isPureSpinLoop(*ctx, m_rdram))
     {
-        m_spinProbeCountdown = kSpinProbeInterval;
         return false;
     }
 
@@ -544,6 +580,7 @@ bool EeScheduler::loopCheckpointDue(uint32_t cycles) noexcept
     if (skip != 0u)
     {
         accountCycles(static_cast<uint32_t>(skip));
+        m_spinProbeCountdown = 0u;
     }
     return false;
 }

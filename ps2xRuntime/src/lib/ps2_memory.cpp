@@ -1631,6 +1631,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             m_pendingVif0Transfers.push_back(std::move(pt));
                         }
                     }
+                    else
+                    {
+                        m_dmaChainScratch.swap(chainBuf);
+                    }
                     // else if (channelBase == 0x10009000u)
                     // {
 
