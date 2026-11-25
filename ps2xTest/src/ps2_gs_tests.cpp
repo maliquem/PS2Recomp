@@ -5058,5 +5058,130 @@ void register_ps2_gs_tests()
             vkBackend->SnapshotVram(snapVk);
             t.Equals(snapVk == snapCpu, true, "Pending unrelated buffer draw must survive non-intrusive Present");
         });
+
+        tc.Run("GSVulkanBackend double-buffered slots keep order across async flushes, presents and overflow", [](TestCase &t)
+        {
+            auto vkBackend = GSVulkanBackend::CreateIfAvailable();
+            if (!vkBackend)
+                return; // headless machine without a Vulkan compute GPU
+
+            std::vector<uint8_t> cpuVram(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> vkVram(PS2_GS_VRAM_SIZE, 0u);
+            GSCpuBackend cpuBackend;
+            cpuBackend.Initialize(cpuVram.data(), static_cast<uint32_t>(cpuVram.size()));
+            vkBackend->Initialize(vkVram.data(), static_cast<uint32_t>(vkVram.size()));
+
+            auto blendSprite = [](float x, float y, float w, float h, uint8_t r, uint8_t g, uint8_t b)
+            {
+                GSPrimitiveBatch sp{};
+                sp.vertexCount = 2u;
+                sp.state.prim.type = GS_PRIM_SPRITE;
+                sp.state.prim.abe = true;
+                sp.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                sp.state.context.zbuf = {80u, GS_PSM_Z16S, true};
+                sp.state.context.scissor = {0u, 639u, 0u, 223u};
+                sp.state.context.test = (1ull << 17u);
+                sp.state.context.alpha = 0x44ull; // (Cs - Cd) * As + Cd: result depends on draw order
+                sp.vertices[0] = {x, y, 0.0, r, g, b, 0x40, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                sp.vertices[1] = {x + w, y + h, 0.0, r, g, b, 0x40, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                return sp;
+            };
+
+            GSPresentationRequest req{};
+            req.pmode = 0x1ull;
+            req.dispfb1 = 10ull | (10ull << 9u) | (static_cast<uint64_t>(GS_PSM_CT32) << 15u);
+            req.display1 = (3ull << 23u) | ((640ull * 4ull - 1ull) << 32u) | (223ull << 44u);
+            req.smode2 = 0x1ull;
+
+            // A present taken while the previous slot may still be in flight must equal the CPU present.
+            auto presentMatchesCpu = [&](uint64_t tick)
+            {
+                req.vsyncTick = tick;
+                const PresentationFrame vk = vkBackend->Present(req);
+                return vk.width != 0u && vk.pixels == cpuBackend.Present(req).pixels;
+            };
+
+            std::vector<uint8_t> tex(16u * 16u * 4u);
+            bool presentsMatch = true;
+            // Each Flush() submits one slot and records the next into the other; every step blends over the
+            // pixels written by the previous submission, so a missing cross-slot dependency changes VRAM.
+            for (uint32_t i = 0u; i < 9u; ++i)
+            {
+                for (uint32_t p = 0u; p < 16u * 16u; ++p)
+                {
+                    tex[p * 4u + 0u] = static_cast<uint8_t>(p * 3u + i * 29u);
+                    tex[p * 4u + 1u] = static_cast<uint8_t>(p * 5u + i * 11u);
+                    tex[p * 4u + 2u] = static_cast<uint8_t>(p * 7u + i * 17u);
+                    tex[p * 4u + 3u] = 0x80u;
+                }
+                for (GSRasterBackend *b : {static_cast<GSRasterBackend *>(&cpuBackend), static_cast<GSRasterBackend *>(vkBackend.get())})
+                {
+                    GSTransferCommand tr{};
+                    tr.direction = 0u;
+                    tr.bitbltbuf = {0u, 0u, 0u, 6400u, 1u, GS_PSM_CT32};
+                    tr.trxreg = {16u, 16u};
+                    b->BeginTransfer(tr);
+                    b->UploadImage(tex.data(), static_cast<uint32_t>(tex.size()));
+                    b->TextureFlush(); // GS semantics: the CPU backend keeps its texture page cache until TEXFLUSH
+
+                    GSPrimitiveBatch texSp = blendSprite(8.0f, 8.0f, 16.0f, 16.0f, 128, 128, 128);
+                    texSp.state.prim.tme = true;
+                    texSp.state.prim.fst = true;
+                    texSp.state.textureWidth = 16u;
+                    texSp.state.textureHeight = 16u;
+                    texSp.state.context.clamp = 5ull;
+                    texSp.state.context.tex0 = {6400u, 1u, GS_PSM_CT32, 4u, 4u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
+                    texSp.vertices[0].a = texSp.vertices[1].a = 0x80u;
+                    texSp.vertices[1].u = 256;
+                    texSp.vertices[1].v = 256;
+                    b->Submit(texSp);
+                    b->Submit(blendSprite(0.0f, 0.0f, 64.0f, 32.0f,
+                                          static_cast<uint8_t>(40u * i), static_cast<uint8_t>(255u - 25u * i), 90u));
+                    b->Flush();
+                }
+                if (i % 2u == 1u)
+                    presentsMatch = presentMatchesCpu(i) && presentsMatch;
+            }
+            t.Equals(presentsMatch, true, "Presents interleaved with async flushes must match the CPU present");
+
+            {
+                std::vector<uint8_t> a, b;
+                cpuBackend.SnapshotVram(a);
+                vkBackend->SnapshotVram(b);
+                size_t diffs = 0u, firstOff = 0u;
+                for (size_t k = 0u; k < a.size(); ++k)
+                    if (a[k] != b[k] && diffs++ == 0u)
+                        firstOff = k;
+                if (diffs != 0u)
+                    std::cerr << "[vk-test] after loop diffs=" << diffs << " firstOff=" << firstOff << "\n";
+                t.Equals(diffs, size_t{0u}, "VRAM after async flush/present slot swaps must match CPU");
+            }
+            // More sprites than one slot holds (kMaxSprites = 32768): forces async overflow submits mid-batch.
+            for (GSRasterBackend *b : {static_cast<GSRasterBackend *>(&cpuBackend), static_cast<GSRasterBackend *>(vkBackend.get())})
+            {
+                for (uint32_t i = 0u; i < 40000u; ++i)
+                    b->Submit(blendSprite(static_cast<float>(i % 32u), static_cast<float>((i / 32u) % 16u), 2.0f, 2.0f,
+                                          static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 3u), static_cast<uint8_t>(i >> 6u)));
+            }
+            t.Equals(presentMatchesCpu(100u), true, "Present after slot overflow must match the CPU present");
+
+            std::vector<uint8_t> snapCpu, snapVk;
+            cpuBackend.SnapshotVram(snapCpu);
+            vkBackend->SnapshotVram(snapVk);
+            if (snapVk != snapCpu)
+            {
+                size_t diffs = 0u, firstOff = 0u, lastOff = 0u;
+                for (size_t k = 0u; k < std::min(snapVk.size(), snapCpu.size()); ++k)
+                    if (snapVk[k] != snapCpu[k])
+                    {
+                        if (diffs++ == 0u)
+                            firstOff = k;
+                        lastOff = k;
+                    }
+                std::cerr << "[vk-test] slots vram diffs=" << diffs << " firstOff=" << firstOff << " lastOff=" << lastOff
+                          << " cpu=" << int(snapCpu[firstOff]) << " vk=" << int(snapVk[firstOff]) << "\n";
+            }
+            t.Equals(snapVk == snapCpu, true, "VRAM after many slot swaps and overflow must match CPU byte-for-byte");
+        });
     });
 }

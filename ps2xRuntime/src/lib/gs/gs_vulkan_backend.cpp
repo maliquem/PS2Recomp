@@ -477,17 +477,6 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         !createBuffer(m_clutGpu, kClutBytes,
                       ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       ps2vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
-        !createBuffer(m_uploadStaging, kStagingBytes,
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      kHostVisCoh, kHostCached) ||
-        !createBuffer(m_spriteBuf, static_cast<ps2vk::VkDeviceSize>(kMaxSprites) * sizeof(GpuSpriteDraw),
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
-        !createBuffer(m_triangleBuf, static_cast<ps2vk::VkDeviceSize>(kMaxTriangles) * sizeof(GpuTriangleDraw),
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
-        !createBuffer(m_tileHeaderBuf, static_cast<ps2vk::VkDeviceSize>(kMaxTileHeaders) * sizeof(GpuTileHeader),
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
-        !createBuffer(m_tileIndexBuf, static_cast<ps2vk::VkDeviceSize>(kMaxTileIndices) * sizeof(uint32_t),
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
         !createBuffer(m_presentOut, kPresentBytes,
                       ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
         !createBuffer(m_vramReadback, kVramBytes,
@@ -496,6 +485,26 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         if (outReason) *outReason = "Vulkan buffer allocation failed";
         destroyVulkan();
         return false;
+    }
+    FrameSlot *const slots[2] = {&m_cur, &m_spare};
+    for (FrameSlot *slot : slots)
+    {
+        if (!createBuffer(slot->uploadStaging, kStagingBytes,
+                          ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          kHostVisCoh, kHostCached) ||
+            !createBuffer(slot->spriteBuf, static_cast<ps2vk::VkDeviceSize>(kMaxSprites) * sizeof(GpuSpriteDraw),
+                          ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
+            !createBuffer(slot->triangleBuf, static_cast<ps2vk::VkDeviceSize>(kMaxTriangles) * sizeof(GpuTriangleDraw),
+                          ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
+            !createBuffer(slot->tileHeaderBuf, static_cast<ps2vk::VkDeviceSize>(kMaxTileHeaders) * sizeof(GpuTileHeader),
+                          ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
+            !createBuffer(slot->tileIndexBuf, static_cast<ps2vk::VkDeviceSize>(kMaxTileIndices) * sizeof(uint32_t),
+                          ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached))
+        {
+            if (outReason) *outReason = "Vulkan buffer allocation failed";
+            destroyVulkan();
+            return false;
+        }
     }
 
     ps2vk::VkDescriptorSetLayoutBinding bindings7[7]{};
@@ -528,10 +537,11 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         return false;
     }
 
-    const ps2vk::VkDescriptorPoolSize poolSize{ps2vk::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13u};
+    // Per slot: upload set (3) + tile set (7); plus one shared present set (3).
+    const ps2vk::VkDescriptorPoolSize poolSize{ps2vk::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u * (3u + 7u) + 3u};
     ps2vk::VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = ps2vk::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 3u;
+    poolInfo.maxSets = 5u;
     poolInfo.poolSizeCount = 1u;
     poolInfo.pPoolSizes = &poolSize;
     if (m_vk.vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descPool) != ps2vk::VK_SUCCESS)
@@ -541,12 +551,12 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         return false;
     }
 
-    const ps2vk::VkDescriptorSetLayout layouts[3] = {m_descLayout3, m_descLayout7, m_descLayout3};
-    ps2vk::VkDescriptorSet sets[3]{};
+    const ps2vk::VkDescriptorSetLayout layouts[5] = {m_descLayout3, m_descLayout7, m_descLayout3, m_descLayout7, m_descLayout3};
+    ps2vk::VkDescriptorSet sets[5]{};
     ps2vk::VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = ps2vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = m_descPool;
-    allocInfo.descriptorSetCount = 3u;
+    allocInfo.descriptorSetCount = 5u;
     allocInfo.pSetLayouts = layouts;
     if (m_vk.vkAllocateDescriptorSets(m_device, &allocInfo, sets) != ps2vk::VK_SUCCESS)
     {
@@ -554,9 +564,11 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         destroyVulkan();
         return false;
     }
-    m_uploadDescSet = sets[0];
-    m_tileDescSet = sets[1];
-    m_presentDescSet = sets[2];
+    m_cur.uploadDescSet = sets[0];
+    m_cur.tileDescSet = sets[1];
+    m_spare.uploadDescSet = sets[2];
+    m_spare.tileDescSet = sets[3];
+    m_presentDescSet = sets[4];
 
     auto bindSet = [&](ps2vk::VkDescriptorSet ds, const ps2vk::VkDescriptorBufferInfo *infos, uint32_t count)
     {
@@ -573,29 +585,34 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         m_vk.vkUpdateDescriptorSets(m_device, count, writes, 0u, nullptr);
     };
 
-    const ps2vk::VkDescriptorBufferInfo uploadInfos[3] = {
-        {m_vramGpu.buffer, 0u, m_vramGpu.size},
-        {m_clutGpu.buffer, 0u, m_clutGpu.size},
-        {m_uploadStaging.buffer, 0u, m_uploadStaging.size},
-    };
-    const ps2vk::VkDescriptorBufferInfo tileInfos[7] = {
-        {m_vramGpu.buffer, 0u, m_vramGpu.size},
-        {m_clutGpu.buffer, 0u, m_clutGpu.size},
-        {m_uploadStaging.buffer, 0u, m_uploadStaging.size},
-        {m_spriteBuf.buffer, 0u, m_spriteBuf.size},
-        {m_triangleBuf.buffer, 0u, m_triangleBuf.size},
-        {m_tileHeaderBuf.buffer, 0u, m_tileHeaderBuf.size},
-        {m_tileIndexBuf.buffer, 0u, m_tileIndexBuf.size},
-    };
+    for (const FrameSlot *slot : slots)
+    {
+        const ps2vk::VkDescriptorBufferInfo uploadInfos[3] = {
+            {m_vramGpu.buffer, 0u, m_vramGpu.size},
+            {m_clutGpu.buffer, 0u, m_clutGpu.size},
+            {slot->uploadStaging.buffer, 0u, slot->uploadStaging.size},
+        };
+        const ps2vk::VkDescriptorBufferInfo tileInfos[7] = {
+            {m_vramGpu.buffer, 0u, m_vramGpu.size},
+            {m_clutGpu.buffer, 0u, m_clutGpu.size},
+            {slot->uploadStaging.buffer, 0u, slot->uploadStaging.size},
+            {slot->spriteBuf.buffer, 0u, slot->spriteBuf.size},
+            {slot->triangleBuf.buffer, 0u, slot->triangleBuf.size},
+            {slot->tileHeaderBuf.buffer, 0u, slot->tileHeaderBuf.size},
+            {slot->tileIndexBuf.buffer, 0u, slot->tileIndexBuf.size},
+        };
+        bindSet(slot->uploadDescSet, uploadInfos, 3u);
+        bindSet(slot->tileDescSet, tileInfos, 7u);
+    }
     const ps2vk::VkDescriptorBufferInfo presentInfos[3] = {
         {m_vramGpu.buffer, 0u, m_vramGpu.size},
         {m_clutGpu.buffer, 0u, m_clutGpu.size},
         {m_presentOut.buffer, 0u, m_presentOut.size},
     };
-    bindSet(m_uploadDescSet, uploadInfos, 3u);
-    bindSet(m_tileDescSet, tileInfos, 7u);
     bindSet(m_presentDescSet, presentInfos, 3u);
 
+    // RESET_COMMAND_BUFFER_BIT: vkBeginCommandBuffer resets each buffer on its own, so one slot can be
+    // re-recorded while the other is still executing (vkResetCommandPool would reset both).
     ps2vk::VkCommandPoolCreateInfo cpInfo{};
     cpInfo.sType = ps2vk::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpInfo.flags = ps2vk::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -607,21 +624,27 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
         return false;
     }
 
+    ps2vk::VkCommandBuffer cmdBufs[3]{};
     ps2vk::VkCommandBufferAllocateInfo cbInfo{};
     cbInfo.sType = ps2vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbInfo.commandPool = m_cmdPool;
     cbInfo.level = ps2vk::VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbInfo.commandBufferCount = 1u;
-    if (m_vk.vkAllocateCommandBuffers(m_device, &cbInfo, &m_cmdBuf) != ps2vk::VK_SUCCESS)
+    cbInfo.commandBufferCount = 3u;
+    if (m_vk.vkAllocateCommandBuffers(m_device, &cbInfo, cmdBufs) != ps2vk::VK_SUCCESS)
     {
         if (outReason) *outReason = "vkAllocateCommandBuffers failed";
         destroyVulkan();
         return false;
     }
+    m_cur.cmdBuf = cmdBufs[0];
+    m_spare.cmdBuf = cmdBufs[1];
+    m_presentCmdBuf = cmdBufs[2];
 
     ps2vk::VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = ps2vk::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (m_vk.vkCreateFence(m_device, &fenceInfo, nullptr, &m_fence) != ps2vk::VK_SUCCESS)
+    if (m_vk.vkCreateFence(m_device, &fenceInfo, nullptr, &m_cur.fence) != ps2vk::VK_SUCCESS ||
+        m_vk.vkCreateFence(m_device, &fenceInfo, nullptr, &m_spare.fence) != ps2vk::VK_SUCCESS ||
+        m_vk.vkCreateFence(m_device, &fenceInfo, nullptr, &m_presentFence) != ps2vk::VK_SUCCESS)
     {
         if (outReason) *outReason = "vkCreateFence failed";
         destroyVulkan();
@@ -633,11 +656,14 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
 
 void GSVulkanBackend::destroyVulkan()
 {
+    FrameSlot *const slots[2] = {&m_cur, &m_spare};
     if (m_device)
     {
         if (m_vk.vkDeviceWaitIdle)
             m_vk.vkDeviceWaitIdle(m_device);
-        if (m_fence) m_vk.vkDestroyFence(m_device, m_fence, nullptr);
+        for (FrameSlot *slot : slots)
+            if (slot->fence) m_vk.vkDestroyFence(m_device, slot->fence, nullptr);
+        if (m_presentFence) m_vk.vkDestroyFence(m_device, m_presentFence, nullptr);
         if (m_cmdPool) m_vk.vkDestroyCommandPool(m_device, m_cmdPool, nullptr);
         if (m_descPool) m_vk.vkDestroyDescriptorPool(m_device, m_descPool, nullptr);
         if (m_presentPipeline) m_vk.vkDestroyPipeline(m_device, m_presentPipeline, nullptr);
@@ -650,11 +676,14 @@ void GSVulkanBackend::destroyVulkan()
         if (m_descLayout3) m_vk.vkDestroyDescriptorSetLayout(m_device, m_descLayout3, nullptr);
         destroyBuffer(m_vramReadback);
         destroyBuffer(m_presentOut);
-        destroyBuffer(m_tileIndexBuf);
-        destroyBuffer(m_tileHeaderBuf);
-        destroyBuffer(m_triangleBuf);
-        destroyBuffer(m_spriteBuf);
-        destroyBuffer(m_uploadStaging);
+        for (FrameSlot *slot : slots)
+        {
+            destroyBuffer(slot->tileIndexBuf);
+            destroyBuffer(slot->tileHeaderBuf);
+            destroyBuffer(slot->triangleBuf);
+            destroyBuffer(slot->spriteBuf);
+            destroyBuffer(slot->uploadStaging);
+        }
         destroyBuffer(m_clutGpu);
         destroyBuffer(m_vramGpu);
         m_vk.vkDestroyDevice(m_device, nullptr);
@@ -662,8 +691,10 @@ void GSVulkanBackend::destroyVulkan()
     if (m_instance && m_vk.vkDestroyInstance)
         m_vk.vkDestroyInstance(m_instance, nullptr);
 
-    m_fence = nullptr;
-    m_cmdBuf = nullptr;
+    m_cur = {};
+    m_spare = {};
+    m_presentFence = nullptr;
+    m_presentCmdBuf = nullptr;
     m_cmdPool = nullptr;
     m_descPool = nullptr;
     m_presentPipeline = nullptr;
@@ -801,41 +832,58 @@ bool GSVulkanBackend::createComputePipeline(const uint32_t *spv, size_t wordCoun
     return res == ps2vk::VK_SUCCESS;
 }
 
+// Waits for the previous submission (m_spare). m_cur is never in flight, so this drains the GPU slots.
 void GSVulkanBackend::waitForInFlightUnlocked() const
 {
     if (!m_gpuInFlight)
         return;
-    if (m_vk.vkWaitForFences(m_device, 1u, &m_fence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
-        m_vk.vkResetFences(m_device, 1u, &m_fence);
+    if (m_vk.vkWaitForFences(m_device, 1u, &m_spare.fence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
+        m_vk.vkResetFences(m_device, 1u, &m_spare.fence);
     m_gpuInFlight = false;
+}
+
+// Begins a one-shot command buffer whose first command orders it after everything submitted before it
+// (queue submission order + this barrier), since submissions no longer wait for each other on the host.
+bool GSVulkanBackend::beginCmdUnlocked(ps2vk::VkCommandBuffer cmd) const
+{
+    ps2vk::VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = ps2vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = ps2vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (m_vk.vkBeginCommandBuffer(cmd, &beginInfo) != ps2vk::VK_SUCCESS)
+        return false;
+    ps2vk::VkMemoryBarrier barrier{};
+    barrier.sType = ps2vk::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = ps2vk::VK_ACCESS_SHADER_WRITE_BIT | ps2vk::VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = ps2vk::VK_ACCESS_SHADER_READ_BIT | ps2vk::VK_ACCESS_SHADER_WRITE_BIT |
+                            ps2vk::VK_ACCESS_TRANSFER_READ_BIT | ps2vk::VK_ACCESS_TRANSFER_WRITE_BIT;
+    const ps2vk::VkFlags stages = ps2vk::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | ps2vk::VK_PIPELINE_STAGE_TRANSFER_BIT;
+    m_vk.vkCmdPipelineBarrier(cmd, stages, stages, 0u, 1u, &barrier, 0u, nullptr, 0u, nullptr);
+    return true;
+}
+
+void GSVulkanBackend::submitBufferCopyUnlocked(ps2vk::VkBuffer src, ps2vk::VkBuffer dst, ps2vk::VkDeviceSize size) const
+{
+    if (!beginCmdUnlocked(m_cur.cmdBuf))
+        return;
+    const ps2vk::VkBufferCopy copy{0u, 0u, size};
+    m_vk.vkCmdCopyBuffer(m_cur.cmdBuf, src, dst, 1u, &copy);
+    if (m_vk.vkEndCommandBuffer(m_cur.cmdBuf) != ps2vk::VK_SUCCESS)
+        return;
+    ps2vk::VkSubmitInfo submitInfo{};
+    submitInfo.sType = ps2vk::VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1u;
+    submitInfo.pCommandBuffers = &m_cur.cmdBuf;
+    if (m_vk.vkQueueSubmit(m_queue, 1u, &submitInfo, m_cur.fence) == ps2vk::VK_SUCCESS)
+    {
+        // Synchronous: m_cur must be free again before the caller records into it.
+        if (m_vk.vkWaitForFences(m_device, 1u, &m_cur.fence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
+            m_vk.vkResetFences(m_device, 1u, &m_cur.fence);
+    }
     m_stagingOffset = 0u;
     m_spriteCount = 0u;
     m_triangleCount = 0u;
     m_tileHeaderCount = 0u;
     m_tileIndexCount = 0u;
-}
-
-void GSVulkanBackend::submitBufferCopyUnlocked(ps2vk::VkBuffer src, ps2vk::VkBuffer dst, ps2vk::VkDeviceSize size) const
-{
-    m_vk.vkResetCommandPool(m_device, m_cmdPool, 0u);
-    ps2vk::VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = ps2vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = ps2vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (m_vk.vkBeginCommandBuffer(m_cmdBuf, &beginInfo) != ps2vk::VK_SUCCESS)
-        return;
-    const ps2vk::VkBufferCopy copy{0u, 0u, size};
-    m_vk.vkCmdCopyBuffer(m_cmdBuf, src, dst, 1u, &copy);
-    if (m_vk.vkEndCommandBuffer(m_cmdBuf) != ps2vk::VK_SUCCESS)
-        return;
-    ps2vk::VkSubmitInfo submitInfo{};
-    submitInfo.sType = ps2vk::VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1u;
-    submitInfo.pCommandBuffers = &m_cmdBuf;
-    if (m_vk.vkQueueSubmit(m_queue, 1u, &submitInfo, m_fence) == ps2vk::VK_SUCCESS)
-    {
-        m_gpuInFlight = true;
-        waitForInFlightUnlocked();
-    }
 }
 
 void GSVulkanBackend::emitUploadCmdUnlocked(const TransferPush &tr, uint32_t groupsX, uint32_t firstPage, uint32_t lastPage) const
@@ -969,8 +1017,8 @@ void GSVulkanBackend::closeTileBatchUnlocked() const
     }
 
     const uint32_t firstTile = m_tileHeaderCount;
-    GpuTileHeader *headers = static_cast<GpuTileHeader *>(m_tileHeaderBuf.mapped);
-    uint32_t *indices = static_cast<uint32_t *>(m_tileIndexBuf.mapped);
+    GpuTileHeader *headers = static_cast<GpuTileHeader *>(m_cur.tileHeaderBuf.mapped);
+    uint32_t *indices = static_cast<uint32_t *>(m_cur.tileIndexBuf.mapped);
     uint32_t curIndexOff = m_tileIndexCount;
 
     for (uint32_t ty = minTy; ty <= maxTy; ++ty)
@@ -1029,23 +1077,19 @@ void GSVulkanBackend::closeTileBatchUnlocked() const
     m_batchEstimatedIndices = 0u;
 }
 
-void GSVulkanBackend::submitPresentOnlyUnlocked(const PresentPush &presentPush, uint32_t presentHeight) const
+// Records and submits the present dispatch on its own command buffer and fence. Does not wait: the
+// caller waits on m_presentFence after releasing m_mutex. Caller holds m_presentMutex and m_mutex.
+bool GSVulkanBackend::submitPresentUnlocked(const PresentPush &presentPush, uint32_t presentHeight) const
 {
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
-
     const uint32_t clampedH = std::clamp(presentHeight, 1u, kHostFrameHeight);
-    m_vk.vkResetCommandPool(m_device, m_cmdPool, 0u);
-    ps2vk::VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = ps2vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = ps2vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (m_vk.vkBeginCommandBuffer(m_cmdBuf, &beginInfo) != ps2vk::VK_SUCCESS)
-        return;
+    if (!beginCmdUnlocked(m_presentCmdBuf))
+        return false;
 
-    m_vk.vkCmdBindPipeline(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_presentPipeline);
-    m_vk.vkCmdBindDescriptorSets(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_presentLayout, 0u, 1u, &m_presentDescSet, 0u, nullptr);
-    m_vk.vkCmdPushConstants(m_cmdBuf, m_presentLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(PresentPush), &presentPush);
-    m_vk.vkCmdDispatch(m_cmdBuf, (kHostFrameWidth + 15u) / 16u, (clampedH + 7u) / 8u, 1u);
+    m_vk.vkCmdBindPipeline(m_presentCmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_presentPipeline);
+    m_vk.vkCmdBindDescriptorSets(m_presentCmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_presentLayout, 0u, 1u, &m_presentDescSet, 0u, nullptr);
+    m_vk.vkCmdPushConstants(m_presentCmdBuf, m_presentLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(PresentPush), &presentPush);
+    m_vk.vkCmdDispatch(m_presentCmdBuf, (kHostFrameWidth + 15u) / 16u, (clampedH + 7u) / 8u, 1u);
+    // Extension point: post-processing passes and an output image sized apart from VRAM/kHostFrame* go here, on this present-only command buffer.
 
     ps2vk::VkBufferMemoryBarrier hostBarrier{};
     hostBarrier.sType = ps2vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1056,48 +1100,37 @@ void GSVulkanBackend::submitPresentOnlyUnlocked(const PresentPush &presentPush, 
     hostBarrier.buffer = m_presentOut.buffer;
     hostBarrier.offset = 0u;
     hostBarrier.size = static_cast<ps2vk::VkDeviceSize>(clampedH) * kHostFrameWidth * 4u;
-    m_vk.vkCmdPipelineBarrier(m_cmdBuf,
+    m_vk.vkCmdPipelineBarrier(m_presentCmdBuf,
                               ps2vk::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               ps2vk::VK_PIPELINE_STAGE_HOST_BIT,
                               0u, 0u, nullptr, 1u, &hostBarrier, 0u, nullptr);
 
-    if (m_vk.vkEndCommandBuffer(m_cmdBuf) != ps2vk::VK_SUCCESS)
-        return;
+    if (m_vk.vkEndCommandBuffer(m_presentCmdBuf) != ps2vk::VK_SUCCESS)
+        return false;
 
     ps2vk::VkSubmitInfo submitInfo{};
     submitInfo.sType = ps2vk::VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1u;
-    submitInfo.pCommandBuffers = &m_cmdBuf;
-    if (m_vk.vkQueueSubmit(m_queue, 1u, &submitInfo, m_fence) == ps2vk::VK_SUCCESS)
-    {
-        // Wait directly without resetting pending staging/tile cursors for any open EE batch.
-        if (m_vk.vkWaitForFences(m_device, 1u, &m_fence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
-            m_vk.vkResetFences(m_device, 1u, &m_fence);
-    }
+    submitInfo.pCommandBuffers = &m_presentCmdBuf;
+    return m_vk.vkQueueSubmit(m_queue, 1u, &submitInfo, m_presentFence) == ps2vk::VK_SUCCESS;
 }
 
-void GSVulkanBackend::submitPendingUnlocked(const PresentPush *presentPush, uint32_t presentHeight, bool copyVramToReadback, bool waitForCompletion) const
+void GSVulkanBackend::submitPendingUnlocked(bool copyVramToReadback, bool waitForCompletion) const
 {
     // Flush any partial contiguous transfer, deferred scratch uploads, and open tile batch before submitting.
     flushPartialContiguousTransferUnlocked();
     materializeDeferredUploadsUnlocked(0u, 511u, true);
     closeTileBatchUnlocked();
 
-    if (m_cmds.empty() && !presentPush && !copyVramToReadback && !m_cpuVramDirtyForGpu)
+    if (m_cmds.empty() && !copyVramToReadback && !m_cpuVramDirtyForGpu)
     {
         if (waitForCompletion)
             waitForInFlightUnlocked();
         return;
     }
 
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
-
-    m_vk.vkResetCommandPool(m_device, m_cmdPool, 0u);
-    ps2vk::VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = ps2vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = ps2vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (m_vk.vkBeginCommandBuffer(m_cmdBuf, &beginInfo) != ps2vk::VK_SUCCESS)
+    const ps2vk::VkCommandBuffer cb = m_cur.cmdBuf;
+    if (!beginCmdUnlocked(cb))
         return;
 
     auto emitComputeBarrier = [&]()
@@ -1106,7 +1139,7 @@ void GSVulkanBackend::submitPendingUnlocked(const PresentPush *presentPush, uint
         barrier.sType = ps2vk::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         barrier.srcAccessMask = ps2vk::VK_ACCESS_SHADER_WRITE_BIT | ps2vk::VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = ps2vk::VK_ACCESS_SHADER_READ_BIT | ps2vk::VK_ACCESS_SHADER_WRITE_BIT;
-        m_vk.vkCmdPipelineBarrier(m_cmdBuf,
+        m_vk.vkCmdPipelineBarrier(cb,
                                   ps2vk::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | ps2vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
                                   ps2vk::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   0u, 1u, &barrier, 0u, nullptr, 0u, nullptr);
@@ -1115,9 +1148,9 @@ void GSVulkanBackend::submitPendingUnlocked(const PresentPush *presentPush, uint
     if (m_cpuVramDirtyForGpu && m_vram)
     {
         const uint32_t copyOffset = (m_stagingOffset + kVramBytes <= kStagingBytes) ? m_stagingOffset : 0u;
-        std::memcpy(static_cast<uint8_t *>(m_uploadStaging.mapped) + copyOffset, m_vram, kVramBytes);
+        std::memcpy(static_cast<uint8_t *>(m_cur.uploadStaging.mapped) + copyOffset, m_vram, kVramBytes);
         const ps2vk::VkBufferCopy copy{copyOffset, 0u, kVramBytes};
-        m_vk.vkCmdCopyBuffer(m_cmdBuf, m_uploadStaging.buffer, m_vramGpu.buffer, 1u, &copy);
+        m_vk.vkCmdCopyBuffer(cb, m_cur.uploadStaging.buffer, m_vramGpu.buffer, 1u, &copy);
         emitComputeBarrier();
         m_cpuVramDirtyForGpu = false;
     }
@@ -1132,53 +1165,28 @@ void GSVulkanBackend::submitPendingUnlocked(const PresentPush *presentPush, uint
         {
             if (boundPipeline != m_uploadPipeline)
             {
-                m_vk.vkCmdBindPipeline(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_uploadPipeline);
-                m_vk.vkCmdBindDescriptorSets(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_uploadLayout, 0u, 1u, &m_uploadDescSet, 0u, nullptr);
+                m_vk.vkCmdBindPipeline(cb, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_uploadPipeline);
+                m_vk.vkCmdBindDescriptorSets(cb, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_uploadLayout, 0u, 1u, &m_cur.uploadDescSet, 0u, nullptr);
                 boundPipeline = m_uploadPipeline;
             }
-            m_vk.vkCmdPushConstants(m_cmdBuf, m_uploadLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(TransferPush), &cmd.transfer);
-            m_vk.vkCmdDispatch(m_cmdBuf, cmd.groupsX, 1u, 1u);
+            m_vk.vkCmdPushConstants(cb, m_uploadLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(TransferPush), &cmd.transfer);
+            m_vk.vkCmdDispatch(cb, cmd.groupsX, 1u, 1u);
         }
         else if (cmd.kind == CmdKind::TileBatch)
         {
             if (boundPipeline != m_tilePipeline)
             {
-                m_vk.vkCmdBindPipeline(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_tilePipeline);
-                m_vk.vkCmdBindDescriptorSets(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_tileLayout, 0u, 1u, &m_tileDescSet, 0u, nullptr);
+                m_vk.vkCmdBindPipeline(cb, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_tilePipeline);
+                m_vk.vkCmdBindDescriptorSets(cb, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_tileLayout, 0u, 1u, &m_cur.tileDescSet, 0u, nullptr);
                 boundPipeline = m_tilePipeline;
             }
-            m_vk.vkCmdPushConstants(m_cmdBuf, m_tileLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(uint32_t), &cmd.firstTile);
-            m_vk.vkCmdDispatch(m_cmdBuf, cmd.tileCount, 1u, 1u);
+            m_vk.vkCmdPushConstants(cb, m_tileLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(uint32_t), &cmd.firstTile);
+            m_vk.vkCmdDispatch(cb, cmd.tileCount, 1u, 1u);
         }
     }
 
     if (!m_cmds.empty())
         m_gpuVramDirtyForCpu = true;
-
-    if (presentPush)
-    {
-        if (!m_cmds.empty())
-            emitComputeBarrier();
-        const uint32_t clampedH = std::clamp(presentHeight, 1u, kHostFrameHeight);
-        m_vk.vkCmdBindPipeline(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_presentPipeline);
-        m_vk.vkCmdBindDescriptorSets(m_cmdBuf, ps2vk::VK_PIPELINE_BIND_POINT_COMPUTE, m_presentLayout, 0u, 1u, &m_presentDescSet, 0u, nullptr);
-        m_vk.vkCmdPushConstants(m_cmdBuf, m_presentLayout, ps2vk::VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(PresentPush), presentPush);
-        m_vk.vkCmdDispatch(m_cmdBuf, (kHostFrameWidth + 15u) / 16u, (clampedH + 7u) / 8u, 1u);
-
-        ps2vk::VkBufferMemoryBarrier hostBarrier{};
-        hostBarrier.sType = ps2vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        hostBarrier.srcAccessMask = ps2vk::VK_ACCESS_SHADER_WRITE_BIT;
-        hostBarrier.dstAccessMask = ps2vk::VK_ACCESS_HOST_READ_BIT;
-        hostBarrier.srcQueueFamilyIndex = ps2vk::VK_QUEUE_FAMILY_IGNORED;
-        hostBarrier.dstQueueFamilyIndex = ps2vk::VK_QUEUE_FAMILY_IGNORED;
-        hostBarrier.buffer = m_presentOut.buffer;
-        hostBarrier.offset = 0u;
-        hostBarrier.size = static_cast<ps2vk::VkDeviceSize>(clampedH) * kHostFrameWidth * 4u;
-        m_vk.vkCmdPipelineBarrier(m_cmdBuf,
-                                  ps2vk::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                  ps2vk::VK_PIPELINE_STAGE_HOST_BIT,
-                                  0u, 0u, nullptr, 1u, &hostBarrier, 0u, nullptr);
-    }
 
     if (copyVramToReadback)
     {
@@ -1191,13 +1199,13 @@ void GSVulkanBackend::submitPendingUnlocked(const PresentPush *presentPush, uint
         vramToTransfer.buffer = m_vramGpu.buffer;
         vramToTransfer.offset = 0u;
         vramToTransfer.size = kVramBytes;
-        m_vk.vkCmdPipelineBarrier(m_cmdBuf,
+        m_vk.vkCmdPipelineBarrier(cb,
                                   ps2vk::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | ps2vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
                                   ps2vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
                                   0u, 0u, nullptr, 1u, &vramToTransfer, 0u, nullptr);
 
         const ps2vk::VkBufferCopy copy{0u, 0u, kVramBytes};
-        m_vk.vkCmdCopyBuffer(m_cmdBuf, m_vramGpu.buffer, m_vramReadback.buffer, 1u, &copy);
+        m_vk.vkCmdCopyBuffer(cb, m_vramGpu.buffer, m_vramReadback.buffer, 1u, &copy);
 
         ps2vk::VkBufferMemoryBarrier readbackHost{};
         readbackHost.sType = ps2vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1208,38 +1216,39 @@ void GSVulkanBackend::submitPendingUnlocked(const PresentPush *presentPush, uint
         readbackHost.buffer = m_vramReadback.buffer;
         readbackHost.offset = 0u;
         readbackHost.size = kVramBytes;
-        m_vk.vkCmdPipelineBarrier(m_cmdBuf,
+        m_vk.vkCmdPipelineBarrier(cb,
                                   ps2vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
                                   ps2vk::VK_PIPELINE_STAGE_HOST_BIT,
                                   0u, 0u, nullptr, 1u, &readbackHost, 0u, nullptr);
     }
 
-    if (m_vk.vkEndCommandBuffer(m_cmdBuf) != ps2vk::VK_SUCCESS)
+    if (m_vk.vkEndCommandBuffer(cb) != ps2vk::VK_SUCCESS)
         return;
 
     ps2vk::VkSubmitInfo submitInfo{};
     submitInfo.sType = ps2vk::VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1u;
-    submitInfo.pCommandBuffers = &m_cmdBuf;
-    const ps2vk::VkResult submitRes = m_vk.vkQueueSubmit(m_queue, 1u, &submitInfo, m_fence);
+    submitInfo.pCommandBuffers = &m_cur.cmdBuf;
+    const ps2vk::VkResult submitRes = m_vk.vkQueueSubmit(m_queue, 1u, &submitInfo, m_cur.fence);
     m_cmds.clear();
     m_gpuWritePages.fill(0ull);
     m_gpuReadPages.fill(0ull);
     m_gpuClutDirty = false;
     if (submitRes == ps2vk::VK_SUCCESS)
     {
+        // Double buffering: retire the submission before this one, then record into its slot
+        // while the GPU runs the one just submitted.
+        waitForInFlightUnlocked();
+        std::swap(m_cur, m_spare);
         m_gpuInFlight = true;
         if (waitForCompletion)
             waitForInFlightUnlocked();
     }
-    else
-    {
-        m_stagingOffset = 0u;
-        m_spriteCount = 0u;
-        m_triangleCount = 0u;
-        m_tileHeaderCount = 0u;
-        m_tileIndexCount = 0u;
-    }
+    m_stagingOffset = 0u;
+    m_spriteCount = 0u;
+    m_triangleCount = 0u;
+    m_tileHeaderCount = 0u;
+    m_tileIndexCount = 0u;
 }
 
 void GSVulkanBackend::syncGpuToCpuUnlocked() const
@@ -1249,7 +1258,7 @@ void GSVulkanBackend::syncGpuToCpuUnlocked() const
     if (!m_gpuVramDirtyForCpu && m_cmds.empty() && m_batchDraws.empty() && m_deferredUploads.empty() &&
         !m_activeTransferContiguous && !m_gpuInFlight)
         return;
-    submitPendingUnlocked(nullptr, 0u, true, true);
+    submitPendingUnlocked(true, true);
     std::memcpy(m_vram, m_vramReadback.mapped, kVramBytes);
     m_gpuVramDirtyForCpu = false;
     m_cpuFallback.TextureFlush();
@@ -1259,12 +1268,10 @@ void GSVulkanBackend::syncCpuToGpuUnlocked()
 {
     if (!m_vram || !m_cpuVramDirtyForGpu)
         return;
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
     if (!m_cmds.empty() || !m_batchDraws.empty() || !m_deferredUploads.empty() || m_activeTransferContiguous)
-        submitPendingUnlocked(nullptr, 0u, false, true);
-    std::memcpy(m_uploadStaging.mapped, m_vram, kVramBytes);
-    submitBufferCopyUnlocked(m_uploadStaging.buffer, m_vramGpu.buffer, kVramBytes);
+        submitPendingUnlocked(false, true);
+    std::memcpy(m_cur.uploadStaging.mapped, m_vram, kVramBytes);
+    submitBufferCopyUnlocked(m_cur.uploadStaging.buffer, m_vramGpu.buffer, kVramBytes);
     m_cpuVramDirtyForGpu = false;
     m_gpuWritePages.fill(0ull);
     m_gpuReadPages.fill(0ull);
@@ -1309,8 +1316,8 @@ void GSVulkanBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     if (m_vram)
     {
         syncCpuToGpuUnlocked();
-        std::memset(m_uploadStaging.mapped, 0, kClutBytes);
-        submitBufferCopyUnlocked(m_uploadStaging.buffer, m_clutGpu.buffer, kClutBytes);
+        std::memset(m_cur.uploadStaging.mapped, 0, kClutBytes);
+        submitBufferCopyUnlocked(m_cur.uploadStaging.buffer, m_clutGpu.buffer, kClutBytes);
     }
 }
 
@@ -1318,7 +1325,7 @@ void GSVulkanBackend::Reset()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_cmds.empty() || !m_batchDraws.empty() || !m_deferredUploads.empty() || m_activeTransferContiguous || m_gpuInFlight)
-        submitPendingUnlocked(nullptr, 0u, false, true);
+        submitPendingUnlocked(false, true);
     m_cpuFallback.Reset();
     m_clutCbp.fill(0u);
     m_transfer = {};
@@ -1328,8 +1335,8 @@ void GSVulkanBackend::Reset()
     m_activeTransferContiguous = false;
     if (m_vram)
     {
-        std::memset(m_uploadStaging.mapped, 0, kClutBytes);
-        submitBufferCopyUnlocked(m_uploadStaging.buffer, m_clutGpu.buffer, kClutBytes);
+        std::memset(m_cur.uploadStaging.mapped, 0, kClutBytes);
+        submitBufferCopyUnlocked(m_cur.uploadStaging.buffer, m_clutGpu.buffer, kClutBytes);
     }
 }
 
@@ -1375,8 +1382,6 @@ void GSVulkanBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclu
 
     if (m_cpuVramDirtyForGpu)
         syncCpuToGpuUnlocked();
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
     if (m_activeTransferContiguous)
         flushPartialContiguousTransferUnlocked();
 
@@ -1460,10 +1465,8 @@ void GSVulkanBackend::BeginTransfer(const GSTransferCommand &command)
         {
             if (m_cpuVramDirtyForGpu)
                 syncCpuToGpuUnlocked();
-            if (m_gpuInFlight)
-                waitForInFlightUnlocked();
             if (m_stagingOffset + alignedBytes > kStagingBytes)
-                submitPendingUnlocked(nullptr, 0u, false, true);
+                submitPendingUnlocked(false, false);
             m_activeTransferStagingOff = m_stagingOffset;
             m_activeTransferStagingBytes = 0u;
             m_stagingOffset += alignedBytes;
@@ -1500,8 +1503,6 @@ void GSVulkanBackend::BeginTransfer(const GSTransferCommand &command)
         }
         if (m_cpuVramDirtyForGpu)
             syncCpuToGpuUnlocked();
-        if (m_gpuInFlight)
-            waitForInFlightUnlocked();
 
         materializeDeferredUploadsUnlocked(srcFirst, srcLast, false);
         materializeDeferredUploadsUnlocked(dstFirst, dstLast, false);
@@ -1616,8 +1617,6 @@ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
     if (m_cpuVramDirtyForGpu)
         syncCpuToGpuUnlocked();
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
 
     const uint32_t startPixel = m_transferState.copiedPixels;
     const uint32_t copied = startPixel + pixelsInChunk;
@@ -1626,7 +1625,7 @@ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
     if (m_activeTransferContiguous)
     {
-        std::memcpy(static_cast<uint8_t *>(m_uploadStaging.mapped) + m_activeTransferStagingOff + m_activeTransferStagingBytes,
+        std::memcpy(static_cast<uint8_t *>(m_cur.uploadStaging.mapped) + m_activeTransferStagingOff + m_activeTransferStagingBytes,
                     data, bytesConsumed);
         m_activeTransferStagingBytes += bytesConsumed;
 
@@ -1704,14 +1703,14 @@ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         const uint32_t alignedBytes = (bytesConsumed + 3u) & ~3u;
         if (m_stagingOffset + alignedBytes > kStagingBytes)
         {
-            submitPendingUnlocked(nullptr, 0u, false, true);
+            submitPendingUnlocked(false, false);
             if (alignedBytes > kStagingBytes)
                 return;
         }
         const uint32_t stagingOff = m_stagingOffset;
-        std::memcpy(static_cast<uint8_t *>(m_uploadStaging.mapped) + stagingOff, data, bytesConsumed);
+        std::memcpy(static_cast<uint8_t *>(m_cur.uploadStaging.mapped) + stagingOff, data, bytesConsumed);
         if (alignedBytes > bytesConsumed)
-            std::memset(static_cast<uint8_t *>(m_uploadStaging.mapped) + stagingOff + bytesConsumed, 0, alignedBytes - bytesConsumed);
+            std::memset(static_cast<uint8_t *>(m_cur.uploadStaging.mapped) + stagingOff + bytesConsumed, 0, alignedBytes - bytesConsumed);
         m_stagingOffset += alignedBytes;
 
         const uint32_t endPixel = copied - 1u;
@@ -1821,8 +1820,6 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
 
     if (m_cpuVramDirtyForGpu)
         syncCpuToGpuUnlocked();
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
     if (m_activeTransferContiguous)
         flushPartialContiguousTransferUnlocked();
 
@@ -1836,7 +1833,7 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
         m_tileHeaderCount + kTileGridSize > kMaxTileHeaders ||
         m_tileIndexCount + m_batchEstimatedIndices + tileSpan > kMaxTileIndices)
     {
-        submitPendingUnlocked(nullptr, 0u, false, true);
+        submitPendingUnlocked(false, false);
     }
 
     const uint32_t fbpBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
@@ -1996,7 +1993,7 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
     d.stagingTexRect = stagingTexRect;
 
     const uint32_t idx = m_spriteCount++;
-    static_cast<GpuSpriteDraw *>(m_spriteBuf.mapped)[idx] = d;
+    static_cast<GpuSpriteDraw *>(m_cur.spriteBuf.mapped)[idx] = d;
 
     m_batchDraws.push_back({idx, tx0, ty0, tx1, ty1});
     m_batchEstimatedIndices += tileSpan;
@@ -2053,8 +2050,6 @@ void GSVulkanBackend::recordTriangleUnlocked(const GSPrimitiveBatch &batch)
 
     if (m_cpuVramDirtyForGpu)
         syncCpuToGpuUnlocked();
-    if (m_gpuInFlight)
-        waitForInFlightUnlocked();
     if (m_activeTransferContiguous)
         flushPartialContiguousTransferUnlocked();
 
@@ -2068,7 +2063,7 @@ void GSVulkanBackend::recordTriangleUnlocked(const GSPrimitiveBatch &batch)
         m_tileHeaderCount + kTileGridSize > kMaxTileHeaders ||
         m_tileIndexCount + m_batchEstimatedIndices + tileSpan > kMaxTileIndices)
     {
-        submitPendingUnlocked(nullptr, 0u, false, true);
+        submitPendingUnlocked(false, false);
     }
 
     const uint32_t fbpBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
@@ -2171,7 +2166,7 @@ void GSVulkanBackend::recordTriangleUnlocked(const GSPrimitiveBatch &batch)
     d.texaPacked = packTexa(state.texa);
 
     const uint32_t idx = m_triangleCount++;
-    static_cast<GpuTriangleDraw *>(m_triangleBuf.mapped)[idx] = d;
+    static_cast<GpuTriangleDraw *>(m_cur.triangleBuf.mapped)[idx] = d;
 
     m_batchDraws.push_back({idx | 0x80000000u, tx0, ty0, tx1, ty1});
     m_batchEstimatedIndices += tileSpan;
@@ -2222,7 +2217,7 @@ void GSVulkanBackend::Flush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_cmds.empty() || !m_batchDraws.empty() || !m_deferredUploads.empty() || m_activeTransferContiguous || m_cpuVramDirtyForGpu)
-        submitPendingUnlocked(nullptr, 0u, false, false);
+        submitPendingUnlocked(false, false);
 }
 
 void GSVulkanBackend::TextureFlush()
@@ -2234,9 +2229,9 @@ void GSVulkanBackend::Sync(GSSyncReason reason)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (reason == GSSyncReason::DebugReadback || reason == GSSyncReason::Reset)
-        submitPendingUnlocked(nullptr, 0u, false, true);
+        submitPendingUnlocked(false, true);
     else if (!m_cmds.empty() || !m_batchDraws.empty() || !m_deferredUploads.empty() || m_activeTransferContiguous || m_cpuVramDirtyForGpu)
-        submitPendingUnlocked(nullptr, 0u, false, false);
+        submitPendingUnlocked(false, false);
 }
 
 PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
@@ -2339,7 +2334,10 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
     if (!fallbackToCpu)
         result.pixels.resize(kPresentBytes);
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    // The UI thread holds only m_presentMutex while the GPU runs the present dispatch, so the EE can
+    // keep recording into m_cur meanwhile.
+    std::lock_guard<std::mutex> presentLock(m_presentMutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
     if (!m_vram)
     {
         result.pixels.clear();
@@ -2383,10 +2381,15 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
         }
     }
 
+    // Pending work that touches the display goes first; queue order puts the present after it.
     if (displayDirtyInPending)
-        submitPendingUnlocked(&push, presentHeight, false, true);
-    else
-        submitPresentOnlyUnlocked(push, presentHeight);
+        submitPendingUnlocked(false, false);
+    const bool submitted = submitPresentUnlocked(push, presentHeight);
+    lock.unlock();
+
+    if (submitted &&
+        m_vk.vkWaitForFences(m_device, 1u, &m_presentFence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
+        m_vk.vkResetFences(m_device, 1u, &m_presentFence);
 
     const size_t copyBytes = static_cast<size_t>(presentHeight) * kHostFrameWidth * 4u;
     std::memcpy(result.pixels.data(), m_presentOut.mapped, copyBytes);
@@ -2412,6 +2415,7 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
         }
         if (!anyNonBlack)
         {
+            lock.lock();
             syncGpuToCpuUnlocked();
             return m_cpuFallback.Present(request);
         }

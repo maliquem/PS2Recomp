@@ -170,6 +170,20 @@ private:
 
     using PageMask = std::array<uint64_t, 8>;
 
+    // Per-submission resources. Two slots let the EE record into one while the GPU runs the other.
+    struct FrameSlot
+    {
+        GpuBuffer uploadStaging{};
+        GpuBuffer spriteBuf{};
+        GpuBuffer triangleBuf{};
+        GpuBuffer tileHeaderBuf{};
+        GpuBuffer tileIndexBuf{};
+        ps2vk::VkCommandBuffer cmdBuf = nullptr;
+        ps2vk::VkFence fence = nullptr;
+        ps2vk::VkDescriptorSet uploadDescSet = nullptr;
+        ps2vk::VkDescriptorSet tileDescSet = nullptr;
+    };
+
     bool initVulkan(std::string *outReason);
     void destroyVulkan();
     bool createBuffer(GpuBuffer &buf, ps2vk::VkDeviceSize size, ps2vk::VkFlags usage,
@@ -180,9 +194,10 @@ private:
                                ps2vk::VkPipelineLayout &outLayout, ps2vk::VkPipeline &outPipeline);
 
     void waitForInFlightUnlocked() const;
+    bool beginCmdUnlocked(ps2vk::VkCommandBuffer cmd) const;
     void submitBufferCopyUnlocked(ps2vk::VkBuffer src, ps2vk::VkBuffer dst, ps2vk::VkDeviceSize size) const;
-    void submitPendingUnlocked(const PresentPush *presentPush, uint32_t presentHeight, bool copyVramToReadback, bool waitForCompletion) const;
-    void submitPresentOnlyUnlocked(const PresentPush &presentPush, uint32_t presentHeight) const;
+    void submitPendingUnlocked(bool copyVramToReadback, bool waitForCompletion) const;
+    bool submitPresentUnlocked(const PresentPush &presentPush, uint32_t presentHeight) const;
     void syncGpuToCpuUnlocked() const;
     void syncCpuToGpuUnlocked();
 
@@ -200,6 +215,9 @@ private:
     static void mergeMasks(PageMask &dst, const PageMask &src);
 
     mutable std::mutex m_mutex;
+    // Serializes Present() so the UI thread can wait on m_presentFence without holding m_mutex.
+    // Lock order: m_presentMutex, then m_mutex.
+    std::mutex m_presentMutex;
     ps2vk::Dispatch m_vk{};
     ps2vk::VkInstance m_instance = nullptr;
     ps2vk::VkPhysicalDevice m_physicalDevice = nullptr;
@@ -212,8 +230,6 @@ private:
     ps2vk::VkDescriptorSetLayout m_descLayout3 = nullptr;
     ps2vk::VkDescriptorSetLayout m_descLayout7 = nullptr;
     ps2vk::VkDescriptorPool m_descPool = nullptr;
-    ps2vk::VkDescriptorSet m_uploadDescSet = nullptr;
-    ps2vk::VkDescriptorSet m_tileDescSet = nullptr;
     ps2vk::VkDescriptorSet m_presentDescSet = nullptr;
 
     ps2vk::VkPipelineLayout m_uploadLayout = nullptr;
@@ -224,17 +240,15 @@ private:
     ps2vk::VkPipeline m_presentPipeline = nullptr;
 
     ps2vk::VkCommandPool m_cmdPool = nullptr;
-    ps2vk::VkCommandBuffer m_cmdBuf = nullptr;
-    mutable ps2vk::VkFence m_fence = nullptr;
+    // m_cur is always free for recording; m_spare is the previous submission, in flight while m_gpuInFlight.
+    mutable FrameSlot m_cur{};
+    mutable FrameSlot m_spare{};
     mutable bool m_gpuInFlight = false;
+    ps2vk::VkCommandBuffer m_presentCmdBuf = nullptr;
+    ps2vk::VkFence m_presentFence = nullptr;
 
     GpuBuffer m_vramGpu{};
     GpuBuffer m_clutGpu{};
-    GpuBuffer m_uploadStaging{};
-    GpuBuffer m_spriteBuf{};
-    GpuBuffer m_triangleBuf{};
-    GpuBuffer m_tileHeaderBuf{};
-    GpuBuffer m_tileIndexBuf{};
     GpuBuffer m_presentOut{};
     GpuBuffer m_vramReadback{};
 
