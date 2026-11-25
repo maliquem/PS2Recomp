@@ -295,6 +295,57 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(countReg), 1u, "fractional cycles should accumulate on the new clock");
         });
 
+        tc.Run("EE timers batched between events match per-call advancing", [](TestCase &t)
+        {
+            // `eager` writes a timer register after every advance, so each advance applies at once;
+            // `lazy` only reads now and then, so its advances accumulate until the next event.
+            PS2Memory eager;
+            PS2Memory lazy;
+            t.IsTrue(eager.initialize() && lazy.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kBases[] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+            constexpr uint32_t kZret = 1u << 6u, kCue = 1u << 7u, kCmpe = 1u << 8u, kOvfe = 1u << 9u;
+            constexpr uint32_t kFlags = (1u << 10u) | (1u << 11u);
+            constexpr uint32_t kModes[] = {1u | kZret | kCue | kCmpe, 0u | kCue | kOvfe,
+                                           3u | kCue | kCmpe | kOvfe, 2u | kZret | kCue | kCmpe | kOvfe};
+            constexpr uint32_t kCompares[] = {0x300u, 0x10u, 0x2u, 0u};
+            for (PS2Memory *mem : {&eager, &lazy})
+            {
+                for (uint32_t i = 0; i < 4u; ++i)
+                {
+                    mem->writeIORegister(kBases[i] + 0x20u, kCompares[i]);
+                    mem->writeIORegister(kBases[i], 0xFFF0u - i);
+                    mem->writeIORegister(kBases[i] + 0x10u, kModes[i]);
+                }
+            }
+
+            uint32_t seed = 12345u;
+            bool same = true;
+            for (uint32_t step = 0; step < 20000u && same; ++step)
+            {
+                seed = seed * 1103515245u + 12345u;
+                const uint64_t cycles = 1u + ((seed >> 8u) % 700u);
+                same = eager.advanceEeTimers(cycles) == lazy.advanceEeTimers(cycles);
+                eager.writeIORegister(kBases[0] + 0x30u, 0u); // any timer write makes the next advance apply at once
+                if (step % 97u == 0u)
+                {
+                    for (uint32_t i = 0; i < 4u && same; ++i)
+                        same = eager.readIORegister(kBases[i]) == lazy.readIORegister(kBases[i]);
+                    same = same && eager.cyclesUntilNextEeTimerInterrupt() == lazy.cyclesUntilNextEeTimerInterrupt();
+                }
+                if (step % 211u == 0u)
+                {
+                    const uint32_t i = (seed >> 4u) & 3u;
+                    eager.writeIORegister(kBases[i] + 0x10u, kModes[i] | kFlags);
+                    lazy.writeIORegister(kBases[i] + 0x10u, kModes[i] | kFlags);
+                }
+            }
+            for (uint32_t i = 0; i < 4u && same; ++i)
+                same = eager.readIORegister(kBases[i] + 0x10u) == lazy.readIORegister(kBases[i] + 0x10u) &&
+                       eager.readIORegister(kBases[i]) == lazy.readIORegister(kBases[i]);
+            t.IsTrue(same, "batched timer cycles should give the same IRQs, counts and flags");
+        });
+
         tc.Run("EE Timer2 compare and overflow flags raise INTC_TIM2 and clear on write-one", [](TestCase &t)
         {
             PS2Memory mem;

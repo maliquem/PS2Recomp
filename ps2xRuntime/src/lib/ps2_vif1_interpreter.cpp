@@ -596,7 +596,49 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes &&
+                !maskEnable && (vif1_regs.mode & 3u) == 0u && cl >= wl && vl != 3u)
+            {
+                // Fast path for the common case (no mask, no row add, no fill-write): every write
+                // consumes one source vector and the lanes past `components` keep their old value,
+                // exactly as the general loop below does.
+                const uint8_t *src = data + pos;
+                uint32_t block = vuAddr;
+                uint32_t cyclePos = 0u;
+                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex, src += bytesPerVector)
+                {
+                    uint8_t *dst = m_vu1Data + ((block + cyclePos) & 0x3FFu) * 16u;
+                    if (++cyclePos == wl)
+                    {
+                        cyclePos = 0u;
+                        block += cl;
+                    }
+                    uint32_t lanes[4];
+                    std::memcpy(lanes, dst, sizeof(lanes));
+                    for (int c = 0; c < components; ++c)
+                    {
+                        if (vl == 0u)
+                        {
+                            std::memcpy(&lanes[c], src + c * 4, sizeof(uint32_t));
+                        }
+                        else if (vl == 1u)
+                        {
+                            uint16_t raw;
+                            std::memcpy(&raw, src + c * 2, sizeof(raw));
+                            lanes[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                        }
+                        else
+                        {
+                            const uint8_t raw = src[c];
+                            lanes[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+                        }
+                    }
+                    if (components == 1)
+                        lanes[1] = lanes[2] = lanes[3] = lanes[0];
+                    std::memcpy(dst, lanes, sizeof(lanes));
+                }
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;

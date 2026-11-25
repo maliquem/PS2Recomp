@@ -422,6 +422,9 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    // Spent chain buffer kept for the next DMA chain so its capacity is reused.
+    std::vector<uint8_t> m_dmaChainScratch;
+    void recycleDmaChainBuffers(std::vector<PendingTransfer> &transfers);
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 
@@ -450,6 +453,19 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // Cycles accepted by advanceEeTimers() but not yet applied to m_eeTimers. They are applied
+    // once they reach m_eeTimerFlushCycles (the first compare match or overflow of any counting
+    // timer) or before a timer register is touched; below that point counting is purely additive.
+    uint64_t m_eeTimerPendingCycles = 0;
+    uint64_t m_eeTimerFlushCycles = 0;
+    uint32_t *m_gifStatRegister = nullptr;
+    uint32_t applyEeTimerCycles(uint64_t eeCycles) noexcept;
+    void flushEeTimers() noexcept;
+    // advanceEeTimers() calls summing to less than this raise nothing and only accumulate.
+    [[nodiscard]] uint64_t eeTimerQuietCycles() const noexcept
+    {
+        return m_eeTimerFlushCycles - m_eeTimerPendingCycles;
+    }
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

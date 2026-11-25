@@ -357,6 +357,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        m_gifStatRegister = nullptr;
 
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
@@ -404,6 +405,8 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerFlushCycles = 0u;
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -415,10 +418,63 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 
     constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (!m_gifStatRegister)
+    {
+        // unordered_map element addresses survive rehashing; only clear() in initialize() drops them.
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            m_gifStatRegister = &gifStatIt->second;
+    }
+    if (m_gifStatRegister)
+        *m_gifStatRegister &= ~kGifFqcMask;
 
+    if (eeCycles < m_eeTimerFlushCycles - m_eeTimerPendingCycles)
+    {
+        m_eeTimerPendingCycles += eeCycles;
+        return 0u;
+    }
+    if (m_eeTimerPendingCycles != 0u)
+    {
+        (void)applyEeTimerCycles(m_eeTimerPendingCycles);
+        m_eeTimerPendingCycles = 0u;
+    }
+    const uint32_t interruptMask = applyEeTimerCycles(eeCycles);
+
+    // Next flush: the first cycle at which any counting timer reaches its compare value or
+    // overflows, whether or not that raises an interrupt. Until then every advance only adds
+    // ticks (the tick/remainder split is exact rational arithmetic), so applying the summed
+    // cycles there gives the same counts, remainders and interrupt as applying them one by one.
+    uint64_t flushCycles = std::numeric_limits<uint64_t>::max();
+    for (const EeTimer &timer : m_eeTimers)
+    {
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
+        const uint32_t count = timer.count & 0xFFFFu;
+        const uint64_t eventTicks = std::min<uint64_t>(ticksUntilMatch(count, timer.compare & 0xFFFFu),
+                                                       0x10000ull - count);
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+        flushCycles = std::min(flushCycles, (numerator + clockHz - 1u) / clockHz);
+    }
+    m_eeTimerFlushCycles = flushCycles;
+    return interruptMask;
+}
+
+void PS2Memory::flushEeTimers() noexcept
+{
+    if (m_eeTimerPendingCycles != 0u)
+    {
+        // Pending cycles never reach an event, so this raises nothing.
+        (void)applyEeTimerCycles(m_eeTimerPendingCycles);
+        m_eeTimerFlushCycles -= m_eeTimerPendingCycles;
+        m_eeTimerPendingCycles = 0u;
+    }
+}
+
+uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
+{
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
@@ -535,6 +591,11 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
         const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+    }
+    // Timer state lags by the pending cycles, which stay below the first event.
+    if (nearest != std::numeric_limits<uint64_t>::max())
+    {
+        nearest = nearest > m_eeTimerPendingCycles ? nearest - m_eeTimerPendingCycles : 1u;
     }
     return nearest;
 }
@@ -1145,6 +1206,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimers();
+        m_eeTimerFlushCycles = 0u; // the write may move the next event; recompute on the next advance
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1364,6 +1427,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 65536;
                     std::vector<uint8_t> chainBuf;
+                    chainBuf.swap(m_dmaChainScratch);
+                    chainBuf.clear();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1678,6 +1743,15 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+void PS2Memory::recycleDmaChainBuffers(std::vector<PendingTransfer> &transfers)
+{
+    for (PendingTransfer &transfer : transfers)
+    {
+        if (transfer.chainData.capacity() > m_dmaChainScratch.capacity())
+            m_dmaChainScratch.swap(transfer.chainData);
+    }
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
@@ -1759,6 +1833,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleDmaChainBuffers(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -1817,6 +1892,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleDmaChainBuffers(m_pendingVif0Transfers);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -1875,6 +1951,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleDmaChainBuffers(m_pendingVif1Transfers);
     m_pendingVif1Transfers.clear();
 
     if (m_gifArbiter)
@@ -2302,6 +2379,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimers();
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {

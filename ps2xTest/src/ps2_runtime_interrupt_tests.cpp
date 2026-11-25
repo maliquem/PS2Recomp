@@ -147,6 +147,65 @@ namespace
         return pred();
     }
 
+    constexpr uint32_t kSpinEntryPc = 0x00160400u;
+    constexpr uint32_t kSpinLoopPc = 0x00160410u;
+    constexpr uint32_t kSpinHandlerPc = 0x00160440u;
+    constexpr uint32_t kSpinFlagAddr = 0x00170000u;
+    uint32_t g_spinIterations = 0u;
+    uint32_t g_spinTimerCount = 0u;
+
+    void spinEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->eeScheduler().addIrqHandler(false, 2u, kSpinHandlerPc, true, 0u, 0u, 0u);
+        runtime->memory().writeIORegister(0x10000010u, 0x80u); // Timer 0 counting the bus clock
+        rdram[kSpinFlagAddr] = 1u;
+        setRegU32(*ctx, 4, kSpinFlagAddr);
+        ctx->pc = kSpinLoopPc;
+    }
+
+    void spinHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        rdram[kSpinFlagAddr] = 0u;
+        ctx->pc = 0u;
+    }
+
+    // What the recompiler emits for "loop: lbu v0, 0(a0) ... bnez v0, loop".
+    void spinLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        for (;;)
+        {
+            ++g_spinIterations;
+            if (rdram[kSpinFlagAddr] == 0u)
+            {
+                break;
+            }
+            ctx->pc = kSpinLoopPc;
+            if (runtime->eeCheckpointDue())
+            {
+                return;
+            }
+        }
+        g_spinTimerCount = runtime->memory().readIORegister(0x10000000u);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void runSpin(const std::vector<uint32_t> &loopCode)
+    {
+        TestEnv env;
+        env.runtime.memory().initialize();
+        env.runtime.registerFunction(kSpinEntryPc, spinEntry);
+        env.runtime.registerFunction(kSpinLoopPc, spinLoop);
+        env.runtime.registerFunction(kSpinHandlerPc, spinHandler);
+        std::memcpy(env.rdram.data() + kSpinLoopPc, loopCode.data(), loopCode.size() * sizeof(uint32_t));
+        g_spinIterations = 0u;
+        g_spinTimerCount = 0u;
+        R5900Context mainContext{};
+        mainContext.pc = kSpinEntryPc;
+        env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+        env.runtime.eeScheduler().run();
+    }
+
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
@@ -544,6 +603,19 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("pure spin loops are skipped to the same cycle as running every iteration", [](TestCase &t)
+        {
+            // lbu v0,0(a0); bnez v0,loop; nop -- pure, so the scheduler may skip iterations.
+            runSpin({0x90820000u, 0x1440FFFEu, 0u});
+            const uint32_t pureIterations = g_spinIterations;
+            const uint32_t pureCount = g_spinTimerCount;
+            // Same loop plus a loop-carried addiu v1,v1,1 in RAM: never skipped.
+            runSpin({0x90820000u, 0x24630001u, 0x1440FFFDu, 0u});
+            t.Equals(pureCount, g_spinTimerCount, "skipping must leave the timer where every iteration leaves it");
+            t.IsTrue(g_spinIterations > 100000u, "the unskipped loop spins until the VBlank IRQ");
+            t.IsTrue(pureIterations * 10u < g_spinIterations, "the pure loop must actually be skipped");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)

@@ -908,6 +908,15 @@ namespace ps2x::iop::detail
             m_impl->cycleOvershoot = elapsed - budget;
     }
 
+    uint64_t IopEmulator::idleEeCycleHorizon() const noexcept
+    {
+        // runEeCycles() of up to this many EE cycles only consumes overshoot and moves totalCycles
+        // inside the idle window, so one call of the sum equals any split of it.
+        const uint64_t idle = m_impl->idleUntil > m_impl->totalCycles ? m_impl->idleUntil - m_impl->totalCycles : 0u;
+        const uint64_t iopCycles = std::min<uint64_t>(m_impl->cycleOvershoot + idle, 1ull << 40);
+        return iopCycles * 8u + 7u - m_impl->eeCycleCarry;
+    }
+
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
         m_impl->idleUntil = 0;

@@ -279,6 +279,8 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    // checkpointDue() for generated backward branches (ctx->pc is the loop head).
+    [[nodiscard]] bool loopCheckpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
@@ -449,6 +451,7 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    uint32_t m_spinProbeCountdown = 0;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

@@ -612,6 +612,11 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
+uint64_t PS2Runtime::iopIdleEeCycleHorizon() const noexcept
+{
+    return m_iopSubsystem->idleEeCycleHorizon();
+}
+
 void PS2Runtime::resetIop()
 {
     m_iopSubsystem->reset();
@@ -2242,7 +2247,7 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    return m_eeScheduler->loopCheckpointDue(cycles);
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)

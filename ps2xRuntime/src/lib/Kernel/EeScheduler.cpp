@@ -388,6 +388,166 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+namespace
+{
+    // True when the loop starting at ctx.pc only reloads RAM and recomputes registers from values
+    // it does not change, closing with a branch back to ctx.pc whose delay slot is a nop. While
+    // memory is unchanged every further iteration leaves exactly the same state.
+    bool isPureSpinLoop(const R5900Context &ctx, const uint8_t *rdram) noexcept
+    {
+        constexpr uint32_t kMaxWords = 16u;
+        const uint32_t head = ctx.pc;
+        if (rdram == nullptr || (head & 3u) != 0u)
+        {
+            return false;
+        }
+        uint32_t reads[kMaxWords]{};
+        uint32_t writes[kMaxWords]{};
+        uint32_t allWrites = 0u;
+        uint32_t loadBases = 0u;
+        for (uint32_t i = 0; i < kMaxWords; ++i)
+        {
+            const uint32_t pc = head + i * 4u;
+            if (PS2Runtime::isSpecialAddress(pc) || PS2Runtime::isSpecialAddress(pc + 4u))
+            {
+                return false;
+            }
+            const uint32_t word = Ps2FastRead32(rdram, pc);
+            const uint32_t op = word >> 26;
+            const uint32_t rs = (word >> 21) & 31u;
+            const uint32_t rt = (word >> 16) & 31u;
+            const uint32_t rd = (word >> 11) & 31u;
+            const auto bit = [](uint32_t reg)
+            { return reg == 0u ? 0u : 1u << reg; };
+
+            bool branch = false;
+            switch (op)
+            {
+            case 0x00:
+                switch (word & 63u)
+                {
+                case 0x00: case 0x02: case 0x03: case 0x38: case 0x3A: case 0x3B: case 0x3C: case 0x3E: case 0x3F:
+                    reads[i] = bit(rt);
+                    writes[i] = bit(rd);
+                    break;
+                case 0x04: case 0x06: case 0x07: case 0x14: case 0x16: case 0x17:
+                case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x2A: case 0x2B: case 0x2D: case 0x2F:
+                    reads[i] = bit(rs) | bit(rt);
+                    writes[i] = bit(rd);
+                    break;
+                default:
+                    return false;
+                }
+                break;
+            case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x19:
+                reads[i] = bit(rs);
+                writes[i] = bit(rt);
+                break;
+            case 0x0F:
+                writes[i] = bit(rt);
+                break;
+            case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
+            {
+                const uint32_t address = GPR_U32((&ctx), rs) + static_cast<uint32_t>(static_cast<int16_t>(word & 0xFFFFu));
+                if (PS2Runtime::isSpecialAddress(address))
+                {
+                    return false;
+                }
+                reads[i] = bit(rs);
+                writes[i] = bit(rt);
+                loadBases |= bit(rs);
+                break;
+            }
+            case 0x04: case 0x05: case 0x14: case 0x15:
+                branch = true;
+                break;
+            case 0x06: case 0x07: case 0x16: case 0x17:
+                branch = rt == 0u;
+                if (!branch)
+                {
+                    return false;
+                }
+                break;
+            case 0x01:
+                branch = rt <= 3u;
+                if (!branch)
+                {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+            }
+
+            if (!branch)
+            {
+                allWrites |= writes[i];
+                continue;
+            }
+            const uint32_t target = pc + 4u + (static_cast<uint32_t>(static_cast<int16_t>(word & 0xFFFFu)) << 2);
+            if (i == 0u || target != head || Ps2FastRead32(rdram, pc + 4u) != 0u || (loadBases & allWrites) != 0u)
+            {
+                return false;
+            }
+            uint32_t written = 0u;
+            for (uint32_t j = 0; j < i; ++j)
+            {
+                if ((reads[j] & allWrites & ~written) != 0u)
+                {
+                    return false; // loop-carried register
+                }
+                written |= writes[j];
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+bool EeScheduler::loopCheckpointDue(uint32_t cycles) noexcept
+{
+    if (checkpointDue(cycles))
+    {
+        return true;
+    }
+
+    // A pure spin (typically polling a flag an interrupt sets) would repeat checkpointDue(cycles)
+    // with nothing observable changing until the next deadline, timer event, IOP wake-up or slice
+    // end. Charge those iterations at once, stopping one step short of the first of them, so the
+    // normal step there sees the same cycle, timer and IOP state as the unskipped loop.
+    constexpr uint32_t kSpinProbeInterval = 32u;
+    if (m_spinProbeCountdown != 0u)
+    {
+        --m_spinProbeCountdown;
+        return false;
+    }
+    const R5900Context *ctx = currentContext();
+    if (ctx == nullptr || !isPureSpinLoop(*ctx, m_rdram))
+    {
+        m_spinProbeCountdown = kSpinProbeInterval;
+        return false;
+    }
+
+    const uint64_t step = std::max<uint32_t>(1u, cycles);
+    uint64_t room = std::numeric_limits<uint32_t>::max();
+    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    if (nextEventCycle != 0u)
+    {
+        room = std::min(room, nextEventCycle > m_eeCycle ? nextEventCycle - m_eeCycle - 1u : 0u);
+    }
+    room = std::min(room, m_sliceEndCycle > m_eeCycle ? m_sliceEndCycle - m_eeCycle - 1u : 0u);
+    const uint64_t timerQuiet = m_runtime.memory().eeTimerQuietCycles();
+    room = std::min(room, timerQuiet != 0u ? timerQuiet - 1u : 0u);
+    room = std::min(room, m_runtime.iopIdleEeCycleHorizon());
+
+    const uint64_t skip = room - room % step;
+    if (skip != 0u)
+    {
+        accountCycles(static_cast<uint32_t>(skip));
+    }
+    return false;
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
