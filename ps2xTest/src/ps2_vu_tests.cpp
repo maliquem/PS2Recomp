@@ -97,6 +97,17 @@ void register_ps2_vu_tests()
                      "MulVector should multiply lanes component-wise");
         });
 
+        tc.Run("InnerProduct_ignores_w", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 1.0f, 2.0f, 3.0f, 1.0f);
+            writeVec4(env, kB, 4.0f, 5.0f, 6.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kA);
+            SET_GPR_U32(&env.ctx, 5, kB);
+            ps2_stubs::sceVu0InnerProduct(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(nearlyEqual(env.ctx.f[0], 32.0f), "InnerProduct should sum xyz only, like libvu0");
+        });
+
         tc.Run("ScaleVectorXYZ_scales_xyz", [](TestCase &t)
         {
             VuEnv env;

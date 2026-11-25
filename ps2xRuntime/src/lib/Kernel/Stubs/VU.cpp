@@ -553,7 +553,8 @@ namespace ps2_stubs
         float dot = 0.0f;
         if (readVuVec4f(rdram, lhsAddr, lhs) && readVuVec4f(rdram, rhsAddr, rhs))
         {
-            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]) + (lhs[3] * rhs[3]);
+            // xyz only, as libvu0 (vmul.xyz, vaddy.x, vaddz.x); Shadow Hearts' slerp keeps w = 1 in these vectors.
+            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]);
         }
 
         if (ctx)
