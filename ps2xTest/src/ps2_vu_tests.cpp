@@ -704,10 +704,63 @@ void register_ps2_vu_tests()
                      "CameraMatrix should map the eye point to the view-space origin");
         });
 
+        tc.Run("CameraMatrix_ignores_w_of_inputs", [](TestCase &t)
+        {
+            // Shadow Hearts passes fwd with w=1; a 4-lane length shrank rows 1/2
+            // by 1/sqrt(2) and the scene rendered ~1.41x wider. libvu0 uses xyz.
+            VuEnv env;
+            writeVec4(env, kA, 0.0f, 0.0f, 0.0f, 1.0f); // eye
+            writeVec4(env, kB, 0.0f, 0.0f, 1.0f, 1.0f); // fwd, w=1
+            writeVec4(env, kC, 0.0f, 1.0f, 0.0f, 1.0f); // up, w=1
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            SET_GPR_U32(&env.ctx, 6, kB);
+            SET_GPR_U32(&env.ctx, 7, kC);
+            ps2_stubs::sceVu0CameraMatrix(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[16]{};
+            readMat4(env, kDst, out);
+            float ident[16]{};
+            makeIdentity(ident);
+            bool allMatch = true;
+            for (int i = 0; i < 16; ++i)
+            {
+                if (!nearlyEqual(out[i], ident[i], 1e-3f))
+                {
+                    allMatch = false;
+                }
+            }
+            t.IsTrue(allMatch, "CameraMatrix must normalize xyz only (w of fwd/up ignored)");
+        });
+
+        tc.Run("InnerProduct_xyz_only", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 0.0f, 0.0f, 1.0f, 1.0f);
+            writeVec4(env, kB, 0.0f, 0.0f, 1.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kA);
+            SET_GPR_U32(&env.ctx, 5, kB);
+            ps2_stubs::sceVu0InnerProduct(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(nearlyEqual(env.ctx.f[0], 1.0f), "InnerProduct should ignore w (libvu0 vmul.xyz)");
+        });
+
+        tc.Run("Normalize_xyz_only_w_zero", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 3.0f, 0.0f, 4.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kOut);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[4]{};
+            readVec4f(env, kOut, out);
+            t.IsTrue(nearlyEqual(out[0], 0.6f) && nearlyEqual(out[1], 0.0f) && nearlyEqual(out[2], 0.8f) &&
+                         nearlyEqual(out[3], 0.0f),
+                     "Normalize should use the xyz length and write w=0");
+        });
+
         tc.Run("NormalLightMatrix_neg_normalized", [](TestCase &t)
         {
             VuEnv env;
-            writeVec4(env, kA, 1.0f, 0.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 1.0f, 0.0f, 0.0f, 1.0f); // w=1 must not change the length
             writeVec4(env, kB, 0.0f, 1.0f, 0.0f, 0.0f);
             writeVec4(env, kC, 0.0f, 0.0f, 1.0f, 0.0f);
             SET_GPR_U32(&env.ctx, 4, kDst);
