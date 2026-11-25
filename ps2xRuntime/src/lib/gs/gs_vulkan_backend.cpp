@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -172,6 +173,21 @@ bool isPresentablePsm(uint8_t psm)
     return psm == GS_PSM_CT32 || psm == GS_PSM_CT24 || psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
 }
 
+std::vector<std::string> &hostInstanceExtensions()
+{
+    static std::vector<std::string> s_extensions;
+    return s_extensions;
+}
+
+template <typename Handle>
+uint64_t handleBits(Handle h)
+{
+    if constexpr (std::is_pointer_v<Handle>)
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
+    else
+        return static_cast<uint64_t>(h);
+}
+
 bool loadVulkanLibrary(ps2vk::Dispatch &vk, std::string *outReason)
 {
 #if defined(_WIN32)
@@ -239,6 +255,11 @@ GSVulkanBackend::GSVulkanBackend()
 GSVulkanBackend::~GSVulkanBackend()
 {
     destroyVulkan();
+}
+
+void GSVulkanBackend::SetHostInstanceExtensions(std::vector<std::string> extensions)
+{
+    hostInstanceExtensions() = std::move(extensions);
 }
 
 std::unique_ptr<GSVulkanBackend> GSVulkanBackend::CreateIfAvailable(std::string *outReason)
@@ -311,15 +332,29 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
     app.pApplicationName = "PS2Recomp GS Vulkan";
     app.apiVersion = ps2vk::VK_API_VERSION_1_0;
 
+    std::vector<const char *> instExts;
+    for (const std::string &ext : hostInstanceExtensions())
+        instExts.push_back(ext.c_str());
+
     ps2vk::VkInstanceCreateInfo instInfo{};
     instInfo.sType = ps2vk::VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instInfo.pApplicationInfo = &app;
+    instInfo.enabledExtensionCount = static_cast<uint32_t>(instExts.size());
+    instInfo.ppEnabledExtensionNames = instExts.empty() ? nullptr : instExts.data();
 
+    bool hostSurfaceExts = !instExts.empty();
     if (m_vk.vkCreateInstance(&instInfo, nullptr, &m_instance) != ps2vk::VK_SUCCESS)
     {
-        if (outReason) *outReason = "vkCreateInstance failed";
-        destroyVulkan();
-        return false;
+        // The GS still runs without surface extensions; the host then uses its CPU-upload presenter.
+        hostSurfaceExts = false;
+        instInfo.enabledExtensionCount = 0u;
+        instInfo.ppEnabledExtensionNames = nullptr;
+        if (m_vk.vkCreateInstance(&instInfo, nullptr, &m_instance) != ps2vk::VK_SUCCESS)
+        {
+            if (outReason) *outReason = "vkCreateInstance failed";
+            destroyVulkan();
+            return false;
+        }
     }
 
 #define LOAD_INST(fn) \
@@ -353,6 +388,7 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
 
     ps2vk::VkPhysicalDevice selected = nullptr;
     uint32_t selectedFamily = 0u;
+    uint32_t selectedQueueCount = 1u;
     ps2vk::VkPhysicalDeviceProperties selectedProps{};
     for (ps2vk::VkPhysicalDevice cand : devices)
     {
@@ -379,6 +415,7 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
             {
                 selected = cand;
                 selectedFamily = i;
+                selectedQueueCount = fams[i].queueCount;
                 selectedProps = props;
             }
             break;
@@ -397,12 +434,14 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
     m_deviceName = selectedProps.deviceName;
     m_vk.vkGetPhysicalDeviceMemoryProperties(selected, &m_memProps);
 
-    const float prio = 1.0f;
+    // A second queue in the family lets the host present without taking the GS lock.
+    const float prios[2] = {1.0f, 1.0f};
+    const uint32_t queueCount = (hostSurfaceExts && selectedQueueCount >= 2u) ? 2u : 1u;
     ps2vk::VkDeviceQueueCreateInfo qInfo{};
     qInfo.sType = ps2vk::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     qInfo.queueFamilyIndex = m_queueFamily;
-    qInfo.queueCount = 1u;
-    qInfo.pQueuePriorities = &prio;
+    qInfo.queueCount = queueCount;
+    qInfo.pQueuePriorities = prios;
 
     ps2vk::VkPhysicalDeviceFeatures enabledFeats{};
     enabledFeats.shaderFloat64 = ps2vk::VK_TRUE;
@@ -413,7 +452,17 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
     devInfo.pQueueCreateInfos = &qInfo;
     devInfo.pEnabledFeatures = &enabledFeats;
 
-    if (m_vk.vkCreateDevice(selected, &devInfo, nullptr, &m_device) != ps2vk::VK_SUCCESS)
+    const char *const swapchainExt = "VK_KHR_swapchain";
+    bool swapchainEnabled = false;
+    if (hostSurfaceExts)
+    {
+        devInfo.enabledExtensionCount = 1u;
+        devInfo.ppEnabledExtensionNames = &swapchainExt;
+        swapchainEnabled = m_vk.vkCreateDevice(selected, &devInfo, nullptr, &m_device) == ps2vk::VK_SUCCESS;
+        devInfo.enabledExtensionCount = 0u;
+        devInfo.ppEnabledExtensionNames = nullptr;
+    }
+    if (!swapchainEnabled && m_vk.vkCreateDevice(selected, &devInfo, nullptr, &m_device) != ps2vk::VK_SUCCESS)
     {
         if (outReason) *outReason = "vkCreateDevice failed";
         destroyVulkan();
@@ -468,6 +517,24 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
 
     m_vk.vkGetDeviceQueue(m_device, m_queueFamily, 0u, &m_queue);
 
+    m_hostContext.instance = m_instance;
+    m_hostContext.physicalDevice = m_physicalDevice;
+    m_hostContext.device = m_device;
+    m_hostContext.queueFamily = m_queueFamily;
+    m_hostContext.getInstanceProcAddr = reinterpret_cast<void *>(m_vk.vkGetInstanceProcAddr);
+    m_hostContext.swapchainEnabled = swapchainEnabled;
+    if (queueCount >= 2u)
+    {
+        ps2vk::VkQueue hostQueue = nullptr;
+        m_vk.vkGetDeviceQueue(m_device, m_queueFamily, 1u, &hostQueue);
+        m_hostContext.queue = hostQueue;
+    }
+    else
+    {
+        m_hostContext.queue = m_queue;
+        m_hostContext.queueLock = &m_mutex;
+    }
+
     constexpr ps2vk::VkFlags kHostVisCoh = ps2vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | ps2vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     constexpr ps2vk::VkFlags kHostCached = kHostVisCoh | ps2vk::VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
@@ -478,7 +545,8 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
                       ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       ps2vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
         !createBuffer(m_presentOut, kPresentBytes,
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHostVisCoh, kHostCached) ||
+                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      kHostVisCoh, kHostCached) ||
         !createBuffer(m_vramReadback, kVramBytes,
                       ps2vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHostVisCoh, kHostCached))
     {
@@ -2236,6 +2304,44 @@ void GSVulkanBackend::Sync(GSSyncReason reason)
 
 PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
 {
+    return presentImpl(request, nullptr);
+}
+
+bool GSVulkanBackend::PresentGpu(const GSPresentationRequest &request, GSGpuFrame &out)
+{
+    presentImpl(request, &out);
+    return true;
+}
+
+const GSHostGpuContext *GSVulkanBackend::HostGpuContext() const
+{
+    return m_device ? &m_hostContext : nullptr;
+}
+
+PresentationFrame GSVulkanBackend::presentCpuFallbackUnlocked(const GSPresentationRequest &request, GSGpuFrame *gpuOut)
+{
+    syncGpuToCpuUnlocked();
+    PresentationFrame frame = m_cpuFallback.Present(request);
+    if (gpuOut && frame)
+    {
+        // Stage the CPU-composed field where the GPU present leaves its output so the host draws both alike.
+        std::memcpy(m_presentOut.mapped, frame.pixels.data(), std::min<size_t>(frame.pixels.size(), kPresentBytes));
+        gpuOut->buffer = handleBits(m_presentOut.buffer);
+        gpuOut->mapped = static_cast<const uint8_t *>(m_presentOut.mapped);
+        gpuOut->rowPixels = kHostFrameWidth;
+        gpuOut->width = std::min(frame.width, kHostFrameWidth);
+        gpuOut->height = std::min(frame.height, kHostFrameHeight);
+        gpuOut->displayFbp = frame.displayFbp;
+        gpuOut->sourceFbp = frame.sourceFbp;
+        gpuOut->usedPreferred = frame.usedPreferred;
+    }
+    return frame;
+}
+
+PresentationFrame GSVulkanBackend::presentImpl(const GSPresentationRequest &request, GSGpuFrame *gpuOut)
+{
+    if (gpuOut)
+        *gpuOut = GSGpuFrame{};
     PresentationFrame result{};
     const bool enableCrt1 = (request.pmode & 0x1ull) != 0ull;
     const bool enableCrt2 = (request.pmode & 0x2ull) != 0ull;
@@ -2331,7 +2437,7 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
     }
 
     // Allocate/zero output buffer before locking m_mutex only when taking the GPU path.
-    if (!fallbackToCpu)
+    if (!fallbackToCpu && !gpuOut)
         result.pixels.resize(kPresentBytes);
 
     // The UI thread holds only m_presentMutex while the GPU runs the present dispatch, so the EE can
@@ -2345,10 +2451,7 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
     }
 
     if (fallbackToCpu)
-    {
-        syncGpuToCpuUnlocked();
-        return m_cpuFallback.Present(request);
-    }
+        return presentCpuFallbackUnlocked(request, gpuOut);
 
     const uint32_t presentHeight = std::clamp(result.height, 1u, kHostFrameHeight);
     PageMask displayPages{};
@@ -2394,15 +2497,19 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
         m_vk.vkWaitForFences(m_device, 1u, &m_presentFence, ps2vk::VK_TRUE, UINT64_MAX) == ps2vk::VK_SUCCESS)
         m_vk.vkResetFences(m_device, 1u, &m_presentFence);
 
-    const size_t copyBytes = static_cast<size_t>(presentHeight) * kHostFrameWidth * 4u;
-    std::memcpy(result.pixels.data(), m_presentOut.mapped, copyBytes);
+    if (!gpuOut)
+    {
+        const size_t copyBytes = static_cast<size_t>(presentHeight) * kHostFrameWidth * 4u;
+        std::memcpy(result.pixels.data(), m_presentOut.mapped, copyBytes);
+    }
     result.displayFbp = displayFbp;
     result.sourceFbp = sourceFbp;
     result.usedPreferred = usedPreferred;
 
     if (mayFallback)
     {
-        const uint32_t *px = reinterpret_cast<const uint32_t *>(result.pixels.data());
+        const uint32_t *px = reinterpret_cast<const uint32_t *>(
+            gpuOut ? static_cast<const uint8_t *>(m_presentOut.mapped) : result.pixels.data());
         bool anyNonBlack = false;
         for (uint32_t y = 0u; y < result.height && !anyNonBlack; ++y)
         {
@@ -2417,12 +2524,20 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
             }
         }
         if (!anyNonBlack)
-        {
-            syncGpuToCpuUnlocked();
-            return m_cpuFallback.Present(request);
-        }
+            return presentCpuFallbackUnlocked(request, gpuOut);
     }
 
+    if (gpuOut && submitted)
+    {
+        gpuOut->buffer = handleBits(m_presentOut.buffer);
+        gpuOut->mapped = static_cast<const uint8_t *>(m_presentOut.mapped);
+        gpuOut->rowPixels = kHostFrameWidth;
+        gpuOut->width = std::min(result.width, kHostFrameWidth);
+        gpuOut->height = presentHeight;
+        gpuOut->displayFbp = displayFbp;
+        gpuOut->sourceFbp = sourceFbp;
+        gpuOut->usedPreferred = usedPreferred;
+    }
     return result;
 }
 

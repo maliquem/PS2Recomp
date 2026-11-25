@@ -1,6 +1,9 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#if !PS2X_HOST_RAYLIB
+#include <SDL3/SDL.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -91,6 +94,21 @@ namespace
     }
 #endif
 
+#if !PS2X_HOST_RAYLIB
+    // SDL pulls the SPU2 stream from the audio thread; feed it from the rings.
+    void SDLCALL spu2StreamCallback(void *, SDL_AudioStream *stream, int additionalAmount, int)
+    {
+        static thread_local std::vector<int16_t> mix;
+        const unsigned int frames = static_cast<unsigned int>(std::max(additionalAmount, 0)) / 4u;
+        if (frames == 0u)
+            return;
+        mix.resize(static_cast<size_t>(frames) * 2u);
+        spu2AudioCallback(mix.data(), frames);
+        SDL_PutAudioStreamData(stream, mix.data(), static_cast<int>(frames * 4u));
+    }
+#endif
+
+#if PS2X_HOST_RAYLIB
     std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
     {
         const uint32_t dataSize = static_cast<uint32_t>(sampleCount * 2);
@@ -146,6 +164,62 @@ namespace
         std::memcpy(p + 44, pcm, dataSize);
         return wav;
     }
+#endif
+
+#if !defined(PLATFORM_VITA)
+#if PS2X_HOST_RAYLIB
+    using HostSound = Sound;
+    bool soundPlaying(const HostSound &s) { return IsSoundPlaying(s); }
+    void releaseSound(HostSound &s)
+    {
+        StopSound(s);
+        UnloadSound(s);
+    }
+    bool startSound(HostSound &out, const std::vector<int16_t> &pcm, uint32_t sampleRate, float pitch, float volume)
+    {
+        std::vector<uint8_t> wav = buildWavFromPcm(pcm.data(), pcm.size(), sampleRate);
+        Wave wave = LoadWaveFromMemory(".wav", wav.data(), static_cast<int>(wav.size()));
+        if (wave.frameCount <= 0)
+            return false;
+        out = LoadSoundFromWave(wave);
+        UnloadWave(wave);
+        SetSoundPitch(out, pitch);
+        SetSoundVolume(out, volume);
+        PlaySound(out);
+        return true;
+    }
+#else
+    // One SDL stream per sound: mono S16 at the sample's rate, pitch as frequency ratio, mixed by the device.
+    using HostSound = SDL_AudioStream *;
+    bool soundPlaying(const HostSound &s)
+    {
+        return s && (SDL_GetAudioStreamQueued(s) > 0 || SDL_GetAudioStreamAvailable(s) > 0);
+    }
+    void releaseSound(HostSound &s)
+    {
+        SDL_DestroyAudioStream(s);
+        s = nullptr;
+    }
+    bool startSound(HostSound &out, const std::vector<int16_t> &pcm, uint32_t sampleRate, float pitch, float volume)
+    {
+        const SDL_AudioSpec srcSpec{SDL_AUDIO_S16, 1, static_cast<int>(sampleRate)};
+        const SDL_AudioSpec dstSpec{SDL_AUDIO_S16, 2, 48000};
+        out = SDL_CreateAudioStream(&srcSpec, &dstSpec);
+        if (!out)
+            return false;
+        SDL_SetAudioStreamFrequencyRatio(out, std::clamp(pitch, 0.01f, 100.0f));
+        SDL_SetAudioStreamGain(out, volume);
+        SDL_PutAudioStreamData(out, pcm.data(), static_cast<int>(pcm.size() * sizeof(int16_t)));
+        SDL_FlushAudioStream(out);
+        if (!SDL_BindAudioStream(ps2host::audioDevice(), out))
+        {
+            releaseSound(out);
+            return false;
+        }
+        return true;
+    }
+#endif
+#endif
 }
 
 namespace ps2_vag
@@ -156,14 +230,18 @@ namespace ps2_vag
 
 struct PS2AudioBackend::Impl
 {
+#if !defined(PLATFORM_VITA)
     struct TrackedSound
     {
-        Sound snd;
+        HostSound snd;
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
-#if !defined(PLATFORM_VITA)
+#if PS2X_HOST_RAYLIB
     AudioStream spu2Stream{};
+#else
+    SDL_AudioStream *spu2Stream = nullptr;
+#endif
     bool spu2StreamStarted = false;
 #endif
 };
@@ -324,9 +402,9 @@ void PS2AudioBackend::pruneFinishedSounds()
     auto it = sounds.begin();
     while (it != sounds.end())
     {
-        if (!IsSoundPlaying(it->snd))
+        if (!soundPlaying(it->snd))
         {
-            UnloadSound(it->snd);
+            releaseSound(it->snd);
             it = sounds.erase(it);
         }
         else
@@ -355,7 +433,7 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
 
     for (const auto &t : m_impl->activeSounds)
     {
-        if (t.sampleKey == sampleKey && IsSoundPlaying(t.snd))
+        if (t.sampleKey == sampleKey && soundPlaying(t.snd))
             return;
     }
 
@@ -364,10 +442,9 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     {
         for (auto it = sounds.begin(); it != sounds.end();)
         {
-            if (IsSoundPlaying(it->snd))
+            if (soundPlaying(it->snd))
             {
-                StopSound(it->snd);
-                UnloadSound(it->snd);
+                releaseSound(it->snd);
                 it = sounds.erase(it);
             }
             else
@@ -378,21 +455,13 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     constexpr int kMaxConcurrentSounds = 4;
     while (static_cast<int>(sounds.size()) >= kMaxConcurrentSounds)
     {
-        StopSound(sounds.front().snd);
-        UnloadSound(sounds.front().snd);
+        releaseSound(sounds.front().snd);
         sounds.erase(sounds.begin());
     }
 
-    std::vector<uint8_t> wav = buildWavFromPcm(sample.pcm.data(), sample.pcm.size(), sample.sampleRate);
-    Wave wave = LoadWaveFromMemory(".wav", wav.data(), static_cast<int>(wav.size()));
-    if (wave.frameCount <= 0)
-        return;
-    Sound snd = LoadSoundFromWave(wave);
-    UnloadWave(wave);
-    SetSoundPitch(snd, pitch);
-    SetSoundVolume(snd, volume);
-    m_impl->activeSounds.push_back({snd, sampleKey});
-    PlaySound(snd);
+    HostSound snd{};
+    if (startSound(snd, sample.pcm, sample.sampleRate, pitch, volume))
+        m_impl->activeSounds.push_back({snd, sampleKey});
 #endif
 }
 
@@ -420,6 +489,7 @@ void PS2AudioBackend::submitSpu2Pcm(int core, const int16_t *interleavedStereoPc
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_impl->spu2StreamStarted)
     {
+#if PS2X_HOST_RAYLIB
         m_impl->spu2Stream = LoadAudioStream(48000u, 16u, 2u);
         if (m_impl->spu2Stream.buffer != nullptr)
         {
@@ -427,6 +497,21 @@ void PS2AudioBackend::submitSpu2Pcm(int core, const int16_t *interleavedStereoPc
             PlayAudioStream(m_impl->spu2Stream);
             m_impl->spu2StreamStarted = true;
         }
+#else
+        const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, 48000};
+        m_impl->spu2Stream = SDL_CreateAudioStream(&spec, &spec);
+        if (m_impl->spu2Stream)
+        {
+            SDL_SetAudioStreamGetCallback(m_impl->spu2Stream, &spu2StreamCallback, nullptr);
+            if (SDL_BindAudioStream(ps2host::audioDevice(), m_impl->spu2Stream))
+                m_impl->spu2StreamStarted = true;
+            else
+            {
+                SDL_DestroyAudioStream(m_impl->spu2Stream);
+                m_impl->spu2Stream = nullptr;
+            }
+        }
+#endif
     }
 #endif
 }
@@ -438,16 +523,18 @@ void PS2AudioBackend::stopAll()
     return;
 #else
     for (auto &t : m_impl->activeSounds)
-    {
-        StopSound(t.snd);
-        UnloadSound(t.snd);
-    }
+        releaseSound(t.snd);
     m_impl->activeSounds.clear();
     if (m_impl->spu2StreamStarted)
     {
+#if PS2X_HOST_RAYLIB
         StopAudioStream(m_impl->spu2Stream);
         UnloadAudioStream(m_impl->spu2Stream);
         m_impl->spu2Stream = AudioStream{};
+#else
+        SDL_DestroyAudioStream(m_impl->spu2Stream);
+        m_impl->spu2Stream = nullptr;
+#endif
         m_impl->spu2StreamStarted = false;
     }
     {

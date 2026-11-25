@@ -1,0 +1,648 @@
+#include "ps2_vk_presenter.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include <vulkan/vulkan.h>
+
+#include "imgui.h"
+#include "imgui_impl_vulkan.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <vector>
+
+namespace
+{
+#define PS2X_VK_INSTANCE_FNS(X)                    \
+    X(vkGetDeviceProcAddr)                         \
+    X(vkGetPhysicalDeviceSurfaceSupportKHR)        \
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)   \
+    X(vkGetPhysicalDeviceSurfaceFormatsKHR)        \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)   \
+    X(vkGetPhysicalDeviceMemoryProperties)         \
+    X(vkDestroySurfaceKHR)
+
+#define PS2X_VK_DEVICE_FNS(X)     \
+    X(vkCreateSwapchainKHR)       \
+    X(vkDestroySwapchainKHR)      \
+    X(vkGetSwapchainImagesKHR)    \
+    X(vkAcquireNextImageKHR)      \
+    X(vkQueuePresentKHR)          \
+    X(vkQueueSubmit)              \
+    X(vkQueueWaitIdle)            \
+    X(vkCreateImageView)          \
+    X(vkDestroyImageView)         \
+    X(vkCreateRenderPass)         \
+    X(vkDestroyRenderPass)        \
+    X(vkCreateFramebuffer)        \
+    X(vkDestroyFramebuffer)       \
+    X(vkCreateCommandPool)        \
+    X(vkDestroyCommandPool)       \
+    X(vkAllocateCommandBuffers)   \
+    X(vkBeginCommandBuffer)       \
+    X(vkEndCommandBuffer)         \
+    X(vkCmdPipelineBarrier)       \
+    X(vkCmdCopyBufferToImage)     \
+    X(vkCmdBlitImage)             \
+    X(vkCmdClearColorImage)       \
+    X(vkCmdBeginRenderPass)       \
+    X(vkCmdEndRenderPass)         \
+    X(vkCreateSemaphore)          \
+    X(vkDestroySemaphore)         \
+    X(vkCreateFence)              \
+    X(vkDestroyFence)             \
+    X(vkWaitForFences)            \
+    X(vkResetFences)              \
+    X(vkCreateImage)              \
+    X(vkDestroyImage)             \
+    X(vkGetImageMemoryRequirements) \
+    X(vkAllocateMemory)           \
+    X(vkFreeMemory)               \
+    X(vkBindImageMemory)
+
+    struct Fns
+    {
+        PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+#define PS2X_DECL(fn) PFN_##fn fn = nullptr;
+        PS2X_VK_INSTANCE_FNS(PS2X_DECL)
+        PS2X_VK_DEVICE_FNS(PS2X_DECL)
+#undef PS2X_DECL
+    };
+
+    // The GS output is meant for a 4:3 TV; C2 turns this into the widescreen/scale setting.
+    constexpr float kOutputAspect = 4.0f / 3.0f;
+
+    // §4 extension point: post-process passes run here on the scene image, between the GS copy and the
+    // letterbox blit. None exist yet, so the pass is named but disabled.
+    constexpr bool kPostProcessEnabled = false;
+}
+
+struct VkPresenter::Impl
+{
+    Fns vk{};
+    SDL_Window *window = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t queueFamily = 0;
+    std::mutex *queueLock = nullptr;
+    bool vsync = false;
+
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkSurfaceFormatKHR format{};
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkExtent2D extent{};
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    std::vector<VkFramebuffer> framebuffers;
+    std::vector<VkSemaphore> renderDone; // per swapchain image: present may still wait on it after the fence
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool inFlight = false;
+
+    VkImage scene = VK_NULL_HANDLE;
+    VkDeviceMemory sceneMemory = VK_NULL_HANDLE;
+    uint32_t sceneCapW = 0, sceneCapH = 0;
+    uint32_t sceneW = 0, sceneH = 0;
+    bool sceneValid = false;
+    bool sceneInitialized = false;
+
+    bool imgui = false;
+
+    bool load(void *gipa)
+    {
+        vk.vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa);
+        if (!vk.vkGetInstanceProcAddr)
+            return false;
+#define PS2X_LOAD_I(fn)                                                                \
+    vk.fn = reinterpret_cast<PFN_##fn>(vk.vkGetInstanceProcAddr(instance, #fn));       \
+    if (!vk.fn)                                                                        \
+        return false;
+        PS2X_VK_INSTANCE_FNS(PS2X_LOAD_I)
+#undef PS2X_LOAD_I
+#define PS2X_LOAD_D(fn)                                                                \
+    vk.fn = reinterpret_cast<PFN_##fn>(vk.vkGetDeviceProcAddr(device, #fn));           \
+    if (!vk.fn)                                                                        \
+        return false;
+        PS2X_VK_DEVICE_FNS(PS2X_LOAD_D)
+#undef PS2X_LOAD_D
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lockQueue()
+    {
+        return queueLock ? std::unique_lock<std::mutex>(*queueLock) : std::unique_lock<std::mutex>();
+    }
+
+    void waitFence()
+    {
+        if (!inFlight)
+            return;
+        vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+        inFlight = false;
+    }
+
+    void destroySwapchainViews()
+    {
+        for (VkFramebuffer fb : framebuffers)
+            vk.vkDestroyFramebuffer(device, fb, nullptr);
+        for (VkImageView v : views)
+            vk.vkDestroyImageView(device, v, nullptr);
+        for (VkSemaphore s : renderDone)
+            vk.vkDestroySemaphore(device, s, nullptr);
+        framebuffers.clear();
+        views.clear();
+        renderDone.clear();
+        images.clear();
+    }
+
+    // False when the window has no area (minimized): nothing to present until it comes back.
+    bool createSwapchain()
+    {
+        VkSurfaceCapabilitiesKHR caps{};
+        if (vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &caps) != VK_SUCCESS)
+            return false;
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(window, &pw, &ph);
+        VkExtent2D want = caps.currentExtent;
+        if (want.width == UINT32_MAX)
+        {
+            want.width = std::clamp<uint32_t>(static_cast<uint32_t>(std::max(pw, 0)), caps.minImageExtent.width, caps.maxImageExtent.width);
+            want.height = std::clamp<uint32_t>(static_cast<uint32_t>(std::max(ph, 0)), caps.minImageExtent.height, caps.maxImageExtent.height);
+        }
+        if (want.width == 0 || want.height == 0)
+            return false;
+
+        {
+            auto lock = lockQueue();
+            vk.vkQueueWaitIdle(queue); // old renderDone semaphores may still be waited on by a present
+        }
+        destroySwapchainViews();
+
+        uint32_t imageCount = std::max(caps.minImageCount, presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? 3u : 2u);
+        if (caps.maxImageCount != 0)
+            imageCount = std::min(imageCount, caps.maxImageCount);
+
+        VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        if (!(caps.supportedCompositeAlpha & alpha))
+            alpha = static_cast<VkCompositeAlphaFlagBitsKHR>(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1u));
+
+        VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+        ci.surface = surface;
+        ci.minImageCount = imageCount;
+        ci.imageFormat = format.format;
+        ci.imageColorSpace = format.colorSpace;
+        ci.imageExtent = want;
+        ci.imageArrayLayers = 1;
+        ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ci.preTransform = caps.currentTransform;
+        ci.compositeAlpha = alpha;
+        ci.presentMode = presentMode;
+        ci.clipped = VK_TRUE;
+        ci.oldSwapchain = swapchain;
+        VkSwapchainKHR created = VK_NULL_HANDLE;
+        VkResult r = vk.vkCreateSwapchainKHR(device, &ci, nullptr, &created);
+        if (swapchain)
+            vk.vkDestroySwapchainKHR(device, swapchain, nullptr);
+        swapchain = created;
+        if (r != VK_SUCCESS)
+        {
+            std::fprintf(stderr, "[host] vkCreateSwapchainKHR failed (%d)\n", static_cast<int>(r));
+            swapchain = VK_NULL_HANDLE;
+            return false;
+        }
+        extent = want;
+
+        uint32_t count = 0;
+        vk.vkGetSwapchainImagesKHR(device, swapchain, &count, nullptr);
+        images.resize(count);
+        vk.vkGetSwapchainImagesKHR(device, swapchain, &count, images.data());
+        views.resize(count);
+        framebuffers.resize(count);
+        renderDone.resize(count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = images[i];
+            vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vi.format = format.format;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vk.vkCreateImageView(device, &vi, nullptr, &views[i]);
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = renderPass;
+            fi.attachmentCount = 1;
+            fi.pAttachments = &views[i];
+            fi.width = extent.width;
+            fi.height = extent.height;
+            fi.layers = 1;
+            vk.vkCreateFramebuffer(device, &fi, nullptr, &framebuffers[i]);
+            VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            vk.vkCreateSemaphore(device, &si, nullptr, &renderDone[i]);
+        }
+        return true;
+    }
+
+    bool ensureScene(uint32_t w, uint32_t h)
+    {
+        if (scene && w <= sceneCapW && h <= sceneCapH)
+            return true;
+        if (scene)
+        {
+            vk.vkDestroyImage(device, scene, nullptr);
+            vk.vkFreeMemory(device, sceneMemory, nullptr);
+            scene = VK_NULL_HANDLE;
+            sceneMemory = VK_NULL_HANDLE;
+        }
+        sceneCapW = std::max(w, 640u);
+        sceneCapH = std::max(h, 512u);
+        sceneInitialized = false;
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.extent = {sceneCapW, sceneCapH, 1};
+        ii.mipLevels = 1;
+        ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vk.vkCreateImage(device, &ii, nullptr, &scene) != VK_SUCCESS)
+            return false;
+        VkMemoryRequirements req{};
+        vk.vkGetImageMemoryRequirements(device, scene, &req);
+        VkPhysicalDeviceMemoryProperties props{};
+        vk.vkGetPhysicalDeviceMemoryProperties(physicalDevice, &props);
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < props.memoryTypeCount && type == UINT32_MAX; ++i)
+            if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                type = i;
+        for (uint32_t i = 0; i < props.memoryTypeCount && type == UINT32_MAX; ++i)
+            if (req.memoryTypeBits & (1u << i))
+                type = i;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = type;
+        if (type == UINT32_MAX || vk.vkAllocateMemory(device, &ai, nullptr, &sceneMemory) != VK_SUCCESS)
+            return false;
+        vk.vkBindImageMemory(device, scene, sceneMemory, 0);
+        return true;
+    }
+
+    static void imageBarrier(Fns &vk, VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to,
+                             VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                             VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
+    {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = srcAccess;
+        b.dstAccessMask = dstAccess;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vk.vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+
+    void recordSceneCopy(const GSGpuFrame &frame)
+    {
+        const VkImageLayout from = sceneInitialized ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        imageBarrier(vk, cmd, scene, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region{};
+        region.bufferRowLength = frame.rowPixels;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {frame.width, frame.height, 1};
+        vk.vkCmdCopyBufferToImage(cmd, (VkBuffer)frame.buffer, scene,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        imageBarrier(vk, cmd, scene, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        sceneInitialized = true;
+        sceneW = frame.width;
+        sceneH = frame.height;
+        sceneValid = true;
+    }
+
+    void recordPostProcess()
+    {
+        if (!kPostProcessEnabled)
+            return;
+    }
+
+    void recordLetterbox(VkImage target)
+    {
+        imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkClearColorValue black{};
+        black.float32[3] = 1.0f;
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vk.vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        if (sceneValid)
+        {
+            const float sw = static_cast<float>(extent.width);
+            const float sh = static_cast<float>(extent.height);
+            float dw = sw, dh = sw / kOutputAspect;
+            if (dh > sh)
+            {
+                dh = sh;
+                dw = sh * kOutputAspect;
+            }
+            const int32_t x0 = static_cast<int32_t>((sw - dw) * 0.5f);
+            const int32_t y0 = static_cast<int32_t>((sh - dh) * 0.5f);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[1] = {static_cast<int32_t>(sceneW), static_cast<int32_t>(sceneH), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.dstOffsets[0] = {x0, y0, 0};
+            blit.dstOffsets[1] = {x0 + static_cast<int32_t>(dw), y0 + static_cast<int32_t>(dh), 1};
+            // Point filtering, as the raylib path drew it; filters arrive with the post-process passes.
+            vk.vkCmdBlitImage(cmd, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        }
+        imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    }
+};
+
+VkPresenter::VkPresenter() : m(std::make_unique<Impl>()) {}
+VkPresenter::~VkPresenter() { shutdown(); }
+
+bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsync, std::string &error)
+{
+    Impl &p = *m;
+    p.window = window;
+    p.instance = static_cast<VkInstance>(ctx.instance);
+    p.physicalDevice = static_cast<VkPhysicalDevice>(ctx.physicalDevice);
+    p.device = static_cast<VkDevice>(ctx.device);
+    p.queue = static_cast<VkQueue>(ctx.queue);
+    p.queueFamily = ctx.queueFamily;
+    p.queueLock = ctx.queueLock;
+    p.vsync = vsync;
+    if (!ctx.swapchainEnabled || !p.instance || !p.device || !p.queue)
+    {
+        error = "GS Vulkan device has no swapchain support";
+        return false;
+    }
+    if (!p.load(ctx.getInstanceProcAddr))
+    {
+        error = "missing Vulkan surface/swapchain entry points";
+        return false;
+    }
+    if (!SDL_Vulkan_CreateSurface(window, p.instance, nullptr, &p.surface))
+    {
+        error = std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError();
+        return false;
+    }
+    VkBool32 supported = VK_FALSE;
+    p.vk.vkGetPhysicalDeviceSurfaceSupportKHR(p.physicalDevice, p.queueFamily, p.surface, &supported);
+    if (!supported)
+    {
+        error = "GS queue family cannot present to the window";
+        return false;
+    }
+
+    uint32_t count = 0;
+    p.vk.vkGetPhysicalDeviceSurfaceFormatsKHR(p.physicalDevice, p.surface, &count, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(count);
+    p.vk.vkGetPhysicalDeviceSurfaceFormatsKHR(p.physicalDevice, p.surface, &count, formats.data());
+    if (formats.empty())
+    {
+        error = "surface reports no formats";
+        return false;
+    }
+    // UNORM on purpose: the GS output is already display-encoded, as raylib showed it.
+    p.format = formats[0];
+    for (const VkSurfaceFormatKHR &f : formats)
+        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        {
+            p.format = f;
+            break;
+        }
+
+    p.vk.vkGetPhysicalDeviceSurfacePresentModesKHR(p.physicalDevice, p.surface, &count, nullptr);
+    std::vector<VkPresentModeKHR> modes(count);
+    p.vk.vkGetPhysicalDeviceSurfacePresentModesKHR(p.physicalDevice, p.surface, &count, modes.data());
+    auto has = [&](VkPresentModeKHR mode) { return std::find(modes.begin(), modes.end(), mode) != modes.end(); };
+    p.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!vsync)
+    {
+        if (has(VK_PRESENT_MODE_MAILBOX_KHR))
+            p.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
+            p.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+
+    VkAttachmentDescription att{};
+    att.format = p.format.format;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp.attachmentCount = 1;
+    rp.pAttachments = &att;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &sub;
+    if (p.vk.vkCreateRenderPass(p.device, &rp, nullptr, &p.renderPass) != VK_SUCCESS)
+    {
+        error = "vkCreateRenderPass failed";
+        return false;
+    }
+
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pi.queueFamilyIndex = p.queueFamily;
+    VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (p.vk.vkCreateCommandPool(p.device, &pi, nullptr, &p.pool) != VK_SUCCESS ||
+        (ci.commandPool = p.pool, ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, ci.commandBufferCount = 1,
+         p.vk.vkAllocateCommandBuffers(p.device, &ci, &p.cmd) != VK_SUCCESS) ||
+        p.vk.vkCreateSemaphore(p.device, &si, nullptr, &p.acquired) != VK_SUCCESS ||
+        p.vk.vkCreateFence(p.device, &fi, nullptr, &p.fence) != VK_SUCCESS || !p.ensureScene(640, 512))
+    {
+        error = "presenter command/sync objects failed";
+        return false;
+    }
+    m_resizePending = true;
+    return true;
+}
+
+void VkPresenter::shutdown()
+{
+    if (!m || !m->device)
+        return;
+    Impl &p = *m;
+    p.waitFence();
+    {
+        auto lock = p.lockQueue();
+        p.vk.vkQueueWaitIdle(p.queue);
+    }
+    imguiShutdown();
+    p.destroySwapchainViews();
+    if (p.swapchain)
+        p.vk.vkDestroySwapchainKHR(p.device, p.swapchain, nullptr);
+    if (p.surface)
+        p.vk.vkDestroySurfaceKHR(p.instance, p.surface, nullptr);
+    if (p.scene)
+        p.vk.vkDestroyImage(p.device, p.scene, nullptr);
+    if (p.sceneMemory)
+        p.vk.vkFreeMemory(p.device, p.sceneMemory, nullptr);
+    if (p.renderPass)
+        p.vk.vkDestroyRenderPass(p.device, p.renderPass, nullptr);
+    if (p.fence)
+        p.vk.vkDestroyFence(p.device, p.fence, nullptr);
+    if (p.acquired)
+        p.vk.vkDestroySemaphore(p.device, p.acquired, nullptr);
+    if (p.pool)
+        p.vk.vkDestroyCommandPool(p.device, p.pool, nullptr);
+    m = std::make_unique<Impl>();
+}
+
+void VkPresenter::waitFrame()
+{
+    if (m && m->device)
+        m->waitFence();
+}
+
+void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
+{
+    Impl &p = *m;
+    if (!p.device)
+        return;
+    p.waitFence();
+    if (m_resizePending || !p.swapchain)
+    {
+        if (!p.createSwapchain())
+            return; // minimized; the scene copy waits for the next fresh field
+        m_resizePending = false;
+    }
+
+    uint32_t index = 0;
+    VkResult r = p.vk.vkAcquireNextImageKHR(p.device, p.swapchain, UINT64_MAX, p.acquired, VK_NULL_HANDLE, &index);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR)
+    {
+        m_resizePending = true;
+        return;
+    }
+    if (r == VK_SUBOPTIMAL_KHR)
+        m_resizePending = true;
+    else if (r != VK_SUCCESS)
+        return;
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    p.vk.vkBeginCommandBuffer(p.cmd, &bi);
+    if (frame && *frame && p.ensureScene(frame->width, frame->height))
+        p.recordSceneCopy(*frame);
+    else if (frame)
+        p.sceneValid = false; // a latched tick without a field shows black, as the raylib path did
+    p.recordPostProcess();
+    p.recordLetterbox(p.images[index]);
+
+    // Shared queue: ImGui's texture uploads submit on it too, so hold the lock from here.
+    auto lock = p.lockQueue();
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = p.renderPass;
+    rb.framebuffer = p.framebuffers[index];
+    rb.renderArea.extent = p.extent;
+    p.vk.vkCmdBeginRenderPass(p.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    if (imgui && p.imgui)
+        ImGui_ImplVulkan_RenderDrawData(imgui, p.cmd);
+    p.vk.vkCmdEndRenderPass(p.cmd);
+    p.vk.vkEndCommandBuffer(p.cmd);
+
+    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &p.acquired;
+    si.pWaitDstStageMask = &waitStage;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &p.cmd;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &p.renderDone[index];
+    p.vk.vkResetFences(p.device, 1, &p.fence);
+    if (p.vk.vkQueueSubmit(p.queue, 1, &si, p.fence) != VK_SUCCESS)
+    {
+        std::fprintf(stderr, "[host] present submit failed\n");
+        return;
+    }
+    p.inFlight = true;
+
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &p.renderDone[index];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &p.swapchain;
+    pi.pImageIndices = &index;
+    r = p.vk.vkQueuePresentKHR(p.queue, &pi);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+        m_resizePending = true;
+}
+
+bool VkPresenter::imguiInit()
+{
+    Impl &p = *m;
+    if (!p.device || p.imgui)
+        return p.imgui;
+    struct LoaderCtx
+    {
+        PFN_vkGetInstanceProcAddr gipa;
+        VkInstance instance;
+    } ctx{p.vk.vkGetInstanceProcAddr, p.instance};
+    if (!ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_0, [](const char *name, void *user) {
+            auto *c = static_cast<LoaderCtx *>(user);
+            return c->gipa(c->instance, name);
+        }, &ctx))
+        return false;
+    ImGui_ImplVulkan_InitInfo info{};
+    info.ApiVersion = VK_API_VERSION_1_0;
+    info.Instance = p.instance;
+    info.PhysicalDevice = p.physicalDevice;
+    info.Device = p.device;
+    info.QueueFamily = p.queueFamily;
+    info.Queue = p.queue;
+    info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE;
+    info.MinImageCount = 2;
+    info.ImageCount = 3; // only paces ImGui's buffer/texture reuse; we keep one frame in flight
+    info.PipelineInfoMain.RenderPass = p.renderPass;
+    info.PipelineInfoMain.Subpass = 0;
+    info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    p.imgui = ImGui_ImplVulkan_Init(&info);
+    return p.imgui;
+}
+
+void VkPresenter::imguiNewFrame()
+{
+    if (m->imgui)
+        ImGui_ImplVulkan_NewFrame();
+}
+
+void VkPresenter::imguiShutdown()
+{
+    if (!m->imgui)
+        return;
+    m->waitFence();
+    ImGui_ImplVulkan_Shutdown();
+    m->imgui = false;
+}

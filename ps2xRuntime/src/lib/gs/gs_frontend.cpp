@@ -524,9 +524,8 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-void GS::latchHostPresentationFrame(uint32_t fullFrameHeight)
+bool GS::buildHostPresentationRequest(uint32_t fullFrameHeight, GSPresentationRequest &request)
 {
-    GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         if (!m_backend || !m_privRegs)
@@ -535,7 +534,7 @@ void GS::latchHostPresentationFrame(uint32_t fullFrameHeight)
             m_hostPresentationFrame.clear();
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
-            return;
+            return false;
         }
         request = buildPresentationRequestUnlocked();
     }
@@ -556,27 +555,15 @@ void GS::latchHostPresentationFrame(uint32_t fullFrameHeight)
         if (expandedDisplay1 || expandedDisplay2)
             request.smode2 &= ~1ull;
     }
+    return true;
+}
 
-    PresentationFrame frame{};
-    {
-        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (m_backend)
-        {
-            m_backend->Flush();
-            m_backend->Sync(GSSyncReason::Presentation);
-            frame = m_backend->Present(request);
-        }
-    }
-
-    const bool hasFrame = static_cast<bool>(frame);
-    const uint32_t displayFbp = frame.displayFbp;
-    const uint32_t sourceFbp = frame.sourceFbp;
-    const uint32_t width = frame.width;
-    const uint32_t height = frame.height;
-    const bool usedPreferred = frame.usedPreferred;
+void GS::storeLatchedFrameInfo(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t height,
+                               uint32_t displayFbp, uint32_t sourceFbp, bool usedPreferred, bool hasFrame)
+{
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
-        m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationFrame = std::move(pixels);
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationDisplayFbp = displayFbp;
@@ -590,6 +577,63 @@ void GS::latchHostPresentationFrame(uint32_t fullFrameHeight)
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
+}
+
+void GS::latchHostPresentationFrame(uint32_t fullFrameHeight)
+{
+    GSPresentationRequest request{};
+    if (!buildHostPresentationRequest(fullFrameHeight, request))
+        return;
+
+    PresentationFrame frame{};
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (m_backend)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::Presentation);
+            frame = m_backend->Present(request);
+        }
+    }
+
+    const bool hasFrame = static_cast<bool>(frame);
+    storeLatchedFrameInfo(std::move(frame.pixels), frame.width, frame.height,
+                          frame.displayFbp, frame.sourceFbp, frame.usedPreferred, hasFrame);
+}
+
+bool GS::latchHostPresentationFrameGpu(uint32_t fullFrameHeight, GSGpuFrame &out)
+{
+    out = GSGpuFrame{};
+    GSPresentationRequest request{};
+    if (!buildHostPresentationRequest(fullFrameHeight, request))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (m_backend)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::Presentation);
+            if (!m_backend->PresentGpu(request, out))
+                out = GSGpuFrame{};
+        }
+    }
+
+    // The pixels stay on the GPU; copyLatchedHostPresentationFrame has nothing to return for this field.
+    const bool hasFrame = static_cast<bool>(out);
+    storeLatchedFrameInfo({}, out.width, out.height, out.displayFbp, out.sourceFbp, out.usedPreferred, false);
+    if (hasFrame)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        recordPresentDebugEventUnlocked(out.displayFbp, out.sourceFbp, out.width, out.height, out.usedPreferred);
+    }
+    return hasFrame;
+}
+
+const GSHostGpuContext *GS::hostGpuContext() const
+{
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    return m_backend ? m_backend->HostGpuContext() : nullptr;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,

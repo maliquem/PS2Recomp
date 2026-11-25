@@ -23,6 +23,9 @@ public:
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
+    // GPU-resident present for a host presenter; false when the backend has no GPU output.
+    virtual bool PresentGpu(const GSPresentationRequest &, GSGpuFrame &) { return false; }
+    virtual const GSHostGpuContext *HostGpuContext() const { return nullptr; }
 
     virtual bool ClearFramebuffer(const GSContext &context, uint32_t rgba) = 0;
     virtual uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) = 0;
