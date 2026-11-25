@@ -211,10 +211,10 @@ namespace ps2host
     bool openWindow(const char *title, int width, int height, GS &gs)
     {
         const bool hidden = envFlag("PS2X_HIDDEN_WINDOW");
-        // Visible windows sync to the display (no tearing; PS2X_VSYNC=0 turns it off).
-        // Hidden runs are measurements: never block on the display's refresh.
+        // Default: visible windows sync to the display (no tearing); hidden runs are measurements and do not.
+        // An explicit PS2X_VSYNC wins either way (PS2X_VSYNC=1 paces hidden parity runs).
         const char *vsyncEnv = std::getenv("PS2X_VSYNC");
-        const bool vsync = !hidden && (!vsyncEnv || !*vsyncEnv || envFlag("PS2X_VSYNC"));
+        const bool vsync = (vsyncEnv && *vsyncEnv) ? envFlag("PS2X_VSYNC") : !hidden;
         g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;

@@ -207,6 +207,11 @@ struct VkPresenter::Impl
         if (!(caps.supportedCompositeAlpha & alpha))
             alpha = static_cast<VkCompositeAlphaFlagBitsKHR>(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1u));
 
+        if (dumpAt && !(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        {
+            std::fprintf(stderr, "[host] present dump disabled: swapchain cannot be a transfer source\n");
+            dumpAt = 0;
+        }
         VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         ci.surface = surface;
         ci.minImageCount = imageCount;
@@ -377,7 +382,8 @@ struct VkPresenter::Impl
 
         imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                     // ALL_COMMANDS: the render pass's final layout change runs at BOTTOM_OF_PIPE.
+                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageExtent = {extent.width, extent.height, 1};
@@ -428,6 +434,11 @@ struct VkPresenter::Impl
             std::fprintf(stderr, "[host] present dump %s (format=%d colorspace=%d)\n", dumpPrefix.c_str(),
                          static_cast<int>(format.format), static_cast<int>(format.colorSpace));
         }
+        freeDump();
+    }
+
+    void freeDump()
+    {
         vk.vkDestroyBuffer(device, dumpBuffer, nullptr);
         vk.vkFreeMemory(device, dumpMemory, nullptr); // frees the mapping too
         dumpBuffer = VK_NULL_HANDLE;
@@ -542,6 +553,13 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
             p.format = f;
             break;
         }
+    // The dump reads 4 bytes per pixel: other formats (e.g. 16-bit float) would overrun its buffer.
+    if (p.dumpAt && p.format.format != VK_FORMAT_B8G8R8A8_UNORM && p.format.format != VK_FORMAT_R8G8B8A8_UNORM)
+    {
+        std::fprintf(stderr, "[host] present dump disabled: swapchain format %d is not 8-bit RGBA\n",
+                     static_cast<int>(p.format.format));
+        p.dumpAt = 0;
+    }
 
     p.vk.vkGetPhysicalDeviceSurfacePresentModesKHR(p.physicalDevice, p.surface, &count, nullptr);
     std::vector<VkPresentModeKHR> modes(count);
@@ -685,7 +703,11 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     if (imgui && p.imgui)
         ImGui_ImplVulkan_RenderDrawData(imgui, p.cmd);
     p.vk.vkCmdEndRenderPass(p.cmd);
-    const bool dump = p.dumpAt && ++p.presentCount == p.dumpAt && p.sceneValid && p.recordDump(p.images[index]);
+    const bool dumpNow = p.dumpAt && ++p.presentCount == p.dumpAt;
+    const bool dump = dumpNow && p.sceneValid && p.recordDump(p.images[index]);
+    if (dumpNow && !dump)
+        std::fprintf(stderr, "[host] present dump skipped at present %llu (no scene or no host memory)\n",
+                     static_cast<unsigned long long>(p.presentCount));
     p.vk.vkEndCommandBuffer(p.cmd);
 
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -701,6 +723,8 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     if (p.vk.vkQueueSubmit(p.queue, 1, &si, p.fence) != VK_SUCCESS)
     {
         std::fprintf(stderr, "[host] present submit failed\n");
+        if (dump)
+            p.freeDump();
         return;
     }
     p.inFlight = true;
