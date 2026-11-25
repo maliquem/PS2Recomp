@@ -5057,6 +5057,27 @@ void register_ps2_gs_tests()
             cpuBackend.SnapshotVram(snapCpu);
             vkBackend->SnapshotVram(snapVk);
             t.Equals(snapVk == snapCpu, true, "Pending unrelated buffer draw must survive non-intrusive Present");
+
+            // The host draws PresentGpu's buffer without readback: it must hold the CPU field, both on the GPU
+            // path and when the backend stages a CPU-composed field (both CRTs on with one at fbp 0 go to the CPU).
+            auto gpuMatchesCpu = [&](const GSPresentationRequest &r)
+            {
+                const PresentationFrame cpu = cpuBackend.Present(r);
+                GSGpuFrame gpu{};
+                if (!vkBackend->PresentGpu(r, gpu) || !cpu || !gpu || gpu.width != cpu.width || gpu.height != cpu.height)
+                    return false;
+                for (uint32_t y = 0u; y < gpu.height; ++y)
+                    if (std::memcmp(gpu.mapped + size_t(y) * gpu.rowPixels * 4u, cpu.pixels.data() + size_t(y) * cpu.width * 4u,
+                                    size_t(cpu.width) * 4u) != 0)
+                        return false;
+                return true;
+            };
+            t.IsTrue(gpuMatchesCpu(req), "PresentGpu output must match the CPU present row by row");
+            GSPresentationRequest stagedReq = req;
+            stagedReq.pmode = 0x3ull;
+            stagedReq.dispfb2 = 0ull | (10ull << 9u) | (static_cast<uint64_t>(GS_PSM_CT32) << 15u);
+            stagedReq.display2 = req.display1;
+            t.IsTrue(gpuMatchesCpu(stagedReq), "PresentGpu must stage the CPU fallback field row by row");
         });
 
         tc.Run("GSVulkanBackend double-buffered slots keep order across async flushes, presents and overflow", [](TestCase &t)

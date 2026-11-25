@@ -619,14 +619,9 @@ bool GS::latchHostPresentationFrameGpu(uint32_t fullFrameHeight, GSGpuFrame &out
         }
     }
 
-    // The pixels stay on the GPU; copyLatchedHostPresentationFrame has nothing to return for this field.
+    // The pixels stay on the GPU, so the stored frame is empty and copyLatchedHostPresentationFrame returns nothing.
     const bool hasFrame = static_cast<bool>(out);
-    storeLatchedFrameInfo({}, out.width, out.height, out.displayFbp, out.sourceFbp, out.usedPreferred, false);
-    if (hasFrame)
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-        recordPresentDebugEventUnlocked(out.displayFbp, out.sourceFbp, out.width, out.height, out.usedPreferred);
-    }
+    storeLatchedFrameInfo({}, out.width, out.height, out.displayFbp, out.sourceFbp, out.usedPreferred, hasFrame);
     return hasFrame;
 }
 

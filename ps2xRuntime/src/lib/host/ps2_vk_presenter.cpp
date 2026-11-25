@@ -20,6 +20,7 @@ namespace
     X(vkGetPhysicalDeviceSurfaceFormatsKHR)        \
     X(vkGetPhysicalDeviceSurfacePresentModesKHR)   \
     X(vkGetPhysicalDeviceMemoryProperties)         \
+    X(vkGetPhysicalDeviceQueueFamilyProperties)    \
     X(vkDestroySurfaceKHR)
 
 #define PS2X_VK_DEVICE_FNS(X)     \
@@ -69,8 +70,6 @@ namespace
 #undef PS2X_DECL
     };
 
-    // The GS output is meant for a 4:3 TV; C2 turns this into the widescreen/scale setting.
-    constexpr float kOutputAspect = 4.0f / 3.0f;
 
     // §4 extension point: post-process passes run here on the scene image, between the GS copy and the
     // letterbox blit. None exist yet, so the pass is named but disabled.
@@ -349,16 +348,10 @@ struct VkPresenter::Impl
         vk.vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
         if (sceneValid)
         {
-            const float sw = static_cast<float>(extent.width);
-            const float sh = static_cast<float>(extent.height);
-            float dw = sw, dh = sw / kOutputAspect;
-            if (dh > sh)
-            {
-                dh = sh;
-                dw = sh * kOutputAspect;
-            }
-            const int32_t x0 = static_cast<int32_t>((sw - dw) * 0.5f);
-            const int32_t y0 = static_cast<int32_t>((sh - dh) * 0.5f);
+            const OutputRect r = letterbox43(static_cast<float>(extent.width), static_cast<float>(extent.height));
+            const int32_t x0 = static_cast<int32_t>(r.x);
+            const int32_t y0 = static_cast<int32_t>(r.y);
+            const float dw = r.w, dh = r.h;
             VkImageBlit blit{};
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             blit.srcOffsets[1] = {static_cast<int32_t>(sceneW), static_cast<int32_t>(sceneH), 1};
@@ -402,6 +395,16 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
     if (!SDL_Vulkan_CreateSurface(window, p.instance, nullptr, &p.surface))
     {
         error = std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError();
+        return false;
+    }
+    // The GS picks its queue family; the blits and the ImGui render pass also need graphics.
+    uint32_t familyCount = 0;
+    p.vk.vkGetPhysicalDeviceQueueFamilyProperties(p.physicalDevice, &familyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> families(familyCount);
+    p.vk.vkGetPhysicalDeviceQueueFamilyProperties(p.physicalDevice, &familyCount, families.data());
+    if (p.queueFamily >= familyCount || !(families[p.queueFamily].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+    {
+        error = "GS queue family has no graphics support";
         return false;
     }
     VkBool32 supported = VK_FALSE;

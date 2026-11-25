@@ -8,6 +8,23 @@
 struct SDL_Window;
 struct ImDrawData;
 
+// The 4:3 output rect centered in a w x h target; both presenters draw the field into it.
+// The GS output is meant for a 4:3 TV; C2 turns this into the widescreen/scale setting.
+struct OutputRect
+{
+    float x, y, w, h;
+};
+inline OutputRect letterbox43(float w, float h)
+{
+    float dw = w, dh = w * 3.0f / 4.0f;
+    if (dh > h)
+    {
+        dh = h;
+        dw = h * 4.0f / 3.0f;
+    }
+    return {(w - dw) * 0.5f, (h - dh) * 0.5f, dw, dh};
+}
+
 // Presents the GS output buffer through a Vulkan swapchain on the GS backend's device: buffer -> scene
 // image -> (post-process passes, none yet) -> letterboxed blit -> ImGui pass -> present. No CPU readback.
 class VkPresenter

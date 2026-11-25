@@ -60,24 +60,13 @@ namespace
 
     bool g_imguiContext = false;
     bool g_imguiFrameReady = false;
+    bool g_imguiDrewLastFrame = false; // ImGui only drains its input queue inside NewFrame
     uint64_t g_nextFrameNs = 0;
 
     bool envFlag(const char *name)
     {
         const char *v = std::getenv(name);
         return v && *v && std::strcmp(v, "0") != 0;
-    }
-
-    // 4:3 output rect centered in the window (same rule as the Vulkan presenter).
-    SDL_FRect letterbox(int w, int h)
-    {
-        float dw = static_cast<float>(w), dh = dw * 3.0f / 4.0f;
-        if (dh > static_cast<float>(h))
-        {
-            dh = static_cast<float>(h);
-            dw = dh * 4.0f / 3.0f;
-        }
-        return SDL_FRect{(static_cast<float>(w) - dw) * 0.5f, (static_cast<float>(h) - dh) * 0.5f, dw, dh};
     }
 
     void snapshotPads()
@@ -193,11 +182,16 @@ namespace ps2host
 {
     bool preInit()
     {
-        if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD))
+        if (!SDL_Init(SDL_INIT_VIDEO))
         {
             std::fprintf(stderr, "[host] SDL_Init failed: %s\n", SDL_GetError());
             return false;
         }
+        // Without audio or gamepads the game still runs (muted / keyboard only).
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
+            std::fprintf(stderr, "[host] no audio subsystem: %s\n", SDL_GetError());
+        if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+            std::fprintf(stderr, "[host] no gamepad subsystem: %s\n", SDL_GetError());
         if (!SDL_Vulkan_LoadLibrary(nullptr))
         {
             std::fprintf(stderr, "[host] no Vulkan loader for the window: %s\n", SDL_GetError());
@@ -297,10 +291,12 @@ namespace ps2host
         bool keepRunning = true;
         for (auto &p : g_pressed)
             p.store(0, std::memory_order_relaxed);
+        const bool forwardToImgui = g_imguiContext && g_imguiDrewLastFrame;
+        g_imguiDrewLastFrame = false;
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {
-            if (g_imguiContext)
+            if (forwardToImgui)
                 ImGui_ImplSDL3_ProcessEvent(&e);
             switch (e.type)
             {
@@ -339,6 +335,12 @@ namespace ps2host
         const bool *state = SDL_GetKeyboardState(&numKeys);
         for (int i = 0; i < SDL_SCANCODE_COUNT && i < numKeys; ++i)
             g_keys[i].store(state[i] ? 1 : 0, std::memory_order_relaxed);
+        // Enter is Start on the pad: Alt+Enter toggles fullscreen and must not press Start too.
+        if (SDL_GetModState() & SDL_KMOD_ALT)
+        {
+            g_keys[SDL_SCANCODE_RETURN].store(0, std::memory_order_relaxed);
+            g_pressed[SDL_SCANCODE_RETURN].store(0, std::memory_order_relaxed);
+        }
         snapshotPads();
         return keepRunning;
     }
@@ -382,7 +384,8 @@ namespace ps2host
         {
             int w = 0, h = 0;
             SDL_GetCurrentRenderOutputSize(g_renderer, &w, &h);
-            const SDL_FRect dst = letterbox(w, h);
+            const OutputRect r = letterbox43(static_cast<float>(w), static_cast<float>(h));
+            const SDL_FRect dst{r.x, r.y, r.w, r.h};
             SDL_RenderTexture(g_renderer, g_texture, nullptr, &dst);
         }
         if (ui)
@@ -457,5 +460,6 @@ namespace ps2host
             return;
         ImGui::Render();
         g_imguiFrameReady = true;
+        g_imguiDrewLastFrame = true;
     }
 }
