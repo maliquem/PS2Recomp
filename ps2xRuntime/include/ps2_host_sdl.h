@@ -30,6 +30,7 @@ enum HostKey : int
     KEY_TAB = 43,
     KEY_SPACE = 44,
     KEY_F1 = 58,
+    KEY_F3 = 60,
     KEY_RIGHT = 79,
     KEY_LEFT = 80,
     KEY_DOWN = 81,
@@ -103,6 +104,9 @@ namespace ps2host
     void presentPixels(const uint8_t *rgba, uint32_t rowPixels, uint32_t width, uint32_t height, bool fresh);
     // 60 Hz host loop pacing, as raylib SetTargetFPS(60) did.
     void waitNextFrame();
+
+    // Shows "<title> - <suffix>"; null or empty restores the title.
+    void setWindowTitleSuffix(const char *suffix);
 
     // Dev-tools ImGui drawn over the game in the presenter's pass.
     bool imguiInit();

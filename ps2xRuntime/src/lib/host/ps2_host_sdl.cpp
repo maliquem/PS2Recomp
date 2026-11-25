@@ -24,7 +24,8 @@ static_assert(KEY_A == SDL_SCANCODE_A && KEY_C == SDL_SCANCODE_C && KEY_D == SDL
               KEY_Q == SDL_SCANCODE_Q && KEY_S == SDL_SCANCODE_S && KEY_V == SDL_SCANCODE_V && KEY_W == SDL_SCANCODE_W &&
               KEY_X == SDL_SCANCODE_X && KEY_Z == SDL_SCANCODE_Z && KEY_ONE == SDL_SCANCODE_1 && KEY_THREE == SDL_SCANCODE_3 &&
               KEY_ENTER == SDL_SCANCODE_RETURN && KEY_ESCAPE == SDL_SCANCODE_ESCAPE && KEY_TAB == SDL_SCANCODE_TAB &&
-              KEY_SPACE == SDL_SCANCODE_SPACE && KEY_F1 == SDL_SCANCODE_F1 && KEY_RIGHT == SDL_SCANCODE_RIGHT &&
+              KEY_SPACE == SDL_SCANCODE_SPACE && KEY_F1 == SDL_SCANCODE_F1 && KEY_F3 == SDL_SCANCODE_F3 &&
+              KEY_RIGHT == SDL_SCANCODE_RIGHT &&
               KEY_LEFT == SDL_SCANCODE_LEFT && KEY_DOWN == SDL_SCANCODE_DOWN && KEY_UP == SDL_SCANCODE_UP &&
               KEY_KP_1 == SDL_SCANCODE_KP_1 && KEY_KP_0 == SDL_SCANCODE_KP_0 && KEY_LEFT_CONTROL == SDL_SCANCODE_LCTRL &&
               KEY_LEFT_SHIFT == SDL_SCANCODE_LSHIFT && KEY_RIGHT_CONTROL == SDL_SCANCODE_RCTRL &&
@@ -62,6 +63,7 @@ namespace
     bool g_imguiFrameReady = false;
     bool g_imguiDrewLastFrame = false; // ImGui only drains its input queue inside NewFrame
     uint64_t g_nextFrameNs = 0;
+    std::string g_baseTitle;
 
     bool envFlag(const char *name)
     {
@@ -209,8 +211,11 @@ namespace ps2host
     bool openWindow(const char *title, int width, int height, GS &gs)
     {
         const bool hidden = envFlag("PS2X_HIDDEN_WINDOW");
+        // Visible windows sync to the display (no tearing; PS2X_VSYNC=0 turns it off).
         // Hidden runs are measurements: never block on the display's refresh.
-        const bool vsync = !hidden && envFlag("PS2X_VSYNC");
+        const char *vsyncEnv = std::getenv("PS2X_VSYNC");
+        const bool vsync = !hidden && (!vsyncEnv || !*vsyncEnv || envFlag("PS2X_VSYNC"));
+        g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;
 
@@ -403,6 +408,12 @@ namespace ps2host
         }
         // Keep the 60 Hz cadence after a slightly late frame; restart it after a long stall.
         g_nextFrameNs = (now > g_nextFrameNs + kFramePeriodNs) ? now + kFramePeriodNs : g_nextFrameNs + kFramePeriodNs;
+    }
+
+    void setWindowTitleSuffix(const char *suffix)
+    {
+        if (g_window)
+            SDL_SetWindowTitle(g_window, (suffix && *suffix) ? (g_baseTitle + " - " + suffix).c_str() : g_baseTitle.c_str());
     }
 
     bool imguiInit()

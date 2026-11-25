@@ -20,6 +20,12 @@ private:
     bool m_showRegisters = true;
     unsigned int m_memoryAddress = 0x00100000u;
     unsigned int m_memoryBytes = 0x100u;
+    // F3 counter: presents per second (FPS) and EE VBlanks per second (VPS).
+    bool m_showRate = false;
+    unsigned int m_rateFrames = 0;
+    unsigned long long m_rateTick = 0;
+    unsigned long long m_rateStartNs = 0;
+    float m_fps = 0.0f, m_vps = 0.0f;
 };
 
 #endif // PS2_DEBUG_PANEL_H

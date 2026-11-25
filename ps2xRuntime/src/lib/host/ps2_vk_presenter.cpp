@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace
@@ -59,7 +61,13 @@ namespace
     X(vkGetImageMemoryRequirements) \
     X(vkAllocateMemory)           \
     X(vkFreeMemory)               \
-    X(vkBindImageMemory)
+    X(vkBindImageMemory)          \
+    X(vkCreateBuffer)             \
+    X(vkDestroyBuffer)            \
+    X(vkGetBufferMemoryRequirements) \
+    X(vkBindBufferMemory)         \
+    X(vkMapMemory)                \
+    X(vkCmdCopyImageToBuffer)
 
     struct Fns
     {
@@ -113,6 +121,13 @@ struct VkPresenter::Impl
     bool sceneInitialized = false;
 
     bool imgui = false;
+
+    // PS2X_PRESENT_DUMP=<prefix>: at present number PS2X_PRESENT_DUMP_AT (default 600) write the swapchain
+    // image as presented and the scene it was blitted from, to check colors on the presented pixels.
+    std::string dumpPrefix;
+    uint64_t dumpAt = 0, presentCount = 0;
+    VkBuffer dumpBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory dumpMemory = VK_NULL_HANDLE;
 
     bool load(void *gipa)
     {
@@ -199,7 +214,8 @@ struct VkPresenter::Impl
         ci.imageColorSpace = format.colorSpace;
         ci.imageExtent = want;
         ci.imageArrayLayers = 1;
-        ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        (dumpAt ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = caps.currentTransform;
         ci.compositeAlpha = alpha;
@@ -331,6 +347,93 @@ struct VkPresenter::Impl
         sceneValid = true;
     }
 
+    // Records the readback copies after the ImGui pass (image in PRESENT_SRC); false if no host buffer.
+    bool recordDump(VkImage target)
+    {
+        const VkDeviceSize presentBytes = VkDeviceSize(extent.width) * extent.height * 4u;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = presentBytes + VkDeviceSize(sceneW) * sceneH * 4u;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vk.vkCreateBuffer(device, &bi, nullptr, &dumpBuffer) != VK_SUCCESS)
+            return false;
+        VkMemoryRequirements req{};
+        vk.vkGetBufferMemoryRequirements(device, dumpBuffer, &req);
+        VkPhysicalDeviceMemoryProperties props{};
+        vk.vkGetPhysicalDeviceMemoryProperties(physicalDevice, &props);
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = UINT32_MAX;
+        for (uint32_t i = 0; i < props.memoryTypeCount && ai.memoryTypeIndex == UINT32_MAX; ++i)
+            if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
+                ai.memoryTypeIndex = i;
+        if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(device, &ai, nullptr, &dumpMemory) != VK_SUCCESS)
+        {
+            vk.vkDestroyBuffer(device, dumpBuffer, nullptr);
+            dumpBuffer = VK_NULL_HANDLE;
+            return false;
+        }
+        vk.vkBindBufferMemory(device, dumpBuffer, dumpMemory, 0);
+
+        imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {extent.width, extent.height, 1};
+        vk.vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dumpBuffer, 1, &region);
+        region.bufferOffset = presentBytes;
+        region.imageExtent = {sceneW, sceneH, 1};
+        vk.vkCmdCopyImageToBuffer(cmd, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dumpBuffer, 1, &region);
+        imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                     VK_ACCESS_TRANSFER_READ_BIT, 0,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
+        return true;
+    }
+
+    // Binary PPMs (RGB); the swapchain may be BGRA.
+    void writeDump()
+    {
+        waitFence();
+        void *mapped = nullptr;
+        if (vk.vkMapMemory(device, dumpMemory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS)
+        {
+            const bool bgra = format.format == VK_FORMAT_B8G8R8A8_UNORM || format.format == VK_FORMAT_B8G8R8A8_SRGB;
+            auto write = [](const std::string &path, const uint8_t *px, uint32_t w, uint32_t h, bool swap) {
+                std::FILE *f = std::fopen(path.c_str(), "wb");
+                if (!f)
+                    return;
+                std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                std::vector<uint8_t> row(size_t(w) * 3u);
+                for (uint32_t y = 0; y < h; ++y)
+                {
+                    for (uint32_t x = 0; x < w; ++x)
+                    {
+                        const uint8_t *s = px + (size_t(y) * w + x) * 4u;
+                        row[x * 3 + 0] = swap ? s[2] : s[0];
+                        row[x * 3 + 1] = s[1];
+                        row[x * 3 + 2] = swap ? s[0] : s[2];
+                    }
+                    std::fwrite(row.data(), 1, row.size(), f);
+                }
+                std::fclose(f);
+            };
+            const auto *bytes = static_cast<const uint8_t *>(mapped);
+            write(dumpPrefix + ".present.ppm", bytes, extent.width, extent.height, bgra);
+            write(dumpPrefix + ".scene.ppm", bytes + size_t(extent.width) * extent.height * 4u, sceneW, sceneH, false);
+            std::fprintf(stderr, "[host] present dump %s (format=%d colorspace=%d)\n", dumpPrefix.c_str(),
+                         static_cast<int>(format.format), static_cast<int>(format.colorSpace));
+        }
+        vk.vkDestroyBuffer(device, dumpBuffer, nullptr);
+        vk.vkFreeMemory(device, dumpMemory, nullptr); // frees the mapping too
+        dumpBuffer = VK_NULL_HANDLE;
+        dumpMemory = VK_NULL_HANDLE;
+    }
+
     void recordPostProcess()
     {
         if (!kPostProcessEnabled)
@@ -382,6 +485,12 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
     p.queueFamily = ctx.queueFamily;
     p.queueLock = ctx.queueLock;
     p.vsync = vsync;
+    if (const char *dump = std::getenv("PS2X_PRESENT_DUMP"); dump && *dump)
+    {
+        const char *at = std::getenv("PS2X_PRESENT_DUMP_AT");
+        p.dumpPrefix = dump;
+        p.dumpAt = (at && *at) ? std::strtoull(at, nullptr, 10) : 600u;
+    }
     if (!ctx.swapchainEnabled || !p.instance || !p.device || !p.queue)
     {
         error = "GS Vulkan device has no swapchain support";
@@ -488,6 +597,9 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
         return false;
     }
     m_resizePending = true;
+    std::fprintf(stderr, "[host] Vulkan swapchain format=%d colorspace=%d present_mode=%d vsync=%d\n",
+                 static_cast<int>(p.format.format), static_cast<int>(p.format.colorSpace),
+                 static_cast<int>(p.presentMode), vsync ? 1 : 0);
     return true;
 }
 
@@ -573,6 +685,7 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     if (imgui && p.imgui)
         ImGui_ImplVulkan_RenderDrawData(imgui, p.cmd);
     p.vk.vkCmdEndRenderPass(p.cmd);
+    const bool dump = p.dumpAt && ++p.presentCount == p.dumpAt && p.sceneValid && p.recordDump(p.images[index]);
     p.vk.vkEndCommandBuffer(p.cmd);
 
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -599,6 +712,9 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     pi.pSwapchains = &p.swapchain;
     pi.pImageIndices = &index;
     r = p.vk.vkQueuePresentKHR(p.queue, &pi);
+    lock = {}; // writeDump waits on the fence; the queue is free again
+    if (dump)
+        p.writeDump();
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         m_resizePending = true;
 }
