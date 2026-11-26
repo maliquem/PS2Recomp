@@ -999,6 +999,7 @@ namespace ps2_stubs
 
 #include "StubState.h"
 #include "ps2x/state_archive.h"
+#include <map>
 
 namespace ps2_stubs
 {
@@ -1026,7 +1027,9 @@ namespace ps2_stubs
         }
         else
         {
-            for (auto &[key, entry] : g_cdFilesByKey)
+            // Key order, so equal maps give equal bytes whatever the insertion history (state_archive.h rule).
+            std::map<std::string, CdFileEntry> sorted(g_cdFilesByKey.begin(), g_cdFilesByKey.end());
+            for (auto &[key, entry] : sorted)
             {
                 std::filesystem::path p = entry.hostPath.lexically_relative(root);
                 if (p.empty() || *p.begin() == "..")
