@@ -302,6 +302,23 @@ void register_code_generator_tests()
                  "the syscall continuation must register to the owner wrapper");
     });
 
+    tc.Run("MOVZ and MOVN move only the low 64 bits", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        Instruction mov{};
+        mov.opcode = OPCODE_SPECIAL;
+        mov.rs = 4;
+        mov.rt = 5;
+        mov.rd = 3;
+        mov.function = SPECIAL_MOVZ;
+        std::string generated = gen.translateInstruction(mov);
+        t.IsTrue(generated.find("if (GPR_U64(ctx, 5) == 0) SET_GPR_U64(ctx, 3, GPR_U64(ctx, 4));") != std::string::npos,
+                 "MOVZ must copy the low doubleword only: " + generated);
+        mov.function = SPECIAL_MOVN;
+        generated = gen.translateInstruction(mov);
+        t.IsTrue(generated.find("if (GPR_U64(ctx, 5) != 0) SET_GPR_U64(ctx, 3, GPR_U64(ctx, 4));") != std::string::npos,
+                 "MOVN must copy the low doubleword only: " + generated);
+    });
+
     tc.Run("R5900 MULT writes rd when rd is non-zero", [](TestCase &t) {
         CodeGenerator gen({}, {});
 
