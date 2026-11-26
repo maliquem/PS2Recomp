@@ -40,6 +40,8 @@ namespace ps2_stubs
             uint8_t ry = kPadAnalogCenter;
             uint8_t lx = kPadAnalogCenter;
             uint8_t ly = kPadAnalogCenter;
+            // libpad order: Right, Left, Up, Down, Triangle, Circle, Cross, Square, L1, L2, R1, R2.
+            uint8_t pressure[12] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
         };
 
         struct PadPortState
@@ -58,6 +60,7 @@ namespace ps2_stubs
             uint8_t lastData[32]{};
             uint32_t readCount = 0u;
             uint32_t lastReadDataAddr = 0u;
+            uint8_t actAlign[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // scePadSetActAlign: byte i drives motor actAlign[i]
         };
 
         std::mutex g_padOverrideMutex;
@@ -229,7 +232,7 @@ namespace ps2_stubs
             portState.transientState = static_cast<uint32_t>(kPadStateExecCmd);
         }
 
-        uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask)
+        uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask, int index)
         {
             if (!portState.pressureEnabled)
             {
@@ -239,7 +242,7 @@ namespace ps2_stubs
             {
                 return 0u;
             }
-            return ((state.buttons & mask) == 0u) ? 0xFFu : 0u;
+            return ((state.buttons & mask) == 0u) ? state.pressure[index] : 0u;
         }
 
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
@@ -252,18 +255,18 @@ namespace ps2_stubs
             data[5] = state.ry;
             data[6] = state.lx;
             data[7] = state.ly;
-            data[8] = pressureValue(state, portState, kPadBtnRight);
-            data[9] = pressureValue(state, portState, kPadBtnLeft);
-            data[10] = pressureValue(state, portState, kPadBtnUp);
-            data[11] = pressureValue(state, portState, kPadBtnDown);
-            data[12] = pressureValue(state, portState, kPadBtnTriangle);
-            data[13] = pressureValue(state, portState, kPadBtnCircle);
-            data[14] = pressureValue(state, portState, kPadBtnCross);
-            data[15] = pressureValue(state, portState, kPadBtnSquare);
-            data[16] = pressureValue(state, portState, kPadBtnL1);
-            data[17] = pressureValue(state, portState, kPadBtnL2);
-            data[18] = pressureValue(state, portState, kPadBtnR1);
-            data[19] = pressureValue(state, portState, kPadBtnR2);
+            data[8] = pressureValue(state, portState, kPadBtnRight, 0);
+            data[9] = pressureValue(state, portState, kPadBtnLeft, 1);
+            data[10] = pressureValue(state, portState, kPadBtnUp, 2);
+            data[11] = pressureValue(state, portState, kPadBtnDown, 3);
+            data[12] = pressureValue(state, portState, kPadBtnTriangle, 4);
+            data[13] = pressureValue(state, portState, kPadBtnCircle, 5);
+            data[14] = pressureValue(state, portState, kPadBtnCross, 6);
+            data[15] = pressureValue(state, portState, kPadBtnSquare, 7);
+            data[16] = pressureValue(state, portState, kPadBtnL1, 8);
+            data[17] = pressureValue(state, portState, kPadBtnL2, 9);
+            data[18] = pressureValue(state, portState, kPadBtnR1, 10);
+            data[19] = pressureValue(state, portState, kPadBtnR2, 11);
         }
 
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
@@ -306,6 +309,7 @@ namespace ps2_stubs
                     state.ry = backendData[5];
                     state.lx = backendData[6];
                     state.ly = backendData[7];
+                    std::memcpy(state.pressure, backendData + 8, sizeof(state.pressure));
                     usedBackend = true;
                 }
                 else
@@ -348,6 +352,10 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_padStateMutex);
             resetPadStateLocked();
         }
+#if !PS2X_HOST_RAYLIB
+        for (int port = 0; port < static_cast<int>(kPadPortCount); ++port)
+            ps2host::setRumble(port, 0, 0);
+#endif
         setReturnS32(ctx, 1);
     }
 
@@ -592,6 +600,9 @@ namespace ps2_stubs
         portState->pressureEnabled = false;
         portState->reqState = 0u;
         portState->transientState = 0u;
+#if !PS2X_HOST_RAYLIB
+        ps2host::setRumble(static_cast<int>(getRegU32(ctx, 4)), 0, 0);
+#endif
         setReturnS32(ctx, 1);
     }
 
@@ -636,6 +647,12 @@ namespace ps2_stubs
             return;
         }
 
+#if !PS2X_HOST_RAYLIB
+        // Pause menu: the game (and the IOP stepped on this thread) waits here until it closes.
+        while (runtime && !runtime->isStopRequested() && ps2host::waitWhileMenuOpen(50))
+        {
+        }
+#endif
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
         if (!readPadPortData(port, slot, runtime, data, dataAddr))
         {
@@ -687,15 +704,46 @@ namespace ps2_stubs
 
     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+                                                           static_cast<int>(getRegU32(ctx, 5)));
+        if (!portState || !portState->open || !align)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::memcpy(portState->actAlign, align, sizeof(portState->actAlign));
         setReturnS32(ctx, 1);
     }
 
     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const uint8_t *direct = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        uint8_t small = 0, large = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            const PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
+            if (!portState || !portState->open || !direct)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+            // Motor 0 is the small (on/off) one, motor 1 the large (0..255) one.
+            for (int i = 0; i < 6; ++i)
+            {
+                if (portState->actAlign[i] == 0)
+                    small = direct[i];
+                else if (portState->actAlign[i] == 1)
+                    large = direct[i];
+            }
+        }
+#if !PS2X_HOST_RAYLIB
+        ps2host::setRumble(port, small, large);
+#endif
         setReturnS32(ctx, 1);
     }
 

@@ -12,6 +12,9 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#if !PS2X_HOST_RAYLIB
+#include "ps2_user_config.h"
+#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -716,8 +719,13 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     {
+#if PS2X_HOST_RAYLIB
         const char *backendEnv = std::getenv("PS2X_GS_BACKEND");
         const bool forceCpu = backendEnv && (std::strcmp(backendEnv, "cpu") == 0 || std::strcmp(backendEnv, "CPU") == 0);
+#else
+        const std::string backend = ps2cfg::envString("PS2X_GS_BACKEND", "gs.backend", "vulkan");
+        const bool forceCpu = backend == "cpu" || backend == "CPU";
+#endif
         if (!forceCpu)
         {
             std::string vkReason;
@@ -2535,6 +2543,7 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        ps2host::drawOverlay(m_memory.gs().vsyncTick.load(std::memory_order_relaxed));
         if (ps2host::gpuPresent())
         {
             ps2host::presentGpuFrame(hostLatch.gpu, freshField);

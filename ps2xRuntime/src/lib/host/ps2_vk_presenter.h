@@ -41,6 +41,7 @@ public:
     // `frame` null or not fresh = draw the last scene again. `imgui` may be null.
     void present(const GSGpuFrame *frame, ImDrawData *imgui);
     void requestResize() { m_resizePending = true; }
+    void setVsync(bool vsync);
 
     bool imguiInit();
     void imguiNewFrame();
