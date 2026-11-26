@@ -2183,8 +2183,6 @@ void PS2DebugPanel::initialize()
     if (!m_initialized)
     {
         m_initialized = ps2host::imguiInit();
-        const char *showFps = std::getenv("PS2X_SHOW_FPS");
-        m_showRate = showFps && *showFps && std::strcmp(showFps, "0") != 0;
     }
 #endif
 }
@@ -2192,11 +2190,7 @@ void PS2DebugPanel::initialize()
 void PS2DebugPanel::shutdown()
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-    if (m_initialized)
-    {
-        ps2host::imguiShutdown();
-        m_initialized = false;
-    }
+    m_initialized = false; // the host owns the ImGui context (the pause menu uses it too)
 #endif
 }
 
@@ -2212,60 +2206,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     {
         toggleVisible();
     }
-    if (IsKeyPressed(KEY_F3))
+    if (!m_visible || !ps2host::imguiBeginFrame())
     {
-        m_showRate = !m_showRate;
-        m_rateStartNs = 0;
-        if (!m_showRate)
-            ps2host::setWindowTitleSuffix(nullptr);
-    }
-    if (m_showRate)
-    {
-        // draw() runs once per host present, so its call rate is the screen FPS.
-        const unsigned long long now = static_cast<unsigned long long>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-        const unsigned long long tick = runtime.memory().gs().vsyncTick.load(std::memory_order_relaxed);
-        if (m_rateStartNs == 0)
-        {
-            m_rateStartNs = now;
-            m_rateTick = tick;
-            m_rateFrames = 0;
-        }
-        else if (++m_rateFrames, now - m_rateStartNs >= 1000000000ull)
-        {
-            const double secs = static_cast<double>(now - m_rateStartNs) / 1e9;
-            m_fps = static_cast<float>(m_rateFrames / secs);
-            m_vps = static_cast<float>(static_cast<double>(tick - m_rateTick) / secs);
-            m_rateStartNs = now;
-            m_rateTick = tick;
-            m_rateFrames = 0;
-            char text[64];
-            std::snprintf(text, sizeof(text), "%.0f FPS / %.0f VPS", m_fps, m_vps);
-            ps2host::setWindowTitleSuffix(text);
-        }
-    }
-
-    if (!m_visible && !m_showRate)
-    {
-        return;
-    }
-
-    if (!ps2host::imguiBeginFrame())
-        return;
-
-    if (m_showRate)
-    {
-        ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f));
-        ImGui::SetNextWindowBgAlpha(0.6f);
-        ImGui::Begin("##rate", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
-                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
-        ImGui::Text("%.0f FPS  %.0f VPS", m_fps, m_vps);
-        ImGui::End();
-    }
-    if (!m_visible)
-    {
-        ps2host::imguiEndFrame();
         return;
     }
 

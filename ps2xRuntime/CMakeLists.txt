@@ -130,6 +130,58 @@ else()
         # Vulkan entry points come from the GS backend's loader, never from a linked vulkan-1.
         target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES)
         target_link_libraries(imgui PUBLIC SDL3::SDL3-static Vulkan::Headers)
+
+        # Player config (TOML) and the RmlUi pause menu (FreeType font engine, all static).
+        FetchContent_Declare(
+            toml11
+            GIT_REPOSITORY https://github.com/ToruNiina/toml11.git
+            GIT_TAG v4.4.0
+            GIT_SHALLOW TRUE
+            GIT_SUBMODULES "" # tests/docs only; their paths are too long for Windows checkouts
+        )
+        set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+        set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+        set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+        set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+        set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            freetype
+            GIT_REPOSITORY https://github.com/freetype/freetype.git
+            GIT_TAG VER-2-13-3
+            GIT_SHALLOW TRUE
+            GIT_SUBMODULES ""
+        )
+        FetchContent_MakeAvailable(toml11 freetype)
+        if(NOT TARGET Freetype::Freetype)
+            add_library(Freetype::Freetype ALIAS freetype)
+        endif()
+
+        set(PS2X_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)
+        set(RMLUI_LUA_BINDINGS OFF CACHE BOOL "" FORCE)
+        set(RMLUI_SVG_PLUGIN OFF CACHE BOOL "" FORCE)
+        set(RMLUI_LOTTIE_PLUGIN OFF CACHE BOOL "" FORCE)
+        set(RMLUI_HARFBUZZ_SAMPLE OFF CACHE BOOL "" FORCE)
+        set(RMLUI_FONT_ENGINE "freetype" CACHE STRING "" FORCE)
+        FetchContent_Declare(
+            rmlui
+            GIT_REPOSITORY https://github.com/mikke89/RmlUi.git
+            GIT_TAG 6.3
+            GIT_SHALLOW TRUE
+            GIT_SUBMODULES ""
+        )
+        FetchContent_MakeAvailable(rmlui)
+        set(BUILD_SHARED_LIBS ${PS2X_SAVED_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+
+        # Menu font: imgui's Roboto, embedded so the exe needs no loose file.
+        set(PS2X_MENU_FONT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/ps2_menu_font.h")
+        if(NOT EXISTS "${PS2X_MENU_FONT_HEADER}")
+            file(READ "${PS2X_IMGUI_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf" PS2X_FONT_HEX HEX)
+            string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," PS2X_FONT_HEX "${PS2X_FONT_HEX}")
+            file(WRITE "${PS2X_MENU_FONT_HEADER}"
+                "#pragma once\nstatic const unsigned char kPs2xMenuFont[] = {${PS2X_FONT_HEX}};\n")
+        endif()
     endif()
 endif()
 
@@ -519,8 +571,16 @@ if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2_runtime PRIVATE
         src/lib/host/ps2_host_sdl.cpp
         src/lib/host/ps2_vk_presenter.cpp
+        src/lib/host/ps2_input.cpp
+        src/lib/host/ps2_menu.cpp
+        src/lib/ps2_user_config.cpp
     )
-    target_include_directories(ps2_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/host)
+    target_include_directories(ps2_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/host
+        ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(ps2_runtime PUBLIC toml11::toml11 RmlUi::Core)
+    # Portuguese UI literals: UTF-8 source, kept out of unity batches so /utf-8 stays per file.
+    set_source_files_properties(src/lib/host/ps2_input.cpp src/lib/host/ps2_menu.cpp PROPERTIES
+        COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:MSVC>:/utf-8>" SKIP_UNITY_BUILD_INCLUSION TRUE)
 endif()
 if(UNIX AND NOT PS2X_IS_VITA)
     target_link_libraries(ps2_runtime PUBLIC ${CMAKE_DL_LIBS})

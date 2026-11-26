@@ -101,6 +101,7 @@ struct VkPresenter::Impl
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSurfaceFormatKHR format{};
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR unsyncedMode = VK_PRESENT_MODE_FIFO_KHR; // best non-vsync mode the surface offers
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D extent{};
     std::vector<VkImage> images;
@@ -588,14 +589,11 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
     std::vector<VkPresentModeKHR> modes(count);
     p.vk.vkGetPhysicalDeviceSurfacePresentModesKHR(p.physicalDevice, p.surface, &count, modes.data());
     auto has = [&](VkPresentModeKHR mode) { return std::find(modes.begin(), modes.end(), mode) != modes.end(); };
-    p.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    if (!vsync)
-    {
-        if (has(VK_PRESENT_MODE_MAILBOX_KHR))
-            p.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-        else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
-            p.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    }
+    if (has(VK_PRESENT_MODE_MAILBOX_KHR))
+        p.unsyncedMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
+        p.unsyncedMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    p.presentMode = vsync ? VK_PRESENT_MODE_FIFO_KHR : p.unsyncedMode;
 
     VkAttachmentDescription att{};
     att.format = p.format.format;
@@ -804,6 +802,16 @@ bool VkPresenter::imguiInit()
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     p.imgui = ImGui_ImplVulkan_Init(&info);
     return p.imgui;
+}
+
+void VkPresenter::setVsync(bool vsync)
+{
+    const VkPresentModeKHR mode = vsync ? VK_PRESENT_MODE_FIFO_KHR : m->unsyncedMode;
+    if (mode == m->presentMode)
+        return;
+    m->presentMode = mode;
+    m->vsync = vsync;
+    m_resizePending = true; // the next present recreates the swapchain with the new mode
 }
 
 void VkPresenter::imguiNewFrame()
