@@ -845,3 +845,19 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void sifStubStateIo(ps2x::state::Archive &ar)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
+            ar(g_nextSifDmaTransferId);
+        }
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        ar(g_sifRegs, g_sifSregs, g_sifCmdHandlers, g_sifCmdBuffer, g_sifSysCmdBuffer, g_sifCmdInitialized);
+    }
+}

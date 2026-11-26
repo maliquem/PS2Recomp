@@ -2,6 +2,8 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "ps2x/state_archive.h"
+#include "runtime/ps2_pacing.h"
 
 #include <algorithm>
 #include <cassert>
@@ -169,6 +171,10 @@ void EeScheduler::run()
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
+        }
+        if (m_safePointHook)
+        {
+            m_safePointHook();
         }
 
         if (m_currentThreadId == 0)
@@ -1525,6 +1531,11 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
         std::move(completion)});
 }
 
+[[noreturn]] void EeScheduler::waitVSyncResumeAt(uint64_t afterTick, int fixedResult, uint32_t resumePc)
+{
+    blockCurrent(EeWaitState{EeWaitReason::VSync, EeVSyncWait{afterTick, fixedResult, resumePc}, {}});
+}
+
 void EeScheduler::completeVSync(uint64_t tick)
 {
     assertExecutor();
@@ -1891,8 +1902,14 @@ void EeScheduler::blockCurrent(EeWaitState wait)
 void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
 {
     auto completion = std::move(item.wait.completion);
+    const EeVSyncWait *vsyncWait = std::get_if<EeVSyncWait>(&item.wait.payload);
+    const uint32_t resumePc = vsyncWait ? vsyncWait->resumePc : 0u;
     item.wait = {};
     setReturnS32(&item.activeContext(), result);
+    if (resumePc != 0u)
+    {
+        item.activeContext().pc = resumePc;
+    }
     item.resumeCompletion = std::move(completion);
     if (item.suspendCount != 0)
     {
@@ -2050,14 +2067,16 @@ void EeScheduler::processDueDeadlines()
             {
                 auto hostDeadline = scheduled.hostDeadline;
                 const auto now = std::chrono::steady_clock::now();
-                // Keep guest cycles intact without replaying overdue fields faster than real time.
-                if (now - hostDeadline >= kVBlankPeriod)
+                const auto hostPeriod = ps2x::pacing::scaleHostWait(kVBlankPeriod);
+                // Keep guest cycles intact without replaying overdue fields faster than real time
+                // (turbo shortens the period; unlimited speed never waits).
+                if (now - hostDeadline >= hostPeriod)
                     hostDeadline = now;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              hostDeadline + kVBlankDuration,
+                              hostDeadline + ps2x::pacing::scaleHostWait(kVBlankDuration),
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              hostDeadline + kVBlankPeriod,
+                              hostDeadline + hostPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2234,7 +2253,8 @@ void EeScheduler::waitForEvent()
     }
     if (hasTimerDeadline)
     {
-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+        const auto timerHostDeadline = std::chrono::steady_clock::now() +
+                                       ps2x::pacing::scaleHostWait(eeCyclesToHostDuration(timerCycles));
         if (timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
@@ -2348,5 +2368,99 @@ void EeScheduler::publishIdleDebugContext()
     if (selected)
     {
         publishDebugContext(selected->activeContext());
+    }
+}
+
+namespace ps2x::state
+{
+    static void io(Archive &ar, GuestInvocation &v)
+    {
+        ar(v.kind, v.sequence, v.tag, v.context);
+        if (ar.loading())
+            v.onComplete = {};
+    }
+
+    static void io(Archive &ar, GuestThread &v)
+    {
+        ar(v.id, v.context, v.entry, v.stack, v.stackSize, v.gp, v.attr, v.option, v.arg,
+           v.initialPriority, v.currentPriority, v.status, v.suspendCount, v.wakeupCount, v.ownsStack,
+           v.tlsBase, v.wait.reason, v.wait.payload, v.invocations);
+        if (ar.loading())
+        {
+            v.wait.completion = {};
+            v.resumeCompletion = {};
+        }
+    }
+
+    static void io(Archive &ar, EeSemaphore &v)
+    {
+        ar(v.id, v.count, v.maxCount, v.initCount, v.attr, v.option, v.waiters);
+    }
+
+    static void io(Archive &ar, EeEventFlag &v)
+    {
+        ar(v.id, v.attr, v.option, v.initBits, v.bits, v.waiters);
+    }
+}
+
+bool EeScheduler::stateQuiescent() const
+{
+    for (const auto &[id, thread] : m_threads)
+    {
+        if (thread.wait.completion || thread.resumeCompletion)
+            return false;
+        for (const GuestInvocation &invocation : thread.invocations)
+        {
+            if (invocation.onComplete)
+                return false;
+        }
+    }
+    std::lock_guard lock(m_eventMutex);
+    for (const GuestInvocation &invocation : m_pendingInvocations)
+    {
+        if (invocation.onComplete)
+            return false;
+    }
+    return true;
+}
+
+void EeScheduler::stateIo(ps2x::state::Archive &ar)
+{
+    assertExecutor();
+    if (!ar.loading() && !stateQuiescent())
+        throw std::runtime_error("EE host continuation pending");
+
+    ar(m_readyQueues, m_threads, m_semaphores, m_eventFlags, m_alarms, m_intcHandlers, m_dmacHandlers,
+       m_nextThreadId, m_nextInvocationThreadId, m_nextSemaphoreId, m_nextEventFlagId, m_nextAlarmId,
+       m_nextIntcHandlerId, m_nextDmacHandlerId, m_intcHeadOrder, m_intcTailOrder, m_dmacHeadOrder,
+       m_dmacTailOrder, m_enabledIntcMask, m_enabledDmacMask, m_currentThreadId, m_rescheduleRequested,
+       m_timeSliceExpired, m_insideInterrupt, m_pendingEeTimerInterrupts, m_eeCycle, m_sliceEndCycle,
+       m_checkpointPending, m_invocationSequence, m_vsyncTick, m_vsyncFlagAddress, m_vsyncTickAddress,
+       m_gsVSyncCallback, m_gsVSyncCallbackGp, m_gsVSyncCallbackSp, m_invocationStackTops,
+       m_spinProbeCountdown);
+
+    {
+        std::lock_guard lock(m_eventMutex);
+        ar(m_events, m_pendingInvocations, m_eventSequence);
+        // Host deadlines are kept relative to now, so pacing continues from the moment of loading.
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t count = ar.size(m_deadlines.size());
+        if (ar.loading())
+            m_deadlines.assign(static_cast<size_t>(count), ScheduledEvent{});
+        for (ScheduledEvent &deadline : m_deadlines)
+        {
+            int64_t hostOffsetNs = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.hostDeadline - now).count();
+            ar(deadline.deadlineCycle, hostOffsetNs, deadline.event, deadline.sequence);
+            if (ar.loading())
+                deadline.hostDeadline = now + std::chrono::nanoseconds(hostOffsetNs);
+        }
+        if (ar.loading())
+            updateNextDeadline();
+    }
+
+    if (ar.loading())
+    {
+        m_debugPublishCountdown = 0u;
+        publishSnapshot();
     }
 }

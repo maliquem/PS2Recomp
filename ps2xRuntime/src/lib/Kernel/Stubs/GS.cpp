@@ -1539,3 +1539,14 @@ namespace ps2_stubs
         setReturnU32(ctx, terminatePacketBuilderState(rdram, ctx, runtime));
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void gsStubStateIo(ps2x::state::Archive &ar)
+    {
+        ar(g_gparam);
+    }
+}

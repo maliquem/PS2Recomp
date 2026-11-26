@@ -7,6 +7,8 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_vulkan_backend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_pacing.h"
+#include "runtime/ps2_savestate.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -2313,12 +2315,7 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
     const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
     const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
-    m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
-                             0,
-                             [resumePc](R5900Context &context)
-                             {
-                                 context.pc = resumePc;
-                             });
+    m_eeScheduler->waitVSyncResumeAt(currentTick + waitTicks - 1u, 0, resumePc);
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)
@@ -2462,6 +2459,7 @@ void PS2Runtime::run()
 #endif
 
     std::atomic<bool> gameThreadFinished{false};
+    ps2x::savestate::install(*this);
 
     std::thread gameThread([&]()
                            {
@@ -2488,6 +2486,7 @@ void PS2Runtime::run()
     const auto elfName = getIoPaths().elfPath.filename().string();
     const bool useFullMpegFrame = elfName == "SLUS_203.47" || elfName == "slus_203.47";
     uint64_t tick = 0;
+    uint32_t undrawnHostFrames = 0u;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2529,19 +2528,37 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+        ps2x::savestate::onHostFrame(*this);
         ps2host::beginFrame();
-        const bool freshField = LatchHostFrame(this, hostLatch, useFullMpegFrame);
+        // Turbo frameskip: level 1 skips presents; level 2 latches only a frame the GS drew in full
+        // (a few host frames at most, so a game that stopped flipping still shows).
+        const bool skipPresent = ps2x::savestate::skipPresent();
+        bool freshField = false;
+        if (!skipPresent)
+        {
+            if (ps2x::pacing::g_frameskipDisplayDrawn.load(std::memory_order_acquire) || ++undrawnHostFrames > 4u)
+            {
+                undrawnHostFrames = 0u;
+                ps2x::pacing::g_frameskipDisplayDrawn.store(true, std::memory_order_relaxed);
+                freshField = LatchHostFrame(this, hostLatch, useFullMpegFrame);
+                if (freshField)
+                    ps2x::pacing::g_frameskipLatched.store(true, std::memory_order_release);
+            }
+            else
+            {
+                ps2x::pacing::g_frameskipWant.store(true, std::memory_order_release);
+            }
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        if (ps2host::gpuPresent())
+        if (!skipPresent)
         {
-            ps2host::presentGpuFrame(hostLatch.gpu, freshField);
-        }
-        else
-        {
-            ps2host::presentPixels(hostLatch.pixels.data(), hostLatch.width, hostLatch.width, hostLatch.height, freshField);
+            if (ps2host::gpuPresent())
+                ps2host::presentGpuFrame(hostLatch.gpu, freshField);
+            else
+                ps2host::presentPixels(hostLatch.pixels.data(), hostLatch.width, hostLatch.width, hostLatch.height, freshField);
         }
         ps2host::waitNextFrame();
 #else

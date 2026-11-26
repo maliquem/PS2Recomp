@@ -1076,14 +1076,18 @@ namespace ps2_stubs
         setReturnU32(ctx, 0u);
     }
 
+    // Same LCG as the MSVC CRT rand() used before, but with a state the save state can carry.
+    uint32_t g_randState = 1u;
+
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, std::rand() & 0x7FFF);
+        g_randState = g_randState * 214013u + 2531011u;
+        setReturnS32(ctx, static_cast<int32_t>((g_randState >> 16) & 0x7FFFu));
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::srand(getRegU32(ctx, 4));
+        g_randState = getRegU32(ctx, 4);
         setReturnS32(ctx, 0);
     }
 
@@ -1188,4 +1192,21 @@ namespace ps2_stubs
         setReturnU64(ctx, static_cast<uint64_t>(num / den));
     }
 
+}
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void libcStubStateIo(ps2x::state::Archive &ar)
+    {
+        if (!ar.loading())
+        {
+            std::lock_guard<std::mutex> lock(g_file_mutex);
+            if (!g_file_map.empty())
+                throw std::runtime_error("a host file is open (fopen)");
+        }
+        ar(g_randState, g_next_file_handle);
+    }
 }

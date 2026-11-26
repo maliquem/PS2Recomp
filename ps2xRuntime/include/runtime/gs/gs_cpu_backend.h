@@ -32,6 +32,7 @@ public:
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
+    void stateIo(ps2x::state::Archive &ar) override;
 
 private:
     void ResetUnlocked();

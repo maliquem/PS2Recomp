@@ -542,7 +542,7 @@ bool GSVulkanBackend::initVulkan(std::string *outReason)
                       ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       ps2vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
         !createBuffer(m_clutGpu, kClutBytes,
-                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       ps2vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
         !createBuffer(m_presentOut, kPresentBytes,
                       ps2vk::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | ps2vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,

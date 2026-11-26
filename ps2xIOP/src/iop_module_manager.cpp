@@ -3,6 +3,7 @@
 #include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -176,5 +177,10 @@ namespace ps2x::iop::detail
             --found->second;
         else
             m_loadedKeyReferences.erase(found);
+    }
+
+    void IopModuleManager::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_records, m_hleIdsByKey, m_loadedKeyReferences, m_nextHleId);
     }
 }

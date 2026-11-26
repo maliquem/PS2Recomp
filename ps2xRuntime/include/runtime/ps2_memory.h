@@ -22,6 +22,10 @@
 #endif
 
 class GS;
+namespace ps2x::state
+{
+    class Archive;
+}
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
@@ -271,6 +275,8 @@ public:
 
     // Initialize memory
     bool initialize(size_t ramSize = PS2_RAM_SIZE);
+    // Save state (Kernel/SaveState.cpp). GS VRAM is saved by the GS backend.
+    void stateIo(ps2x::state::Archive &ar);
 
     // Memory access methods
     uint8_t *getRDRAM() { return m_rdram; }
@@ -418,6 +424,8 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        template <class A>
+        void stateIo(A &ar) { ar(fromScratchpad, srcAddr, qwc, chainData); }
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;

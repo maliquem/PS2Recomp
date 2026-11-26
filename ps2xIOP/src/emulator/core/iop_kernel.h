@@ -6,6 +6,11 @@
 #include <cstdint>
 #include <map>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopMemory;
@@ -67,6 +72,9 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         struct Semaphore

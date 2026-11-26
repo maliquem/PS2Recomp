@@ -39,6 +39,11 @@ struct PS2VfsDescriptorInfo
     std::string path;
 };
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 class IPS2OpenFile
 {
 public:
@@ -67,6 +72,8 @@ public:
     [[nodiscard]] bool stat(std::string_view path, const PS2VfsMounts &mounts, const PS2RomDevice &rom, PS2VfsStat &result) const;
     [[nodiscard]] bool resolveHostPath(std::string_view path, const PS2VfsMounts &mounts, std::filesystem::path &result) const;
     [[nodiscard]] std::vector<PS2VfsDescriptorInfo> descriptors() const;
+    // Save state (Kernel/SaveState.cpp): refuses to save while a guest file is open.
+    void stateIo(ps2x::state::Archive &ar);
 
 private:
     struct OpenDescriptor

@@ -10,6 +10,11 @@
 
 #include "spu2_synth.h"
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopMemory
@@ -82,6 +87,9 @@ namespace ps2x::iop::detail
         void setHardwareRegister32(uint32_t address, uint32_t value) { m_hardware[address] = value; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;

@@ -1633,8 +1633,11 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
-        recordDrawDebugEventUnlocked(needed);
+        if (!frameskipDropsDraw(batch))
+        {
+            m_backend->Submit(batch);
+            recordDrawDebugEventUnlocked(needed);
+        }
     }
 
     switch (m_prim.type)

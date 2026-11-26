@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -345,5 +346,10 @@ namespace ps2x::iop::detail
     {
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
+    }
+
+    void IopRpcBridge::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_servers, m_nextDmaId, m_sifInitialized);
     }
 }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <utility>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -191,5 +192,10 @@ namespace ps2x::iop::detail
             else
                 ++library;
         }
+    }
+
+    void IopImportRegistry::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_libraries);
     }
 }

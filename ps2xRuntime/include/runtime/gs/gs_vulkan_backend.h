@@ -52,6 +52,7 @@ public:
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
+    void stateIo(ps2x::state::Archive &ar) override;
 
 private:
     struct GpuBuffer
@@ -206,6 +207,7 @@ private:
     bool submitPresentUnlocked(const PresentPush &presentPush, uint32_t presentHeight) const;
     void syncGpuToCpuUnlocked() const;
     void syncCpuToGpuUnlocked();
+    void readClutUnlocked(uint8_t *out) const;
     PresentationFrame presentImpl(const GSPresentationRequest &request, GSGpuFrame *gpuOut);
     PresentationFrame presentCpuFallbackUnlocked(const GSPresentationRequest &request, GSGpuFrame *gpuOut);
 

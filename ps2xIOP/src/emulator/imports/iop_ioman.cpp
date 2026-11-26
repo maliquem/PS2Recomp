@@ -5,6 +5,7 @@
 #include "../services/iop_rpc.h"
 
 #include <algorithm>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -87,5 +88,10 @@ namespace ps2x::iop::detail
         default:
             return false;
         }
+    }
+
+    void IopIoman::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_devices);
     }
 }
