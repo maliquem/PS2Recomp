@@ -271,7 +271,9 @@ namespace ps2x::iop::detail
         m_rawRegs.fill(0u);
         for (uint32_t c = 0; c < kCoreCount; ++c)
         {
+            const uint8_t inputBus = m_cores[c].inputBus;
             m_cores[c] = Core{};
+            m_cores[c].inputBus = inputBus;
             // Power-on values (PCSX2 V_Core::Init): every gate open except the external input,
             // an empty reverb area at the top of the core's megabyte, input volumes at full.
             raw(c, kMmix) = c ? 0xFFCu : 0xFF0u;

@@ -183,6 +183,7 @@ struct PS2AudioBackend::Impl
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
+    ps2x::audio::loadSettings();
 }
 
 PS2AudioBackend::~PS2AudioBackend()

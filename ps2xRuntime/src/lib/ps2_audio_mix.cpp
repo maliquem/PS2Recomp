@@ -1,6 +1,7 @@
 // Host side of the SPU2 output (runtime/ps2_audio_mix.h).
 
 #include "runtime/ps2_audio_mix.h"
+#include "ps2_user_config.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +24,48 @@ namespace ps2x::audio
         constexpr uint32_t kLimiterHold = 480u;           // 10 ms: covers the gap between peaks down to 50 Hz
         // Music FIFO target while it runs on the wall clock: the prebuffer plus one device period.
         constexpr double kMusicTarget = static_cast<double>(OutputMixer::kPrebufferFrames) + 1024.0;
+    }
+
+    namespace
+    {
+        constexpr const char *kVolumeKeys[1 + kBusCount] = {"audio.volume", "audio.effects", "audio.music", "audio.voice", "audio.video"};
+        std::array<int, 1 + kBusCount> g_volumePercent{100, 100, 100, 100, 100};
+
+        void applyVolume(int index, int percent)
+        {
+            percent = std::clamp(percent, 0, 100);
+            g_volumePercent[static_cast<size_t>(index)] = percent;
+            const float gain = static_cast<float>(percent * percent) / 10000.0f; // squared: 50 % sounds like half
+            (index == 0 ? g_masterGain : g_busGain[static_cast<size_t>(index - 1)]).store(gain, std::memory_order_relaxed);
+        }
+    }
+
+    void loadSettings()
+    {
+        for (int i = 0; i <= kBusCount; ++i)
+            applyVolume(i, ps2cfg::getInt(kVolumeKeys[i], 100));
+        g_musicWallClock.store(ps2cfg::envBool("PS2X_MUSIC_TURBO", "audio.music_normal_speed_in_turbo", true), std::memory_order_relaxed);
+    }
+
+    int volumePercent(int index)
+    {
+        return index >= 0 && index <= kBusCount ? g_volumePercent[static_cast<size_t>(index)] : 0;
+    }
+
+    void setVolumePercent(int index, int percent)
+    {
+        if (index < 0 || index > kBusCount)
+            return;
+        applyVolume(index, percent);
+        ps2cfg::setInt(kVolumeKeys[index], g_volumePercent[static_cast<size_t>(index)]);
+        ps2cfg::save();
+    }
+
+    void setMusicWallClock(bool on)
+    {
+        g_musicWallClock.store(on, std::memory_order_relaxed);
+        ps2cfg::setBool("audio.music_normal_speed_in_turbo", on);
+        ps2cfg::save();
     }
 
     bool musicOnWallClock(uint32_t speedPercent)

@@ -35,6 +35,13 @@ namespace ps2x::audio
     // sequencer to repeat ticks; upgrade when a game ships slow motion as a feature.
     bool musicOnWallClock(uint32_t speedPercent);
 
+    // Player settings, [audio] in ps2x_player.toml. Volumes in percent (0..100, the gain is its
+    // square); index 0 is the master, 1 + bus the bus. The setters apply and save. Main thread.
+    void loadSettings(); // PS2X_MUSIC_TURBO=0/1 wins over the file for the music clock
+    [[nodiscard]] int volumePercent(int index);
+    void setVolumePercent(int index, int percent);
+    void setMusicWallClock(bool on);
+
     // Host side of the SPU2 output: one FIFO per bus, a prebuffer that refills after an underrun (one
     // clean gap instead of a crackle), the stream rate that keeps the fill level on target, and the
     // final mix (per-bus volume, float sum, limiter only above full scale). At volume 1 and below full

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <optional>
 #include <span>
@@ -80,9 +81,24 @@ namespace ps2x::iop::detail
             uint32_t entry = 0;
             uint32_t gp = 0;
             bool resident = false;
+            uint64_t hash = 0; // FNV-1a of the IRX file, what code hooks are keyed by
 
             template <class A>
-            void stateIo(A &ar) { ar(id, path, name, base, size, entry, gp, resident); }
+            void stateIo(A &ar) { ar(id, path, name, base, size, entry, gp, resident, hash); }
+        };
+
+        struct CodeHookEntry
+        {
+            uint64_t imageHash = 0;
+            uint32_t offset = 0;
+            CodeHook hook;
+        };
+
+        struct ActiveCodeHook
+        {
+            uint32_t address = 0; // physical
+            uint32_t moduleBase = 0;
+            size_t entry = 0; // index into codeHooks
         };
 
         struct GuestCallback
@@ -138,6 +154,7 @@ namespace ps2x::iop::detail
             memory.reset();
             kernel.reset();
             modules.clear();
+            rebuildCodeHooks();
             imports.reset();
             rpc.reset();
             cdvd.reset();
@@ -263,6 +280,8 @@ namespace ps2x::iop::detail
                     continue;
                 audioChunkFrames = 0u;
                 nextAudioCycle += kAudioChunkCycles;
+                // The music bus follows the host's clock (1.0 unless the game runs faster than real time).
+                spu2.setMusicRatio(static_cast<uint32_t>(std::lround(std::clamp(host.spu2MusicRatio(), 0.0, 1.0) * 65536.0)));
 
                 for (int c = 0; c < 2; ++c)
                 {
@@ -511,6 +530,8 @@ namespace ps2x::iop::detail
             }
             if (checkInterrupt(cpu))
                 return true;
+            if (physicalAddress(cpu.pc) - codeHookLow < codeHookSpan)
+                runCodeHooks(cpu);
 
             if (const auto import = imports.decode(cpu.pc))
             {
@@ -533,6 +554,47 @@ namespace ps2x::iop::detail
             if (totalCycles >= nextSampleCycle())
                 advanceSpu2Audio();
             return running;
+        }
+
+        // The hooks of the modules loaded now, as addresses. Call whenever `modules` or `codeHooks` change.
+        void rebuildCodeHooks()
+        {
+            activeCodeHooks.clear();
+            uint32_t low = UINT32_MAX;
+            uint32_t high = 0u;
+            for (const auto &[id, module] : modules)
+            {
+                for (size_t i = 0; i < codeHooks.size(); ++i)
+                {
+                    if (codeHooks[i].imageHash != module.hash || codeHooks[i].offset >= module.size)
+                        continue;
+                    const uint32_t address = physicalAddress(module.base + codeHooks[i].offset);
+                    activeCodeHooks.push_back({address, module.base, i});
+                    low = std::min(low, address);
+                    high = std::max(high, address);
+                }
+            }
+            codeHookLow = activeCodeHooks.empty() ? 0u : low;
+            codeHookSpan = activeCodeHooks.empty() ? 0u : high - low + 1u;
+        }
+
+        void runCodeHooks(CpuState &cpu)
+        {
+            const uint32_t address = physicalAddress(cpu.pc);
+            // shortcut: linear scan, right for the handful of hooks a profile has; index by address
+            // if one ever needs dozens.
+            for (const ActiveCodeHook &active : activeCodeHooks)
+            {
+                if (active.address != address)
+                    continue;
+                CodeHookContext context{cpu.gpr.data(), cpu.pc, active.moduleBase};
+                codeHooks[active.entry].hook(context);
+                if (context.pc != cpu.pc)
+                {
+                    cpu.pc = context.pc; // the hook sent execution elsewhere
+                    return;
+                }
+            }
         }
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
@@ -768,6 +830,9 @@ namespace ps2x::iop::detail
             module.size = loaded.size;
             module.entry = loaded.entry;
             module.gp = loaded.gp;
+            module.hash = 0xcbf29ce484222325ull;
+            for (const uint8_t byte : image)
+                module.hash = (module.hash ^ byte) * 0x100000001b3ull;
 
             uint32_t args = 0u;
             if (arguments && argumentSize)
@@ -786,11 +851,13 @@ namespace ps2x::iop::detail
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
             modules[module.id] = std::move(module);
+            rebuildCodeHooks();
 
             std::ostringstream out;
             out << "[IOP] loaded IRX id=" << result.moduleId
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
+                << " hash=0x" << modules[result.moduleId].hash
                 << " start=" << std::dec << result.startResult;
             log(LogLevel::Info, out.str());
             return result;
@@ -827,6 +894,7 @@ namespace ps2x::iop::detail
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
             modules.erase(it);
+            rebuildCodeHooks();
             kernel.cleanupDeadThreads();
             if (result)
                 *result = 0;
@@ -850,6 +918,10 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
+        std::vector<CodeHookEntry> codeHooks; // registered by the game profile, kept across reset()
+        std::vector<ActiveCodeHook> activeCodeHooks;
+        uint32_t codeHookLow = 0u; // physical address range of the active hooks; span 0 = none
+        uint32_t codeHookSpan = 0u;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
@@ -898,6 +970,29 @@ namespace ps2x::iop::detail
            d.totalCycles, d.idleUntil, d.totalInstructions, d.eeCycleCarry, d.cycleOvershoot,
            d.nextAudioCycle, d.audioChunkFrames, d.audioStreamActive, d.autoDma,
            d.secrMcCommandHandler, d.secrMcDevIdHandler, d.checkKelfPathCallback);
+        if (ar.loading())
+            d.rebuildCodeHooks();
+    }
+
+    void IopEmulator::addCodeHook(uint64_t imageHash, uint32_t offset, CodeHook hook)
+    {
+        m_impl->codeHooks.push_back({imageHash, offset, std::move(hook)});
+        m_impl->rebuildCodeHooks();
+    }
+
+    void IopEmulator::setSpu2VoiceBus(int core, uint32_t voice, int bus)
+    {
+        m_impl->memory.spu2().setVoiceBus(core, voice, bus);
+    }
+
+    void IopEmulator::setSpu2InputBus(int core, int bus)
+    {
+        m_impl->memory.spu2().setInputBus(core, bus);
+    }
+
+    uint32_t IopEmulator::spu2BusSamples(int bus) const noexcept
+    {
+        return bus >= 0 && bus < Spu2Synth::kBusCount ? m_impl->memory.spu2().busSamples(bus) : 0u;
     }
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)

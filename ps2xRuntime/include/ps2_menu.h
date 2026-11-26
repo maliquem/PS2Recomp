@@ -1,7 +1,7 @@
 #pragma once
 
 // Pause menu (RmlUi, drawn over the game after the scene). Opened by Esc on the keyboard, Guide (or Back+Start)
-// on a controller. Built-in sections: Controller, Keyboard, Display, System.
+// on a controller. Built-in sections: Controller, Keyboard, Display, Audio, System.
 //
 // Other parts of the runtime add their own sections and options from code, on the main thread, before or after
 // the window opens (for example right after ps2host::openWindow):

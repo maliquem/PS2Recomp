@@ -48,6 +48,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t threadCount() const noexcept;
         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
 
+        // See IopSubsystem.
+        void addCodeHook(uint64_t imageHash, uint32_t offset, CodeHook hook);
+        void setSpu2VoiceBus(int core, uint32_t voice, int bus);
+        void setSpu2InputBus(int core, int bus);
+        [[nodiscard]] uint32_t spu2BusSamples(int bus) const noexcept;
+
         // Save state: saves or restores the guest-visible state (same executable only).
         void stateIo(ps2x::state::Archive &ar);
 

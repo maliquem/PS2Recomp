@@ -59,9 +59,12 @@ namespace ps2x::iop::detail
         // AutoDMA: the core's PCM input for its next 256 samples (1024 bytes: 256 left, 256 right).
         void setInputBlock(int core, const uint8_t *block1024);
 
-        // Bus the voice plays on from its next key-on, and the bus of a core's PCM input.
+        // Bus the voice plays on from its next key-on, and the bus of a core's PCM input (a setting
+        // of the host: reset() keeps it).
         void setVoiceBus(int core, uint32_t voice, int bus);
         void setInputBus(int core, int bus);
+        // Samples the bus has advanced since reset (wraps).
+        [[nodiscard]] uint32_t busSamples(int bus) const noexcept { return m_busTicks[static_cast<size_t>(bus)]; }
         // Music-bus ticks per sample tick, 16.16 fixed point, at most 1.0 (0x10000 = the hardware).
         void setMusicRatio(uint32_t ratioQ16) noexcept { m_musicRatio = ratioQ16 < 0x10000u ? ratioQ16 : 0x10000u; }
 
