@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -1406,6 +1407,17 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vu0_vf[13]") != std::string::npos, "S1 q/i source should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[4]") != std::string::npos, "S1 q/i destination should come from sa");
             t.IsTrue(out.find("ctx->vu0_vf[25]") == std::string::npos, "S1 q/i must not use rs(format) as register index");
+        });
+
+        tc.Run("VU0 VCLIPw sets the +plane bit before the -plane bit and compares with |w|", [](TestCase &t) {
+            // Shadow Hearts' Gsx::GsClipRmVertex masks the clip flags with 0xA95 (x,y,z > 4095 or < 0).
+            const Instruction inst = R5900Decoder().decodeInstruction(0x2fc70c, 0x4BC121FFu); // vclipw.xyz vf4, vf1w
+            const std::string code = CodeGenerator({}, {}).translateInstruction(inst);
+            t.IsTrue(code.find("((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1)") != std::string::npos,
+                     "bit 0 is +x (x > |w|), bit 1 is -x: " + code);
+            t.IsTrue(code.find("((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3)") != std::string::npos,
+                     "bit 4 is +z, bit 5 is -z: " + code);
+            t.IsTrue(code.find("_mm_set1_epi32(0x7FFFFFFF)") != std::string::npos, "the clip plane is |w|: " + code);
         });
 
         tc.Run("VU0 destination MADD and MSUB forms preserve ACC", [](TestCase &t) {
