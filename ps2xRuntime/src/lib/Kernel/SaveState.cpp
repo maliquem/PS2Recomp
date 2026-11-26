@@ -740,7 +740,7 @@ namespace ps2x::savestate
             {
                 if (now - s.requestSince < kQuiescenceTimeout)
                     return;
-                const char *why = rt.stateBusy();
+                const char *why = op == static_cast<int>(Op::Save) ? rt.stateBusy() : nullptr; // its reasons only block saves
                 say(std::string(op == static_cast<int>(Op::Save) ? "Save" : "Load") + " failed: the game is busy (" +
                     (why ? why : "inside a system call") + "), try again");
             }

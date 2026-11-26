@@ -81,8 +81,9 @@ namespace
         uint32_t backFbp = 0;
         bool dropCurrent = false;
         bool hadDrops = false; // the frame in the back buffer lost draws
-        bool readsBack = false; // the game reads the back buffer (texture or transfer): never drop into it
+        bool readsBack = false; // the game reads the back buffer (texture or transfer): never drop into it again
         uint32_t backRows = 512; // rows of the displayed frame buffer (DISPLAY height)
+        uint32_t backFbw = 10;   // width of the displayed frame buffer (DISPFB FBW, 64-pixel units)
         SkipPhase phase = SkipPhase::Drawing;
     };
 
@@ -100,12 +101,13 @@ namespace
         return std::clamp<uint32_t>(rows, 1u, 2048u);
     }
 
-    // Once per turbo: which read stopped the drops (turbo stats on stdout).
-    void noteReadsBack(int why, uint32_t blockAddress, uint32_t fbw)
+    // Once per run: which read stopped the drops (turbo stats on stdout). The read is only seen when it happens, so
+    // the draws dropped before it in that frame are lost; keeping readsBack for the whole run limits that to once.
+    void noteReadsBack(int why, uint32_t blockAddress)
     {
         if (!g_skip.readsBack)
             std::cout << "[frameskip] back buffer read (" << (why == 1 ? "texture" : "transfer") << "): block " << blockAddress
-                      << ", back fbp " << g_skip.backFbp << ", fbw " << fbw << ", rows " << g_skip.backRows << std::endl;
+                      << ", back fbp " << g_skip.backFbp << ", fbw " << g_skip.backFbw << ", rows " << g_skip.backRows << std::endl;
         g_skip.readsBack = true;
         ps2x::pacing::g_frameskipReadsBack.store(why, std::memory_order_relaxed);
     }
@@ -113,10 +115,10 @@ namespace
     // Counts PSMCT32 pages (32 rows): a 16-bit buffer is covered twice over, which only stops more drops.
     // shortcut: only reads of the back buffer are caught; a game that reads the buffer on display (feedback, screen
     // capture) after a swap of a frame that lost draws would see them missing. Widen it if a game does that.
-    bool readsBackBuffer(uint32_t blockAddress, uint32_t fbw)
+    bool readsBackBuffer(uint32_t blockAddress)
     {
         const uint32_t start = g_skip.backFbp * 32u;
-        const uint32_t pages = std::max<uint32_t>(fbw, 1u) * ((g_skip.backRows + 31u) / 32u);
+        const uint32_t pages = std::max<uint32_t>(g_skip.backFbw, 1u) * ((g_skip.backRows + 31u) / 32u);
         return g_skip.known && blockAddress >= start && blockAddress < start + pages * 32u;
     }
 }
@@ -124,8 +126,8 @@ namespace
 void GS::frameskipNoteTransfer(const GSTransferCommand &command) const
 {
     // Directions 1 (local to host) and 2 (local to local) read GS memory.
-    if ((command.direction == 1u || command.direction == 2u) && readsBackBuffer(command.bitbltbuf.sbp, command.bitbltbuf.sbw))
-        noteReadsBack(2, command.bitbltbuf.sbp, command.bitbltbuf.sbw);
+    if ((command.direction == 1u || command.direction == 2u) && readsBackBuffer(command.bitbltbuf.sbp))
+        noteReadsBack(2, command.bitbltbuf.sbp);
 }
 
 bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
@@ -136,15 +138,13 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
     const bool enabled = g_frameskipDraws.load(std::memory_order_relaxed);
     if (!enabled)
     {
-        // Turbo ended: draw everything now; a frame that already lost draws is still not latched.
+        // Turbo ended: draw everything now. Keep tracking swaps while a frame that lost draws is in the back buffer
+        // or on display; the swap after it (or the host's fallback) marks the display drawn again.
         g_skip.dropCurrent = false;
         g_skip.phase = SkipPhase::Drawing;
-        g_skip.readsBack = false;
-        g_frameskipReadsBack.store(0, std::memory_order_relaxed);
-        if (!g_skip.hadDrops)
+        if (!g_skip.hadDrops && g_frameskipDisplayDrawn.load(std::memory_order_acquire))
         {
             g_skip.known = false;
-            g_frameskipDisplayDrawn.store(true, std::memory_order_release); // nothing dropped: the host may latch
             return false;
         }
     }
@@ -158,6 +158,7 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
         g_skip.displayFbp = displayFbp;
         g_skip.backFbp = displayFbp;
         g_skip.backRows = displayRows(*m_privRegs);
+        g_skip.backFbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
         g_skip.dropCurrent = false;
         g_skip.phase = SkipPhase::Drawing;
     }
@@ -168,6 +169,7 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
         g_skip.backFbp = g_skip.displayFbp;
         g_skip.displayFbp = displayFbp;
         g_skip.backRows = displayRows(*m_privRegs);
+        g_skip.backFbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
         if (enabled)
         {
             g_frameskipSwaps.fetch_add(1u, std::memory_order_relaxed);
@@ -195,8 +197,8 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
     }
 
     const GSContext &context = batch.state.context;
-    if (batch.state.prim.tme && readsBackBuffer(context.tex0.tbp0, context.frame.fbw))
-        noteReadsBack(1, context.tex0.tbp0, context.frame.fbw);
+    if (batch.state.prim.tme && readsBackBuffer(context.tex0.tbp0))
+        noteReadsBack(1, context.tex0.tbp0);
     const bool drop = g_skip.dropCurrent && !g_skip.readsBack && context.frame.fbp == g_skip.backFbp;
     g_skip.hadDrops = g_skip.hadDrops || drop;
     if (enabled)

@@ -158,6 +158,7 @@ void register_ps2_savestate_tests()
         {
             using namespace ps2x::pacing;
             constexpr uint32_t kA = 0u, kB = 70u; // two display buffers (FBP units)
+            constexpr uint64_t kFbw = 10ull << 9; // DISPFB FBW: 640 pixels
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
             regs.display1 = 223ull << 44; // 224 rows: a 640x224 buffer is 70 pages, so B sits right after A
@@ -181,13 +182,13 @@ void register_ps2_savestate_tests()
             t.IsTrue(g_frameskipDisplayDrawn.load(), "off: the display counts as drawn");
 
             g_frameskipDraws.store(true);
-            regs.dispfb1 = kA;
+            regs.dispfb1 = kA | kFbw;
             t.IsFalse(draw(kB), "first frame is drawn");
             g_frameskipLatched.store(true); // the host took the frame on display
-            regs.dispfb1 = kB;              // swap: A is the back buffer now
+            regs.dispfb1 = kB | kFbw;              // swap: A is the back buffer now
             t.IsTrue(draw(kA), "after the latch, back-buffer draws are dropped");
             t.IsFalse(draw(kB + 200u), "other render targets are drawn");
-            regs.dispfb1 = kA; // swap with a frame that lost draws
+            regs.dispfb1 = kA | kFbw; // swap with a frame that lost draws
             t.IsTrue(draw(kB), "still dropping until the host asks");
             t.IsFalse(g_frameskipDisplayDrawn.load(), "a frame that lost draws is not latched");
 
@@ -198,10 +199,12 @@ void register_ps2_savestate_tests()
 
             g_frameskipDraws.store(false);
             t.IsFalse(draw(kA), "turbo off: drawn");
-            regs.dispfb1 = kB;
+            regs.dispfb1 = kB | kFbw;
             t.IsFalse(draw(kA), "turbo off: drawn after the swap");
+            t.IsFalse(draw(kA), "turbo off: drawn");
+            t.IsFalse(g_frameskipDisplayDrawn.load(), "turbo off: the frame that lost draws stays unlatched over more draws");
             t.IsFalse(g_frameskipDisplayDrawn.load(), "turbo off: the frame that lost draws is still not latched");
-            regs.dispfb1 = kA;
+            regs.dispfb1 = kA | kFbw;
             t.IsFalse(draw(kB), "turbo off: drawn");
             t.IsTrue(g_frameskipDisplayDrawn.load(), "turbo off: the next full frame is latched");
             t.IsFalse(draw(kB), "turbo off: back to idle");
