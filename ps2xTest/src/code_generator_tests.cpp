@@ -213,6 +213,8 @@ void register_code_generator_tests()
             {OPCODE_BGTZ, 0, "GPR_S64(ctx, 2) > 0"}, {OPCODE_BGTZL, 0, "GPR_S64(ctx, 2) > 0"},
             {OPCODE_REGIMM, REGIMM_BLTZ, "GPR_S64(ctx, 2) < 0"}, {OPCODE_REGIMM, REGIMM_BLTZL, "GPR_S64(ctx, 2) < 0"},
             {OPCODE_REGIMM, REGIMM_BGEZ, "GPR_S64(ctx, 2) >= 0"}, {OPCODE_REGIMM, REGIMM_BGEZL, "GPR_S64(ctx, 2) >= 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZAL, "GPR_S64(ctx, 2) < 0"}, {OPCODE_REGIMM, REGIMM_BLTZALL, "GPR_S64(ctx, 2) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZAL, "GPR_S64(ctx, 2) >= 0"}, {OPCODE_REGIMM, REGIMM_BGEZALL, "GPR_S64(ctx, 2) >= 0"},
         };
         for (const Case &c : cases)
         {
