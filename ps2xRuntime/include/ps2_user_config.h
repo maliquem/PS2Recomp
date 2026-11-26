@@ -8,7 +8,6 @@
 // Keys this runtime does not know are kept on save, so later stages can add their own.
 namespace ps2cfg
 {
-    std::string path();
 
     bool getBool(const char *key, bool def);
     int getInt(const char *key, int def);

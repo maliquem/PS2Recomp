@@ -36,5 +36,4 @@ namespace ps2menu
 
     bool isOpen();
     void close();
-    bool portuguese(); // menu language (ui.language, "auto" follows the system)
 }

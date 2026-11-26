@@ -46,6 +46,7 @@ pressure_ramp_ms = 0
 
     Value g_root{toml::ordered_table{}};
     bool g_loaded = false;
+    bool g_noSave = false; // the player's file is left alone (test run, or a file that could not be read)
     fs::path g_path;
 
     fs::path utf8Path(const char *s)
@@ -93,10 +94,25 @@ pressure_ramp_ms = 0
         if (g_loaded)
             return;
         g_loaded = true;
+        const char *hidden = std::getenv("PS2X_HIDDEN_WINDOW");
+        const char *chosen = std::getenv("PS2X_CONFIG");
+        if (hidden && *hidden && !(chosen && *chosen))
+        {
+            g_noSave = true; // hidden test runs use the defaults unless PS2X_CONFIG names a file
+            return;
+        }
         const fs::path &p = filePath();
         std::ifstream in(p, std::ios::binary);
         if (!in)
-            return; // no file: defaults
+        {
+            std::error_code ec;
+            if (fs::exists(p, ec) || ec)
+            {
+                g_noSave = true; // there but unreadable: saving one key would drop the rest
+                std::fprintf(stderr, "[config] cannot read %s; changes will not be saved\n", p.string().c_str());
+            }
+            return; // defaults
+        }
         std::stringstream text;
         text << in.rdbuf();
         in.close();
@@ -167,7 +183,6 @@ pressure_ramp_ms = 0
 
 namespace ps2cfg
 {
-    std::string path() { return filePath().string(); }
 
     bool getBool(const char *key, bool def)
     {
@@ -245,6 +260,8 @@ namespace ps2cfg
     bool save()
     {
         ensureLoaded();
+        if (g_noSave)
+            return false;
         const fs::path &p = filePath();
         fs::path tmp = p;
         tmp += ".tmp";
@@ -256,8 +273,12 @@ namespace ps2cfg
                 return false;
             }
             out << toml::format(g_root);
-            if (!out.good())
+            out.close(); // flush first, so a full disk shows up before the rename
+            if (!out)
+            {
+                std::fprintf(stderr, "[config] cannot write %s\n", tmp.string().c_str());
                 return false;
+            }
         }
         std::error_code ec;
         fs::rename(tmp, p, ec); // replaces the old file

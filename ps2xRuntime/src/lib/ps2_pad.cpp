@@ -48,6 +48,7 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[7] = in.ly;
 #else
     (void)port;
+    std::memset(data + 8, 0xFF, 12); // full pressure; Pad.cpp reports it only for held buttons
     constexpr int kGamepad = 0;
     const bool useGamepad = IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)

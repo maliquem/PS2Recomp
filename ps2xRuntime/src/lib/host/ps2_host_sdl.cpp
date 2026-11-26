@@ -236,6 +236,7 @@ namespace ps2host
     bool pumpEvents()
     {
         bool keepRunning = true;
+        const bool wasOpen = ps2menu::isOpen(); // the press that closes the menu must not reach the game
         for (auto &p : g_pressed)
             p.store(0, std::memory_order_relaxed);
         const bool forwardToImgui = g_imguiContext && g_imguiDrewLastFrame;
@@ -263,13 +264,15 @@ namespace ps2host
             case SDL_EVENT_KEY_DOWN:
                 if (e.key.repeat)
                     break;
-                if (e.key.scancode == SDL_SCANCODE_F11)
-                    toggleFullscreen(false);
-                else if (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))
+                if (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))
                 {
                     toggleFullscreen(true);
                     continue; // Enter is Start: Alt+Enter must not reach the game or the menu
                 }
+                if (ps2menu::isOpen())
+                    break; // F3/F11 are bindable: the menu (key capture) gets them
+                if (e.key.scancode == SDL_SCANCODE_F11)
+                    toggleFullscreen(false);
                 else if (e.key.scancode == SDL_SCANCODE_F3)
                     setShowFps(!g_showRate);
                 break;
@@ -291,7 +294,7 @@ namespace ps2host
         if (menuOpen)
             for (auto &k : g_keys)
                 k.store(0, std::memory_order_relaxed);
-        ps2input::update(menuOpen);
+        ps2input::update(menuOpen || wasOpen);
         ps2menu::host::update();
         return keepRunning && !ps2menu::host::quitRequested();
     }

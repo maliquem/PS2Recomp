@@ -402,7 +402,7 @@ body { width: 100%; height: 100%; font-family: Roboto; font-size: 17dp; color: #
 div { display: block; }
 #shade { position: absolute; left: 0; top: 0; right: 0; bottom: 0; background-color: #000000a8; }
 #panel { position: absolute; left: 50%; top: 50%; width: 780dp; height: 620dp; margin-left: -390dp; margin-top: -310dp;
-  padding: 16dp 20dp; background-color: #14151ef2; border: 1dp #474d6b; border-radius: 6dp; }
+  padding: 16dp 20dp; background-color: #14151eff; border: 1dp #474d6b; border-radius: 6dp; }
 #title { font-size: 26dp; height: 36dp; }
 #tabs { height: 34dp; border-bottom: 1dp #474d6b; margin-bottom: 8dp; }
 .tab { display: inline-block; height: 34dp; line-height: 34dp; padding: 0 16dp; color: #959bb5; }
@@ -798,7 +798,6 @@ namespace ps2menu
 
     bool isOpen() { return g_open.load(std::memory_order_relaxed); }
     void close() { setOpen(false); }
-    bool portuguese() { return isPt(); }
 }
 
 namespace ps2menu::host
