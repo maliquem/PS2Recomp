@@ -161,6 +161,7 @@ void register_ps2_savestate_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
             regs.display1 = 223ull << 44; // 224 rows: a 640x224 buffer is 70 pages, so B sits right after A
+            regs.smode2 = 3u;              // Shadow Hearts' game mode: the buffer is DH+1 rows
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
             auto draw = [&](uint32_t fbp, bool textured = false, uint32_t tbp = 0u)
@@ -191,6 +192,7 @@ void register_ps2_savestate_tests()
             t.IsFalse(g_frameskipDisplayDrawn.load(), "a frame that lost draws is not latched");
 
             t.IsTrue(draw(kB, true, (kB + 70u) * 32u), "a texture right after the back buffer is not a read of it");
+            t.IsFalse(draw(kB, true, (kB + 69u) * 32u), "a texture in the last page of the back buffer is a read of it");
             t.IsFalse(draw(kB + 200u, true, kB * 32u), "texturing from the back buffer is drawn");
             t.IsFalse(draw(kB), "once the game reads the back buffer, nothing more is dropped");
 

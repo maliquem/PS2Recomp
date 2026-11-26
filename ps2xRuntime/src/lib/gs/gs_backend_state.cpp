@@ -88,13 +88,15 @@ namespace
 
     SkipState g_skip; // guarded by GS::m_stateMutex (vertexKick and TRXDIR run under it)
 
-    // Rows of the displayed frame buffer: DISPLAY height over the vertical magnification, halved in field mode.
+    // Rows of the displayed frame buffer: DISPLAY height over the vertical magnification. With SMODE2 INT=1, FFMD=0
+    // DISPLAY holds one field of a full frame buffer twice as tall (the FMV player); with FFMD=1 (Shadow Hearts'
+    // game mode, DH 223) the buffer is DH+1 rows, as the Present reads it.
     uint32_t displayRows(const GSRegisters &regs)
     {
         const uint64_t display = (regs.pmode & 2u) ? regs.display2 : regs.display1;
         uint32_t rows = static_cast<uint32_t>(((display >> 44) & 0x7FFu) + 1u) / static_cast<uint32_t>(((display >> 27) & 3u) + 1u);
-        if ((regs.smode2 & 3u) == 3u) // interlaced, field mode
-            rows = (rows + 1u) / 2u;
+        if ((regs.smode2 & 3u) == 1u)
+            rows *= 2u;
         return std::clamp<uint32_t>(rows, 1u, 2048u);
     }
 
@@ -109,6 +111,8 @@ namespace
     }
 
     // Counts PSMCT32 pages (32 rows): a 16-bit buffer is covered twice over, which only stops more drops.
+    // shortcut: only reads of the back buffer are caught; a game that reads the buffer on display (feedback, screen
+    // capture) after a swap of a frame that lost draws would see them missing. Widen it if a game does that.
     bool readsBackBuffer(uint32_t blockAddress, uint32_t fbw)
     {
         const uint32_t start = g_skip.backFbp * 32u;
@@ -136,6 +140,7 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
         g_skip.dropCurrent = false;
         g_skip.phase = SkipPhase::Drawing;
         g_skip.readsBack = false;
+        g_frameskipReadsBack.store(0, std::memory_order_relaxed);
         if (!g_skip.hadDrops)
         {
             g_skip.known = false;
