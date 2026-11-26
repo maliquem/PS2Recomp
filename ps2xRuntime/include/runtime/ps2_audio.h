@@ -18,7 +18,10 @@ public:
     void onSoundCommand(uint32_t sid, uint32_t rpcNum,
                         const uint8_t *sendBuf, uint32_t sendSize,
                         uint8_t *recvBuf, uint32_t recvSize);
-    void submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount);
+    // One 48 kHz stereo stream per output bus (ps2x::audio::kBus*).
+    void submitSpu2Pcm(int bus, const int16_t *interleavedStereoPcm, size_t frameCount);
+    // Music frames the SPU2 core should render per game frame (1 unless the music is on the wall clock).
+    double spu2MusicRatio();
 
     void play(uint32_t sampleAddr, float pitch = 1.0f, float volume = 1.0f,
               uint32_t voiceIndex = 0xFFFFFFFFu);

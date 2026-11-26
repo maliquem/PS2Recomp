@@ -7,6 +7,7 @@
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
+#include "runtime/ps2_audio_mix.h"
 
 #include <algorithm>
 #include <cstring>
@@ -14,6 +15,9 @@
 #include <iostream>
 #include <limits>
 #include <utility>
+
+static_assert(ps2x::audio::kBusCount == ps2x::iop::kSpu2BusCount && ps2x::audio::kBusMusic == ps2x::iop::kSpu2MusicBus,
+              "the SPU2 core and the output mixer number the buses alike");
 
 #if !defined(_WIN32)
 #include <sys/types.h>
@@ -268,9 +272,14 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             receive.size);
 }
 
-void PS2IopHostAdapter::submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+void PS2IopHostAdapter::submitSpu2Pcm(int bus, const int16_t *interleavedStereoPcm, size_t frameCount)
 {
-    m_runtime.audioBackend().submitSpu2Pcm(core, interleavedStereoPcm, frameCount);
+    m_runtime.audioBackend().submitSpu2Pcm(bus, interleavedStereoPcm, frameCount);
+}
+
+double PS2IopHostAdapter::spu2MusicRatio()
+{
+    return m_runtime.audioBackend().spu2MusicRatio();
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const

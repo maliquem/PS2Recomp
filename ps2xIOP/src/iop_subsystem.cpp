@@ -281,6 +281,26 @@ namespace ps2x::iop
         return snapshot;
     }
 
+    void IopSubsystem::addCodeHook(uint64_t imageHash, uint32_t offset, CodeHook hook)
+    {
+        m_impl->emulator.addCodeHook(imageHash, offset, std::move(hook));
+    }
+
+    void IopSubsystem::setSpu2VoiceBus(int core, uint32_t voice, int bus)
+    {
+        m_impl->emulator.setSpu2VoiceBus(core, voice, bus);
+    }
+
+    void IopSubsystem::setSpu2InputBus(int core, int bus)
+    {
+        m_impl->emulator.setSpu2InputBus(core, bus);
+    }
+
+    uint32_t IopSubsystem::spu2BusSamples(int bus) const noexcept
+    {
+        return m_impl->emulator.spu2BusSamples(bus);
+    }
+
     void IopSubsystem::stateIo(ps2x::state::Archive &ar)
     {
         ar(m_impl->moduleManager, m_impl->emulator);

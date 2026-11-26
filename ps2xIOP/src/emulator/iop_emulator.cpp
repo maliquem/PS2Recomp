@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <optional>
 #include <span>
@@ -80,9 +81,24 @@ namespace ps2x::iop::detail
             uint32_t entry = 0;
             uint32_t gp = 0;
             bool resident = false;
+            uint64_t hash = 0; // FNV-1a of the IRX file, what code hooks are keyed by
 
             template <class A>
-            void stateIo(A &ar) { ar(id, path, name, base, size, entry, gp, resident); }
+            void stateIo(A &ar) { ar(id, path, name, base, size, entry, gp, resident, hash); }
+        };
+
+        struct CodeHookEntry
+        {
+            uint64_t imageHash = 0;
+            uint32_t offset = 0;
+            CodeHook hook;
+        };
+
+        struct ActiveCodeHook
+        {
+            uint32_t address = 0; // physical
+            uint32_t moduleBase = 0;
+            size_t entry = 0; // index into codeHooks
         };
 
         struct GuestCallback
@@ -110,7 +126,8 @@ namespace ps2x::iop::detail
         };
 
         static constexpr uint32_t kAudioChunkFrames = 256u;
-        static constexpr uint64_t kAudioChunkCycles = static_cast<uint64_t>(kAudioChunkFrames) * 768u;
+        static constexpr uint64_t kAudioFrameCycles = 768u;
+        static constexpr uint64_t kAudioChunkCycles = static_cast<uint64_t>(kAudioChunkFrames) * kAudioFrameCycles;
 
         explicit Impl(IopHost &hostRef)
             : host(hostRef),
@@ -137,6 +154,7 @@ namespace ps2x::iop::detail
             memory.reset();
             kernel.reset();
             modules.clear();
+            rebuildCodeHooks();
             imports.reset();
             rpc.reset();
             cdvd.reset();
@@ -153,6 +171,7 @@ namespace ps2x::iop::detail
             eeCycleCarry = 0;
             cycleOvershoot = 0;
             nextAudioCycle = kAudioChunkCycles;
+            audioChunkFrames = 0u;
             audioStreamActive = false;
             autoDma = {};
             activeCpu = nullptr;
@@ -204,6 +223,7 @@ namespace ps2x::iop::detail
             {
                 if (dma->autoDma && dma->byteSize >= 1024u)
                 {
+                    advanceSpu2Audio(); // the first block is read at the next chunk boundary from here
                     const uint32_t alignedBytes = dma->byteSize & ~1023u;
                     auto &state = autoDma[static_cast<size_t>(dma->core & 1)];
                     state.active = true;
@@ -213,8 +233,6 @@ namespace ps2x::iop::detail
                     state.currentMadr = dma->madr;
                     state.totalBytes = alignedBytes;
                     state.bytesRemaining = alignedBytes;
-                    if (nextAudioCycle <= totalCycles)
-                        nextAudioCycle = totalCycles + kAudioChunkCycles;
                 }
                 else
                 {
@@ -237,14 +255,33 @@ namespace ps2x::iop::detail
             }
         }
 
+        // Cycle at which the next sample of the current chunk is due. nextAudioCycle is the end of the
+        // chunk, where the AutoDMA block is fed and the chunk goes to the host.
+        [[nodiscard]] uint64_t nextSampleCycle() const noexcept
+        {
+            return nextAudioCycle - (kAudioChunkFrames - 1u - audioChunkFrames) * kAudioFrameCycles;
+        }
+
+        // Runs the SPU2 up to the current cycle. Called after every instruction that crosses a sample,
+        // so a register write lands on its own sample and a read sees the state of that moment.
         void advanceSpu2Audio()
         {
-            while (totalCycles >= nextAudioCycle)
+            Spu2Synth &spu2 = memory.spu2();
+            while (totalCycles >= nextSampleCycle())
             {
+                const uint32_t frames = static_cast<uint32_t>(std::min<uint64_t>(
+                    kAudioChunkFrames - audioChunkFrames, (totalCycles - nextSampleCycle()) / kAudioFrameCycles + 1u));
+                audioChunkFrames += frames;
+                if (spu2.render(frames))
+                    audioStreamActive = true;
+                if (spu2.takeIrq())
+                    pendingDmaInterrupts[9] = totalCycles; // SPU2 interrupt
+                if (audioChunkFrames < kAudioChunkFrames)
+                    continue;
+                audioChunkFrames = 0u;
                 nextAudioCycle += kAudioChunkCycles;
-
-                std::array<int16_t, kAudioChunkFrames * 2u> stereo{};
-                bool producedAudio = memory.spu2().render(stereo.data(), kAudioChunkFrames);
+                // The music bus follows the host's clock (1.0 unless the game runs faster than real time).
+                spu2.setMusicRatio(static_cast<uint32_t>(std::lround(std::clamp(host.spu2MusicRatio(), 0.0, 1.0) * 65536.0)));
 
                 for (int c = 0; c < 2; ++c)
                 {
@@ -252,28 +289,18 @@ namespace ps2x::iop::detail
                     if (!state.active)
                         continue;
 
-                    if (!memory.spu2().isAutoDmaEnabled(c))
+                    if (!spu2.isAutoDmaEnabled(c))
                     {
                         state.active = false;
                         continue;
                     }
 
+                    // The block goes through the core's input area: it plays over the next chunk.
                     uint8_t raw[1024]{};
                     if (memory.readRam(state.currentMadr, raw, sizeof(raw)))
                     {
-                        int32_t volL = 0x7FFE;
-                        int32_t volR = 0x7FFE;
-                        memory.spu2().getAutoDmaVolume(c, volL, volR);
-                        const int16_t *left = reinterpret_cast<const int16_t *>(raw);
-                        const int16_t *right = reinterpret_cast<const int16_t *>(raw + 512u);
-                        for (uint32_t i = 0u; i < kAudioChunkFrames; ++i)
-                        {
-                            const int32_t sL = (static_cast<int32_t>(left[i]) * volL) >> 15;
-                            const int32_t sR = (static_cast<int32_t>(right[i]) * volR) >> 15;
-                            stereo[i * 2u] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(stereo[i * 2u]) + sL, -32768, 32767));
-                            stereo[i * 2u + 1u] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(stereo[i * 2u + 1u]) + sR, -32768, 32767));
-                        }
-                        producedAudio = true;
+                        spu2.setInputBlock(c, raw);
+                        audioStreamActive = true;
                     }
 
                     state.currentMadr += 1024u;
@@ -299,10 +326,10 @@ namespace ps2x::iop::detail
                     }
                 }
 
-                if (producedAudio)
-                    audioStreamActive = true;
                 if (audioStreamActive)
-                    host.submitSpu2Pcm(0, stereo.data(), kAudioChunkFrames);
+                    for (int bus = 0; bus < Spu2Synth::kBusCount; ++bus)
+                        host.submitSpu2Pcm(bus, spu2.output(bus).data(), spu2.output(bus).size() / 2u);
+                spu2.clearOutput();
             }
         }
 
@@ -503,12 +530,16 @@ namespace ps2x::iop::detail
             }
             if (checkInterrupt(cpu))
                 return true;
+            if (physicalAddress(cpu.pc) - codeHookLow < codeHookSpan)
+                runCodeHooks(cpu);
 
             if (const auto import = imports.decode(cpu.pc))
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
                 ++totalCycles;
+                if (totalCycles >= nextSampleCycle())
+                    advanceSpu2Audio();
                 if (disposition == ImportDisposition::JumpToGuest)
                     return true;
                 cpu.pc = cpu.gpr[31];
@@ -520,7 +551,50 @@ namespace ps2x::iop::detail
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
+            if (totalCycles >= nextSampleCycle())
+                advanceSpu2Audio();
             return running;
+        }
+
+        // The hooks of the modules loaded now, as addresses. Call whenever `modules` or `codeHooks` change.
+        void rebuildCodeHooks()
+        {
+            activeCodeHooks.clear();
+            uint32_t low = UINT32_MAX;
+            uint32_t high = 0u;
+            for (const auto &[id, module] : modules)
+            {
+                for (size_t i = 0; i < codeHooks.size(); ++i)
+                {
+                    if (codeHooks[i].imageHash != module.hash || codeHooks[i].offset >= module.size)
+                        continue;
+                    const uint32_t address = physicalAddress(module.base + codeHooks[i].offset);
+                    activeCodeHooks.push_back({address, module.base, i});
+                    low = std::min(low, address);
+                    high = std::max(high, address);
+                }
+            }
+            codeHookLow = activeCodeHooks.empty() ? 0u : low;
+            codeHookSpan = activeCodeHooks.empty() ? 0u : high - low + 1u;
+        }
+
+        void runCodeHooks(CpuState &cpu)
+        {
+            const uint32_t address = physicalAddress(cpu.pc);
+            // shortcut: linear scan, right for the handful of hooks a profile has; index by address
+            // if one ever needs dozens.
+            for (const ActiveCodeHook &active : activeCodeHooks)
+            {
+                if (active.address != address)
+                    continue;
+                CodeHookContext context{cpu.gpr.data(), cpu.pc, active.moduleBase};
+                codeHooks[active.entry].hook(context);
+                if (context.pc != cpu.pc)
+                {
+                    cpu.pc = context.pc; // the hook sent execution elsewhere
+                    return;
+                }
+            }
         }
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
@@ -756,6 +830,9 @@ namespace ps2x::iop::detail
             module.size = loaded.size;
             module.entry = loaded.entry;
             module.gp = loaded.gp;
+            module.hash = 0xcbf29ce484222325ull;
+            for (const uint8_t byte : image)
+                module.hash = (module.hash ^ byte) * 0x100000001b3ull;
 
             uint32_t args = 0u;
             if (arguments && argumentSize)
@@ -774,11 +851,13 @@ namespace ps2x::iop::detail
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
             modules[module.id] = std::move(module);
+            rebuildCodeHooks();
 
             std::ostringstream out;
             out << "[IOP] loaded IRX id=" << result.moduleId
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
+                << " hash=0x" << modules[result.moduleId].hash
                 << " start=" << std::dec << result.startResult;
             log(LogLevel::Info, out.str());
             return result;
@@ -815,6 +894,7 @@ namespace ps2x::iop::detail
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
             modules.erase(it);
+            rebuildCodeHooks();
             kernel.cleanupDeadThreads();
             if (result)
                 *result = 0;
@@ -838,6 +918,10 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
+        std::vector<CodeHookEntry> codeHooks; // registered by the game profile, kept across reset()
+        std::vector<ActiveCodeHook> activeCodeHooks;
+        uint32_t codeHookLow = 0u; // physical address range of the active hooks; span 0 = none
+        uint32_t codeHookSpan = 0u;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
@@ -849,6 +933,7 @@ namespace ps2x::iop::detail
         uint64_t eeCycleCarry = 0;
         uint64_t cycleOvershoot = 0;
         uint64_t nextAudioCycle = kAudioChunkCycles;
+        uint32_t audioChunkFrames = 0u; // samples of the current chunk already rendered
         bool audioStreamActive = false;
         std::array<AutoDmaState, 2> autoDma{};
         CpuState *activeCpu = nullptr;
@@ -883,8 +968,31 @@ namespace ps2x::iop::detail
         ar(d.memory, d.kernel, d.cdvd, d.rpc, d.intrman, d.timrman, d.ioman, d.imports,
            d.modules, d.pendingDmaInterrupts, d.pendingGuestCallbacks, d.nextModuleId, d.moduleCursor,
            d.totalCycles, d.idleUntil, d.totalInstructions, d.eeCycleCarry, d.cycleOvershoot,
-           d.nextAudioCycle, d.audioStreamActive, d.autoDma,
+           d.nextAudioCycle, d.audioChunkFrames, d.audioStreamActive, d.autoDma,
            d.secrMcCommandHandler, d.secrMcDevIdHandler, d.checkKelfPathCallback);
+        if (ar.loading())
+            d.rebuildCodeHooks();
+    }
+
+    void IopEmulator::addCodeHook(uint64_t imageHash, uint32_t offset, CodeHook hook)
+    {
+        m_impl->codeHooks.push_back({imageHash, offset, std::move(hook)});
+        m_impl->rebuildCodeHooks();
+    }
+
+    void IopEmulator::setSpu2VoiceBus(int core, uint32_t voice, int bus)
+    {
+        m_impl->memory.spu2().setVoiceBus(core, voice, bus);
+    }
+
+    void IopEmulator::setSpu2InputBus(int core, int bus)
+    {
+        m_impl->memory.spu2().setInputBus(core, bus);
+    }
+
+    uint32_t IopEmulator::spu2BusSamples(int bus) const noexcept
+    {
+        return bus >= 0 && bus < Spu2Synth::kBusCount ? m_impl->memory.spu2().busSamples(bus) : 0u;
     }
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)

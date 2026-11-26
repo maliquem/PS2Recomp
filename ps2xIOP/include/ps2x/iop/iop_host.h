@@ -95,11 +95,18 @@ namespace ps2x::iop
         virtual void freeGuest(uint32_t address) = 0;
 
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
-        virtual void submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+        // One 48 kHz stereo stream per output bus (Spu2Synth::kBus*), all buses submitted in step.
+        virtual void submitSpu2Pcm(int bus, const int16_t *interleavedStereoPcm, size_t frameCount)
         {
-            (void)core;
+            (void)bus;
             (void)interleavedStereoPcm;
             (void)frameCount;
+        }
+        // Music-clock frames to render per game frame for the next chunk: 1 at normal speed, less
+        // while the host keeps the music at normal speed in turbo.
+        virtual double spu2MusicRatio()
+        {
+            return 1.0;
         }
 
         virtual std::string hostPath(HostPathKind kind) const = 0;

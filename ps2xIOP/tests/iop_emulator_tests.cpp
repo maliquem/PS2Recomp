@@ -927,6 +927,9 @@ int main()
 
     constexpr uint32_t lotrSoundSid = 0x00012345u;
     writeRpcServerIrx(host, 0x100u, lotrSoundSid);
+    uint64_t soundImageHash = 0xcbf29ce484222325ull; // FNV-1a of the image: 0x100 of headers, 0xA0 of code
+    for (uint32_t i = 0; i < 0x1A0u; ++i)
+        soundImageHash = (soundImageHash ^ host.guest[0x100u + i]) * 0x100000001b3ull;
     const ModuleLoadResult physicalSoundModule = iop.loadModuleBuffer(0x100u);
     if (!expect(physicalSoundModule.handled && physicalSoundModule.startResult == 0,
                 "Synthetic physical sound RPC server did not start")) return 1;
@@ -953,6 +956,79 @@ int main()
                 "Physical sound RPC did not return its own payload")) return 1;
     if (!expect(iop.debugSnapshot().emulatorInstructions > soundInstructionsBefore,
                 "Sound RPC did not execute the physical IOP handler")) return 1;
+
+    // The SPU2 runs up to the instruction that touches it: a voice in linear attack (14 per sample)
+    // read twice, 7682 instructions (10 samples of 768 cycles) apart, has grown by 10 or 11 samples.
+    const uint32_t spu2TimingHandler[] = {
+        0x3C09BF90u, // lui t1, 0xBF90 (SPU2 registers)
+        0x340A28FFu, // ori t2, zero, 0x28FF (ADSR1: linear attack, shift 10)
+        0xA52A0006u, // sh t2, 0x06(t1)
+        0x340A1FCAu, // ori t2, zero, 0x1FCA (ADSR2: held sustain)
+        0xA52A0008u, // sh t2, 0x08(t1)
+        0x340A0001u, // ori t2, zero, 1
+        0xA52A01A0u, // sh t2, 0x1A0(t1) (key on voice 0)
+        0x34080A00u, // ori t0, zero, 2560
+        0x2508FFFFu, // addiu t0, t0, -1
+        0x1500FFFEu, // bne t0, zero, -2
+        0x00000000u, // nop
+        0x952B000Au, // lhu t3, 0x0A(t1) (ENVX)
+        0x34080A00u, // ori t0, zero, 2560
+        0x2508FFFFu, // addiu t0, t0, -1
+        0x1500FFFEu, // bne t0, zero, -2
+        0x00000000u, // nop
+        0x952C000Au, // lhu t4, 0x0A(t1)
+        0x00000000u, // nop (load delay)
+        0x018B5823u, // subu t3, t4, t3
+        0x3C020001u, // lui v0, 1
+        0x34420400u, // ori v0, v0, 0x400
+        0xAC4B0000u, // sw t3, 0(v0)
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+    };
+    if (!expect(iop.writeMemory(0x00010300u, spu2TimingHandler, sizeof(spu2TimingHandler)),
+                "Could not install the SPU2 timing handler")) return 1;
+    const RpcResult spu2TimingResult = iop.handleRpc(soundRequest);
+    uint32_t envelopeGrowth = 0u;
+    std::memcpy(&envelopeGrowth, host.guest.data() + 0x900u, sizeof(envelopeGrowth));
+    if (!expect(spu2TimingResult.handled && (envelopeGrowth == 140u || envelopeGrowth == 154u),
+                ("SPU2 did not advance sample by sample between two register reads (ENVX grew " +
+                 std::to_string(envelopeGrowth) + ")").c_str())) return 1;
+
+    // Code hooks: keyed by the hash of the IRX and an offset from its base, they see the registers
+    // and can send execution elsewhere. Here one skips the store that replaces the echoed payload.
+    const uint32_t hookedHandler[] = {
+        0x3C020001u, // lui v0, 1
+        0x34420400u, // ori v0, v0, 0x400
+        0x34081111u, // ori t0, zero, 0x1111
+        0xAC480000u, // sw t0, 0(v0)
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+    };
+    if (!expect(iop.writeMemory(0x00010300u, hookedHandler, sizeof(hookedHandler)),
+                "Could not install the hooked handler")) return 1;
+    uint32_t hookResponse = 0u;
+    (void)iop.handleRpc(soundRequest);
+    std::memcpy(&hookResponse, host.guest.data() + 0x900u, sizeof(hookResponse));
+    if (!expect(hookResponse == 0x1111u, "Handler for the code hook test did not run as written")) return 1;
+
+    bool hooksLive = true;
+    uint32_t hookHits = 0u, hookBase = 0u, hookT0 = 0u, wrongHashHits = 0u;
+    iop.addCodeHook(soundImageHash, 0x30Cu, [&](CodeHookContext &context) {
+        if (!hooksLive)
+            return;
+        ++hookHits;
+        hookBase = context.moduleBase;
+        hookT0 = context.gpr[8];
+        context.pc = context.moduleBase + 0x310u;
+    });
+    iop.addCodeHook(soundImageHash ^ 1u, 0x300u, [&](CodeHookContext &) { ++wrongHashHits; });
+    (void)iop.handleRpc(soundRequest);
+    std::memcpy(&hookResponse, host.guest.data() + 0x900u, sizeof(hookResponse));
+    hooksLive = false;
+    if (!expect(hookHits == 1u && hookBase == 0x00010000u && hookT0 == 0x1111u,
+                "Code hook did not run once with the module base and the registers")) return 1;
+    if (!expect(hookResponse == soundPayload, "Code hook did not skip the instruction it jumped over")) return 1;
+    if (!expect(wrongHashHits == 0u, "Code hook ran on a module with another hash")) return 1;
 
     constexpr uint32_t relocatableRpcSid = 0xA11CE001u;
     writeRelocatableRpcServerIrx(host, 0x100u);

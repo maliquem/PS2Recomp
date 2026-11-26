@@ -303,6 +303,8 @@ public:
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
+    // For game profiles (code hooks, SPU2 buses): include ps2x/iop/iop_subsystem.h to use it.
+    [[nodiscard]] ps2x::iop::IopSubsystem &iop() noexcept { return *m_iopSubsystem; }
     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
     bool freeIopMemory(uint32_t address);
     bool readIopMemory(uint32_t address, void *destination, size_t size) const;

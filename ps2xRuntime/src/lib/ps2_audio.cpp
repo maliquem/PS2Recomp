@@ -1,6 +1,6 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
-#include "runtime/ps2_audio_turbo.h"
+#include "runtime/ps2_audio_mix.h"
 #include "runtime/ps2_pacing.h"
 #include "ps2_host_backend.h"
 #if !PS2X_HOST_RAYLIB
@@ -8,62 +8,24 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
 namespace
 {
-    // shortcut: SPU2 AutoDMA PCM streaming plays 48 kHz 16-bit stereo directly without
-    // SPU2 mixer volume/reverb or 48-voice ADPCM synthesis. Upgrade when a full SPU2
-    // voice/mixer backend is integrated.
-    // At normal speed the compressor is a plain FIFO with the old 0.5 s latency cap; in turbo it
-    // plays the faster input at normal pitch (ps2_audio_turbo.h).
-    struct Spu2PcmRing
-    {
-        ps2x::audio::TurboCompressor stream;
-        std::vector<int16_t> scratch;
-
-        void push(const int16_t *samples, size_t sampleCount)
-        {
-            stream.push(samples, sampleCount / 2u);
-        }
-
-        void mixInto(int16_t *dst, size_t sampleCount, bool overwrite)
-        {
-            const bool turbo = ps2x::pacing::g_speedPercent.load(std::memory_order_relaxed) != 100u;
-            if (overwrite)
-            {
-                const size_t got = stream.pull(dst, sampleCount / 2u, turbo) * 2u;
-                if (got < sampleCount)
-                    std::memset(dst + got, 0, (sampleCount - got) * sizeof(int16_t));
-                return;
-            }
-            scratch.resize(sampleCount);
-            const size_t got = stream.pull(scratch.data(), sampleCount / 2u, turbo) * 2u;
-            for (size_t i = 0; i < got; ++i)
-            {
-                const int32_t sum = static_cast<int32_t>(dst[i]) + scratch[i];
-                dst[i] = static_cast<int16_t>(std::clamp(sum, -32768, 32767));
-            }
-        }
-
-        void clear()
-        {
-            stream.reset();
-        }
-    };
-
+    // SPU2 output: the IOP core pushes one PCM stream per bus, the device callback pulls the mix
+    // (runtime/ps2_audio_mix.h).
     std::mutex g_spu2RingMutex;
-    std::array<Spu2PcmRing, 2> g_spu2Rings;
+    ps2x::audio::OutputMixer g_spu2Mixer;
+    double g_spu2Rate = 1.0; // frequency ratio the SDL stream is at (under the backend mutex)
 
 #if !defined(PLATFORM_VITA)
     void spu2AudioCallback(void *bufferData, unsigned int frames)
     {
-        auto *out = static_cast<int16_t *>(bufferData);
-        const size_t sampleCount = static_cast<size_t>(frames) * 2u;
         std::lock_guard<std::mutex> lock(g_spu2RingMutex);
-        g_spu2Rings[0].mixInto(out, sampleCount, true);
-        g_spu2Rings[1].mixInto(out, sampleCount, false);
+        g_spu2Mixer.pull(static_cast<int16_t *>(bufferData), frames,
+                         ps2x::pacing::g_speedPercent.load(std::memory_order_relaxed));
     }
 #endif
 
@@ -221,6 +183,7 @@ struct PS2AudioBackend::Impl
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
+    ps2x::audio::loadSettings();
 }
 
 PS2AudioBackend::~PS2AudioBackend()
@@ -443,20 +406,22 @@ void PS2AudioBackend::stop(uint32_t voiceId)
     (void)voiceId;
 }
 
-void PS2AudioBackend::submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+void PS2AudioBackend::submitSpu2Pcm(int bus, const int16_t *interleavedStereoPcm, size_t frameCount)
 {
 #if defined(PLATFORM_VITA)
-    (void)core;
+    (void)bus;
     (void)interleavedStereoPcm;
     (void)frameCount;
     return;
 #else
-    if (!m_audioReady || !interleavedStereoPcm || frameCount == 0u || core < 0 || core > 1)
+    if (!m_audioReady || !interleavedStereoPcm || frameCount == 0u)
         return;
 
+    double rate = 1.0;
     {
         std::lock_guard<std::mutex> lock(g_spu2RingMutex);
-        g_spu2Rings[static_cast<size_t>(core)].push(interleavedStereoPcm, frameCount * 2u);
+        g_spu2Mixer.push(bus, interleavedStereoPcm, frameCount);
+        rate = g_spu2Mixer.rateRatio();
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -484,9 +449,25 @@ void PS2AudioBackend::submitSpu2Pcm(int core, const int16_t *interleavedStereoPc
                 m_impl->spu2Stream = nullptr;
             }
         }
+        g_spu2Rate = 1.0;
 #endif
     }
+#if !PS2X_HOST_RAYLIB
+    // The game makes audio a little off the device's 48 kHz (measured -0.13 %): follow it by playing
+    // that much slower or faster. shortcut: the raylib host has no rate control, it keeps the gaps.
+    if (m_impl->spu2Stream && std::abs(rate - g_spu2Rate) > 1e-5)
+    {
+        SDL_SetAudioStreamFrequencyRatio(m_impl->spu2Stream, static_cast<float>(rate));
+        g_spu2Rate = rate;
+    }
 #endif
+#endif
+}
+
+double PS2AudioBackend::spu2MusicRatio()
+{
+    std::lock_guard<std::mutex> lock(g_spu2RingMutex);
+    return g_spu2Mixer.musicRatio(ps2x::pacing::g_speedPercent.load(std::memory_order_relaxed));
 }
 
 void PS2AudioBackend::stopAll()
@@ -512,8 +493,7 @@ void PS2AudioBackend::stopAll()
     }
     {
         std::lock_guard<std::mutex> ringLock(g_spu2RingMutex);
-        g_spu2Rings[0].clear();
-        g_spu2Rings[1].clear();
+        g_spu2Mixer.reset();
     }
 #endif
 }

@@ -18,7 +18,7 @@ namespace
     using Value = toml::ordered_value;
 
     constexpr const char *kTemplate = R"(# PS2Recomp player settings. Delete this file to get the defaults back.
-# An environment variable set explicitly (PS2X_VSYNC, PS2X_SHOW_FPS, PS2X_GS_BACKEND) wins over this file.
+# An environment variable set explicitly (PS2X_VSYNC, PS2X_SHOW_FPS, PS2X_GS_BACKEND, PS2X_MUSIC_TURBO) wins over this file.
 # The pause menu (Esc, or Guide / Back+Start on a controller) changes most of these and saves them here.
 
 [display]
@@ -30,6 +30,17 @@ show_fps = false
 [gs]
 # "vulkan" (default) or "cpu".
 backend = "vulkan"
+
+[audio]
+# Volumes, 0 to 100. Music, voices and videos only have a level of their own in games whose profile
+# separates them; everything else follows "effects".
+volume = 100
+music = 100
+effects = 100
+voice = 100
+video = 100
+# In turbo the music keeps its normal speed and pitch while the rest of the sound follows the game.
+music_normal_speed_in_turbo = true
 
 [ui]
 # Menu language: "auto" (system), "en" or "pt".

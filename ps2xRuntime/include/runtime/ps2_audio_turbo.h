@@ -19,6 +19,8 @@ namespace ps2x::audio
         void push(const int16_t *interleaved, size_t frames);
         // Writes up to `frames` frames; returns how many (fewer when the input ran out).
         size_t pull(int16_t *out, size_t frames, bool compress);
+        // Frames a direct pull can still hand out.
+        [[nodiscard]] size_t buffered() const { return static_cast<size_t>(m_end - m_rd); }
 
     private:
         static constexpr int64_t kCap = 1 << 17;   // input ring: ~2.7 s

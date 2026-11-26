@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -141,6 +142,20 @@ namespace ps2x::iop
         bool active = true;
         std::vector<DebugMetric> metrics;
     };
+
+    // SPU2 output buses. The host's mixer (ps2x::audio) names them and checks these two numbers.
+    inline constexpr int kSpu2BusCount = 4;
+    inline constexpr int kSpu2MusicBus = 1; // the one that can run on its own clock
+
+    // Code hook: called right before the instruction at `offset` from the load base of an IRX runs.
+    // The hook may change registers and, by writing `pc`, make execution continue elsewhere.
+    struct CodeHookContext
+    {
+        uint32_t *gpr; // the 32 general registers
+        uint32_t pc;
+        uint32_t moduleBase;
+    };
+    using CodeHook = std::function<void(CodeHookContext &)>;
 
     struct DebugSnapshot
     {
