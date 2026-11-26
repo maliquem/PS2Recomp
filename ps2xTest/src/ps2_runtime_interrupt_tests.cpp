@@ -271,6 +271,50 @@ namespace
         ctx->pc = readGuestU32(rdram, sp);
     }
 
+    constexpr uint32_t kLoopCallerPc = 0x00160620u;
+    constexpr uint32_t kLoopCallerResumePc = 0x00160628u;
+    constexpr uint32_t kLoopPc = 0x00160630u;
+    uint32_t g_loopIterations = 0u;
+    uint32_t g_loopSeenByCaller = 0u;
+    uint32_t g_loopYields = 0u;
+
+    void loopCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kLoopCallerPc)
+        {
+            setRegU32(*ctx, 31, kLoopCallerResumePc);
+            ctx->pc = kLoopPc;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kLoopPc, kLoopCallerPc, kLoopCallerResumePc,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "loopBack"))
+            {
+                return;
+            }
+        }
+        g_loopSeenByCaller = g_loopIterations;
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // A function whose loop goes back to its first instruction: the back edge's checkpoint yields
+    // with ctx->pc == kLoopPc.
+    void loopBack(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        while (g_loopIterations < 2u)
+        {
+            ++g_loopIterations;
+            EeEvent wake;
+            wake.type = EeEventType::Dmac; // handled as a no-op: only makes the next checkpoint due
+            runtime->eeScheduler().postEvent(wake);
+            ctx->pc = kLoopPc;
+            if (runtime->eeCheckpointDue(1u))
+            {
+                ++g_loopYields;
+                return;
+            }
+        }
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
     void runSpin(const std::vector<uint32_t> &loopCode, PS2Runtime::RecompiledFunction entry = spinEntry)
     {
         TestEnv env;
@@ -703,6 +747,24 @@ void register_ps2_runtime_interrupt_tests()
 
             t.Equals(g_recurEpilogues, 1u, "the outer call must run its epilogue before its caller continues");
             t.Equals(g_recurCallerSp, kRecurSp, "the caller must continue with its own stack pointer");
+        });
+
+        tc.Run("a loop that yields at the callee's own entry address is not taken as returned", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kLoopCallerPc, loopCaller);
+            env.runtime.registerFunction(kLoopCallerResumePc, loopCaller);
+            env.runtime.registerFunction(kLoopPc, loopBack);
+            g_loopIterations = 0u;
+            g_loopSeenByCaller = 0u;
+            g_loopYields = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kLoopCallerPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_loopYields > 0u, "the loop must have yielded at its own entry for this test to mean anything");
+            t.Equals(g_loopSeenByCaller, 2u, "the callee's loop must finish before its caller continues");
         });
 
         tc.Run("pure spin loops are skipped to the same cycle as running every iteration", [](TestCase &t)

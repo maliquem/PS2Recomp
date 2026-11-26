@@ -193,10 +193,10 @@ void main()
                 fy4 = uint((vFixed >> 12) & 15);
                 useSpriteBilinear = linear && (fx4 != 0u || fy4 != 0u);
                 // Field blend (game option, texMeta bit 27, nearest only): also the row the other interlace field
-                // shows, half a line up.
+                // shows, half a line toward the lower v (a flipped sprite stays inside itself).
                 if (((texMeta >> 27u) & 1u) != 0u)
                 {
-                    float tyField = float(py - d.unclippedY0) * d.invH;
+                    float tyField = float(py - d.unclippedY0 + (d.v1f < d.v0f ? 1 : 0)) * d.invH;
                     vField = int((d.v0f + (d.v1f - d.v0f) * tyField) * 65536.0) >> 16;
                     useFieldBlend = vField != v0;
                 }

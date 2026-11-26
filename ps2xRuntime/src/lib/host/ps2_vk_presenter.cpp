@@ -405,7 +405,7 @@ struct VkPresenter::Impl
     }
 
     // Binary PPMs (RGB); the swapchain may be BGRA.
-    void writeDump()
+    void writeDump(const std::string &dumpPrefix)
     {
         waitFence();
         void *mapped = nullptr;
@@ -484,6 +484,20 @@ struct VkPresenter::Impl
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     }
 };
+
+std::string readDumpRequest(const char *path)
+{
+    std::FILE *f = std::fopen(path, "rb");
+    if (!f)
+        return {};
+    char prefix[512]{};
+    const bool ok = std::fgets(prefix, sizeof(prefix), f) != nullptr;
+    std::fclose(f);
+    prefix[std::strcspn(prefix, "\r\n")] = 0;
+    if (!ok || !prefix[0])
+        std::remove(path);
+    return prefix;
+}
 
 VkPresenter::VkPresenter() : m(std::make_unique<Impl>()) {}
 VkPresenter::~VkPresenter() { shutdown(); }
@@ -712,24 +726,12 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     if (imgui && p.imgui)
         ImGui_ImplVulkan_RenderDrawData(imgui, p.cmd);
     p.vk.vkCmdEndRenderPass(p.cmd);
-    bool dumpNow = p.dumpAt && ++p.presentCount == p.dumpAt;
-    if (!dumpNow && !p.dumpReq.empty())
-    {
-        if (std::FILE *f = std::fopen(p.dumpReq.c_str(), "rb"))
-        {
-            char prefix[512]{};
-            const bool ok = std::fgets(prefix, sizeof(prefix), f) != nullptr;
-            std::fclose(f);
-            std::remove(p.dumpReq.c_str());
-            if (ok)
-            {
-                prefix[std::strcspn(prefix, "\r\n")] = 0;
-                p.dumpPrefix = prefix;
-                dumpNow = prefix[0] != 0;
-            }
-        }
-    }
-    const bool dump = dumpNow && p.sceneValid && p.recordDump(p.images[index]);
+    const bool dumpNow = p.dumpAt && ++p.presentCount == p.dumpAt;
+    // dumpAt is zero when the swapchain cannot be read back. A request that cannot be served this present
+    // (no scene, no host memory) stays in its file for the next one.
+    const std::string request =
+        (!dumpNow && p.dumpAt && !p.dumpReq.empty()) ? readDumpRequest(p.dumpReq.c_str()) : std::string();
+    const bool dump = (dumpNow || !request.empty()) && p.sceneValid && p.recordDump(p.images[index]);
     if (dumpNow && !dump)
         std::fprintf(stderr, "[host] present dump skipped at present %llu (no scene or no host memory)\n",
                      static_cast<unsigned long long>(p.presentCount));
@@ -763,7 +765,11 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     r = p.vk.vkQueuePresentKHR(p.queue, &pi);
     lock = {}; // writeDump waits on the fence; the queue is free again
     if (dump)
-        p.writeDump();
+    {
+        p.writeDump(request.empty() ? p.dumpPrefix : request);
+        if (!request.empty())
+            std::remove(p.dumpReq.c_str());
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         m_resizePending = true;
 }

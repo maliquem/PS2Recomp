@@ -299,18 +299,23 @@ namespace ps2_stubs
             static const char *padFile = std::getenv("PS2X_PAD_FILE");
             if (!useOverride && port == 0 && padFile && *padFile)
             {
+                // The last value read stays while the harness rewrites the file (empty for an instant).
+                static unsigned pressed = 0, lx = kPadAnalogCenter, ly = kPadAnalogCenter;
                 if (std::FILE *f = std::fopen(padFile, "rb"))
                 {
-                    unsigned pressed = 0, lx = kPadAnalogCenter, ly = kPadAnalogCenter;
-                    if (std::fscanf(f, "%x %x %x", &pressed, &lx, &ly) >= 1)
+                    unsigned p = 0, x = kPadAnalogCenter, y = kPadAnalogCenter;
+                    if (std::fscanf(f, "%x %x %x", &p, &x, &y) >= 1)
                     {
-                        state.buttons = static_cast<uint16_t>(~pressed);
-                        state.lx = static_cast<uint8_t>(lx);
-                        state.ly = static_cast<uint8_t>(ly);
-                        useOverride = true;
+                        pressed = p;
+                        lx = x;
+                        ly = y;
                     }
                     std::fclose(f);
                 }
+                state.buttons = static_cast<uint16_t>(~pressed);
+                state.lx = static_cast<uint8_t>(lx);
+                state.ly = static_cast<uint8_t>(ly);
+                useOverride = true;
             }
 
             bool usedBackend = false;

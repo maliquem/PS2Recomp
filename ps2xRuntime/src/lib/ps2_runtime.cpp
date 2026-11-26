@@ -1466,7 +1466,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
-        m_guestUnwinding = true;
+        m_guestUnwinding = kind != GuestBranchKind::Return; // jr $ra (strict diagnostics) is a plain return
         return false;
     }
 

@@ -25,6 +25,10 @@ inline OutputRect letterbox43(float w, float h)
     return {(w - dw) * 0.5f, (h - dh) * 0.5f, dw, dh};
 }
 
+// PS2X_PRESENT_DUMP_REQ: the prefix a test wrote in the request file, empty when nothing is asked. An empty or
+// unreadable file is deleted here; a valid one stays until the caller has taken the dump and deletes it.
+std::string readDumpRequest(const char *path);
+
 // Presents the GS output buffer through a Vulkan swapchain on the GS backend's device: buffer -> scene
 // image -> (post-process passes, none yet) -> letterboxed blit -> ImGui pass -> present. No CPU readback.
 class VkPresenter

@@ -1303,6 +1303,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 
         // Same rule as the Vulkan backend (recordSpriteUnlocked and the shader's field blend).
         const bool fieldBlend = state.spriteFieldBlend && !state.linearFilter && std::fabs(v1f - v0f) > spriteH;
+        const int fieldEdge = v1f < v0f ? 1 : 0; // the line edge on the lower-v side: a flipped sprite stays inside itself
 
         const bool ateEnabled = (ctx.test & 1u) != 0u;
         const bool dateEnabled = ((ctx.test >> 14) & 1u) != 0u;
@@ -1401,7 +1402,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                     const int v0i = wrapTextureCoordinate(vFixed >> 16, texH, wrapV, minV, maxV);
                     const int v1i = linear ? wrapTextureCoordinate((vFixed >> 16) + 1, texH, wrapV, minV, maxV) : v0i;
                     const int vFieldRaw = fieldBlend
-                                              ? static_cast<int32_t>((v0f + (v1f - v0f) * (static_cast<float>(y - unclippedY0) * invH)) * 65536.0f) >> 16
+                                              ? static_cast<int32_t>((v0f + (v1f - v0f) * (static_cast<float>(y - unclippedY0 + fieldEdge) * invH)) * 65536.0f) >> 16
                                               : (vFixed >> 16);
                     const int vFieldI = (vFieldRaw != (vFixed >> 16)) ? wrapTextureCoordinate(vFieldRaw, texH, wrapV, minV, maxV) : -1;
                     const uint32_t fy4 = static_cast<uint32_t>((vFixed >> 12) & 15);
@@ -1605,7 +1606,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         {
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
-            const float texVfField = v0f + (v1f - v0f) * (static_cast<float>(y - unclippedY0) / spriteH);
+            const float texVfField = v0f + (v1f - v0f) * (static_cast<float>(y - unclippedY0 + fieldEdge) / spriteH);
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
