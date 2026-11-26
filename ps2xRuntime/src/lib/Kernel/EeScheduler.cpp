@@ -1776,12 +1776,20 @@ int EeScheduler::allocateThreadId()
 
 GuestThread &EeScheduler::acquireInvocationThread()
 {
+    // The idle dispatcher closest to -1, not the first in map order: each one has its own guest stack, and the
+    // map order changes when a save state rebuilds the map, which would move the handler stack in RDRAM.
+    GuestThread *idle = nullptr;
     for (auto &[id, candidate] : m_threads)
     {
-        if (id < 0 && candidate.status == EeThreadStatus::Dormant && candidate.invocations.empty())
+        if (id < 0 && candidate.status == EeThreadStatus::Dormant && candidate.invocations.empty() &&
+            (!idle || id > idle->id))
         {
-            return candidate;
+            idle = &candidate;
         }
+    }
+    if (idle)
+    {
+        return *idle;
     }
 
     GuestThread dispatcher{};
@@ -2387,6 +2395,10 @@ namespace ps2x::state
            v.tlsBase, v.wait.reason, v.wait.payload, v.invocations);
         if (ar.loading())
         {
+            // The ready queues are indexed by priority: a damaged file must not index past them.
+            if (v.initialPriority < 0 || v.initialPriority >= EeScheduler::kPriorityCount ||
+                v.currentPriority < 0 || v.currentPriority >= EeScheduler::kPriorityCount)
+                throw std::runtime_error("save state has a thread priority out of range");
             v.wait.completion = {};
             v.resumeCompletion = {};
         }
@@ -2437,7 +2449,7 @@ void EeScheduler::stateIo(ps2x::state::Archive &ar)
        m_timeSliceExpired, m_insideInterrupt, m_pendingEeTimerInterrupts, m_eeCycle, m_sliceEndCycle,
        m_checkpointPending, m_invocationSequence, m_vsyncTick, m_vsyncFlagAddress, m_vsyncTickAddress,
        m_gsVSyncCallback, m_gsVSyncCallbackGp, m_gsVSyncCallbackSp, m_invocationStackTops,
-       m_spinProbeCountdown);
+       m_spinProbeCountdown, m_debugPublishCountdown);
 
     {
         std::lock_guard lock(m_eventMutex);
@@ -2460,7 +2472,7 @@ void EeScheduler::stateIo(ps2x::state::Archive &ar)
 
     if (ar.loading())
     {
-        m_debugPublishCountdown = 0u;
+        m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release); // read by the host thread
         publishSnapshot();
     }
 }

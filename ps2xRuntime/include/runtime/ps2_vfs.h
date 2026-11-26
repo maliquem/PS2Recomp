@@ -74,6 +74,7 @@ public:
     [[nodiscard]] std::vector<PS2VfsDescriptorInfo> descriptors() const;
     // Save state (Kernel/SaveState.cpp): refuses to save while a guest file is open.
     void stateIo(ps2x::state::Archive &ar);
+    [[nodiscard]] bool hasOpenFiles() const;
 
 private:
     struct OpenDescriptor

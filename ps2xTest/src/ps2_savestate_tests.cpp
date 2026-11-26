@@ -1,12 +1,19 @@
 #include "MiniTest.h"
 #include "runtime/ps2_audio_turbo.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_pacing.h"
+#include "runtime/ps2_savestate.h"
+#include "runtime/gs/gs_frontend.h"
 #include "ps2x/state_archive.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -93,6 +100,159 @@ void register_ps2_savestate_tests()
             for (size_t i = 2u * 2048u; i + 2u < out.size(); i += 2u)
                 maxStep = std::max(maxStep, std::abs(out[i + 2u] - out[i]));
             t.IsTrue(maxStep < 1300, "no discontinuity across the switch (max step " + std::to_string(maxStep) + ")");
+        });
+
+        tc.Run("Archive_unordered_map_bytes_do_not_depend_on_insertion_order", [](TestCase &t)
+        {
+            // Save, load, save again must give the same bytes, or a loaded state hashes differently.
+            std::unordered_map<uint32_t, uint32_t> a, b;
+            for (uint32_t i = 0; i < 200; ++i)
+                a[i * 2654435761u] = i;
+            for (uint32_t i = 200; i-- > 0;)
+                b[i * 2654435761u] = i;
+            std::vector<uint8_t> blobA, blobB, blobC;
+            {
+                ps2x::state::Archive ar(blobA);
+                ar(a);
+            }
+            {
+                ps2x::state::Archive ar(blobB);
+                ar(b);
+            }
+            t.IsTrue(blobA == blobB, "same contents, same bytes");
+            std::unordered_map<uint32_t, uint32_t> loaded;
+            ps2x::state::Archive in(blobA.data(), blobA.size());
+            in(loaded);
+            t.IsTrue(loaded == a, "round trip keeps the contents");
+            {
+                ps2x::state::Archive ar(blobC);
+                ar(loaded);
+            }
+            t.IsTrue(blobA == blobC, "a loaded map saves to the same bytes");
+        });
+
+        tc.Run("Archive_rejects_count_past_the_end", [](TestCase &t)
+        {
+            std::vector<uint32_t> v(4, 7u);
+            std::vector<uint8_t> blob;
+            {
+                ps2x::state::Archive ar(blob);
+                ar(v);
+            }
+            blob[0] = 0xFF; // count far larger than the bytes left
+            std::vector<uint32_t> out;
+            bool threw = false;
+            try
+            {
+                ps2x::state::Archive in(blob.data(), blob.size());
+                in(out);
+            }
+            catch (const std::runtime_error &)
+            {
+                threw = true;
+            }
+            t.IsTrue(threw, "a damaged count throws instead of allocating");
+        });
+
+        tc.Run("Frameskip_drops_only_back_buffer_and_stops_on_readback", [](TestCase &t)
+        {
+            using namespace ps2x::pacing;
+            constexpr uint32_t kA = 0u, kB = 70u; // two display buffers (FBP units)
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.display1 = 223ull << 44; // 224 rows: a 640x224 buffer is 70 pages, so B sits right after A
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            auto draw = [&](uint32_t fbp, bool textured = false, uint32_t tbp = 0u)
+            {
+                GSPrimitiveBatch batch{};
+                batch.state.context.frame.fbp = fbp;
+                batch.state.context.frame.fbw = 10u;
+                batch.state.prim.tme = textured;
+                batch.state.context.tex0.tbp0 = tbp;
+                return gs.frameskipDropsDraw(batch);
+            };
+
+            g_frameskipWant.store(false);
+            g_frameskipLatched.store(false);
+            g_frameskipDraws.store(false);
+            t.IsFalse(draw(kA), "off: nothing dropped");
+            t.IsTrue(g_frameskipDisplayDrawn.load(), "off: the display counts as drawn");
+
+            g_frameskipDraws.store(true);
+            regs.dispfb1 = kA;
+            t.IsFalse(draw(kB), "first frame is drawn");
+            g_frameskipLatched.store(true); // the host took the frame on display
+            regs.dispfb1 = kB;              // swap: A is the back buffer now
+            t.IsTrue(draw(kA), "after the latch, back-buffer draws are dropped");
+            t.IsFalse(draw(kB + 200u), "other render targets are drawn");
+            regs.dispfb1 = kA; // swap with a frame that lost draws
+            t.IsTrue(draw(kB), "still dropping until the host asks");
+            t.IsFalse(g_frameskipDisplayDrawn.load(), "a frame that lost draws is not latched");
+
+            t.IsTrue(draw(kB, true, (kB + 70u) * 32u), "a texture right after the back buffer is not a read of it");
+            t.IsFalse(draw(kB + 200u, true, kB * 32u), "texturing from the back buffer is drawn");
+            t.IsFalse(draw(kB), "once the game reads the back buffer, nothing more is dropped");
+
+            g_frameskipDraws.store(false);
+            t.IsFalse(draw(kA), "turbo off: drawn");
+            regs.dispfb1 = kB;
+            t.IsFalse(draw(kA), "turbo off: drawn after the swap");
+            t.IsFalse(g_frameskipDisplayDrawn.load(), "turbo off: the frame that lost draws is still not latched");
+            regs.dispfb1 = kA;
+            t.IsFalse(draw(kB), "turbo off: drawn");
+            t.IsTrue(g_frameskipDisplayDrawn.load(), "turbo off: the next full frame is latched");
+            t.IsFalse(draw(kB), "turbo off: back to idle");
+            g_frameskipDropped.store(0);
+            g_frameskipSubmitted.store(0);
+        });
+
+        tc.Run("StateFile_round_trip_and_rejections", [](TestCase &t)
+        {
+            namespace ss = ps2x::savestate;
+            const auto dir = std::filesystem::temp_directory_path() / "ps2x_savestate_test";
+            std::filesystem::create_directories(dir);
+            const auto path = dir / "GAME.slot1.ps2xstate";
+            const std::vector<uint8_t> payload(1000, 0x5A);
+            ss::writeStateFile(path, payload, "GAME", 42u, 7u);
+            t.IsTrue(ss::readStateFile(path, "GAME", 42u) == payload, "a written slot reads back");
+            t.IsFalse(std::filesystem::exists(path.string() + ".tmp"), "no temporary file left");
+
+            auto rejects = [&](const std::filesystem::path &file, const std::string &game, uint64_t exe, const std::string &why)
+            {
+                std::string message;
+                try
+                {
+                    (void)ss::readStateFile(file, game, exe);
+                }
+                catch (const std::runtime_error &e)
+                {
+                    message = e.what();
+                }
+                t.IsTrue(message.find(why) != std::string::npos, "rejected with '" + why + "' (got '" + message + "')");
+            };
+            rejects(dir / "missing.ps2xstate", "GAME", 42u, "no save state");
+            rejects(path, "OTHER", 42u, "another game");
+            rejects(path, "GAME", 43u, "different build");
+
+            auto damaged = [&](const char *name, auto change)
+            {
+                const auto copy = dir / name;
+                std::filesystem::copy_file(path, copy, std::filesystem::copy_options::overwrite_existing);
+                std::fstream f(copy, std::ios::in | std::ios::out | std::ios::binary);
+                change(f);
+                f.close();
+                return copy;
+            };
+            rejects(damaged("magic.ps2xstate", [](std::fstream &f) { f.seekp(0); f.put('X'); }), "GAME", 42u, "not a save state");
+            rejects(damaged("version.ps2xstate", [](std::fstream &f) { f.seekp(8); f.put(9); }), "GAME", 42u, "format");
+            rejects(damaged("payload.ps2xstate", [](std::fstream &f) { f.seekp(-1, std::ios::end); f.put(0); }), "GAME", 42u,
+                    "checksum");
+            const auto cut = damaged("cut.ps2xstate", [](std::fstream &) {});
+            std::filesystem::resize_file(cut, std::filesystem::file_size(cut) - 10u);
+            rejects(cut, "GAME", 42u, "corrupt");
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
         });
 
         tc.Run("PS2Memory_state_round_trip", [](TestCase &t)

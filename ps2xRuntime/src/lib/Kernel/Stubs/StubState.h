@@ -18,4 +18,9 @@ namespace ps2_stubs
     void mpegStubStateIo(ps2x::state::Archive &ar);
     void padStubStateIo(ps2x::state::Archive &ar);
     void sifStubStateIo(ps2x::state::Archive &ar);
+
+    // Why a save has to wait (a file or a movie in flight), or nullptr.
+    const char *libcStubBusy();
+    const char *mcStubBusy();
+    const char *mpegStubBusy();
 }

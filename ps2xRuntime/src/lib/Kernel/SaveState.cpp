@@ -30,7 +30,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <future>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -118,7 +117,7 @@ void PS2Vfs::stateIo(Archive &ar)
     // shortcut: an open guest file cannot be reopened at the same position after loading, so saving
     // waits until the game has closed its files (the retry window covers the usual short reads).
     if (!ar.loading() && !m_descriptors.empty())
-        throw std::runtime_error("a game file is open");
+        throw ps2x::state::StateBusy("a game file is open");
     if (ar.loading())
         m_descriptors.clear();
     ar(m_nextDescriptor);
@@ -170,6 +169,23 @@ namespace
         }
         ar(g_sif_module_id_by_path, g_next_sif_module_id);
     }
+}
+
+bool PS2Vfs::hasOpenFiles() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return !m_descriptors.empty();
+}
+
+const char *PS2Runtime::stateBusy()
+{
+    if (m_vfs.hasOpenFiles())
+        return "a game file is open";
+    if (const char *why = ps2_stubs::libcStubBusy())
+        return why;
+    if (const char *why = ps2_stubs::mcStubBusy())
+        return why;
+    return ps2_stubs::mpegStubBusy();
 }
 
 void PS2Runtime::stateIo(Archive &ar)
@@ -311,6 +327,7 @@ namespace ps2x::savestate
             std::filesystem::path hashLog;
             uint64_t hashFields = 300;
             bool turboAtStart = false;
+            bool padHotkeys = true; // PS2X_PAD_HOTKEYS=0 frees L3 combos for games that use them
             uint64_t turboFrom = 0, turboTo = 0; // turbo on for fields [from, to) (tests)
             bool exitAfterTest = true;
         };
@@ -336,7 +353,6 @@ namespace ps2x::savestate
         {
             Options opt;
             std::string gameId;
-            std::shared_future<uint64_t> exeHash;
 
             // Main thread -> EE.
             std::atomic<int> request{0}; // op | slot << 8, one atomic so the EE never sees a stale slot
@@ -348,11 +364,13 @@ namespace ps2x::savestate
             std::atomic<bool> turboHeld{false};
             std::atomic<int> frameskip{0};
             std::atomic<int> autoLevel{1};
+            std::atomic<bool> vpsRestart{false}; // a load moved the field counter: restart the VPS sample
             std::atomic<bool> gpuPresent{false};
             uint64_t hostFrame = 0;
 
             // EE side.
             uint64_t lastTick = ~0ull;
+            uint64_t requestTriedTick = ~0ull; // a waiting request is tried once per field
             bool startLoadDone = false;
             bool savedAt = false;
             std::vector<uint8_t> selftestState;
@@ -430,6 +448,15 @@ namespace ps2x::savestate
             return h;
         }
 
+        // Read on the first save or load, not at boot: players who never use save states pay nothing.
+        uint64_t exeHash()
+        {
+            static const uint64_t hash = computeExeHash();
+            if (hash == 0)
+                throw std::runtime_error("cannot read the game executable to tag the save state");
+            return hash;
+        }
+
         void say(const std::string &text)
         {
             Service &s = svc();
@@ -444,7 +471,9 @@ namespace ps2x::savestate
             const char *v = std::getenv(name);
             if (!v || !*v)
                 return fallback;
-            return std::strtoull(v, nullptr, 10);
+            char *end = nullptr;
+            const uint64_t value = std::strtoull(v, &end, 10);
+            return (end == v || *end != '\0') ? fallback : value;
         }
 
         Frameskip parseFrameskip(const char *v)
@@ -509,6 +538,7 @@ namespace ps2x::savestate
                 o.hashLog = h;
             o.hashFields = envU64("PS2X_SAVESTATE_HASH_FIELDS", 300);
             o.turboAtStart = envU64("PS2X_TURBO", 0) != 0;
+            o.padHotkeys = envU64("PS2X_PAD_HOTKEYS", 1) != 0;
             if (const char *r = std::getenv("PS2X_TURBO_FIELDS"); r && *r)
             {
                 o.turboFrom = std::strtoull(r, nullptr, 10);
@@ -612,54 +642,12 @@ namespace ps2x::savestate
 
         void writeFile(const std::filesystem::path &path, const std::vector<uint8_t> &payload, uint64_t tick)
         {
-            Service &s = svc();
-            FileHeader h{};
-            std::memcpy(h.magic, kMagic, sizeof(kMagic));
-            h.formatVersion = kFormatVersion;
-            h.headerSize = sizeof(FileHeader);
-            std::strncpy(h.gameId, s.gameId.c_str(), sizeof(h.gameId) - 1);
-            h.exeHash = s.exeHash.get();
-            h.payloadSize = payload.size();
-            h.payloadHash = hashBytes(payload.data(), payload.size());
-            h.vsyncTick = tick;
-
-            std::filesystem::create_directories(path.parent_path());
-            std::filesystem::path tmp = path;
-            tmp += ".tmp";
-            {
-                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-                out.write(reinterpret_cast<const char *>(&h), sizeof(h));
-                out.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
-                if (!out)
-                    throw std::runtime_error("cannot write " + tmp.string());
-            }
-            std::filesystem::rename(tmp, path);
+            writeStateFile(path, payload, svc().gameId, exeHash(), tick);
         }
 
         std::vector<uint8_t> readFile(const std::filesystem::path &path)
         {
-            Service &s = svc();
-            std::ifstream in(path, std::ios::binary);
-            if (!in)
-                throw std::runtime_error("no save state in this slot");
-            FileHeader h{};
-            in.read(reinterpret_cast<char *>(&h), sizeof(h));
-            if (!in || std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0)
-                throw std::runtime_error("not a save state file");
-            if (h.formatVersion != kFormatVersion || h.headerSize != sizeof(FileHeader))
-                throw std::runtime_error("save state format " + std::to_string(h.formatVersion) + " is not supported");
-            h.gameId[sizeof(h.gameId) - 1] = '\0';
-            if (s.gameId != h.gameId)
-                throw std::runtime_error(std::string("save state is for another game (") + h.gameId + ")");
-            if (h.exeHash != s.exeHash.get())
-                throw std::runtime_error("save state was made by a different build of the game");
-            if (h.payloadSize > (512ull << 20))
-                throw std::runtime_error("save state corrupt (size)");
-            std::vector<uint8_t> payload(static_cast<size_t>(h.payloadSize));
-            in.read(reinterpret_cast<char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
-            if (!in || hashBytes(payload.data(), payload.size()) != h.payloadHash)
-                throw std::runtime_error("save state corrupt (checksum)");
-            return payload;
+            return readStateFile(path, svc().gameId, exeHash());
         }
 
         std::filesystem::path resolveLoadTarget(const std::string &v)
@@ -704,7 +692,8 @@ namespace ps2x::savestate
             const uint64_t tick = rt.eeScheduler().currentVSyncTick();
             try
             {
-                if (!quiescent(rt))
+                // Cheap checks first: the capture copies ~40 MB and waits for the GPU.
+                if (!quiescent(rt) || (op == Op::Save && rt.stateBusy()))
                     return false;
                 if (op == Op::Save)
                 {
@@ -715,16 +704,17 @@ namespace ps2x::savestate
                 else
                 {
                     loadPayload(rt, readFile(slotPath(slot)));
+                    svc().vpsRestart.store(true, std::memory_order_relaxed);
                     say("Loaded state from slot " + std::to_string(slot));
                 }
             }
+            catch (const ps2x::state::StateBusy &)
+            {
+                return false; // a file or movie in flight: wait for a better moment inside the retry window
+            }
             catch (const std::exception &e)
             {
-                const std::string what = e.what();
-                // Host files or a movie in flight: wait for a better moment inside the retry window.
-                if (op == Op::Save && (what == "a game file is open" || what == "a host file is open (fopen)"))
-                    return false;
-                say(std::string(op == Op::Save ? "Save" : "Load") + " failed: " + what);
+                say(std::string(op == Op::Save ? "Save" : "Load") + " failed: " + e.what());
             }
             return true;
         }
@@ -737,27 +727,31 @@ namespace ps2x::savestate
             if (op == 0)
                 return;
             const auto now = std::chrono::steady_clock::now();
+            const uint64_t tick = rt.eeScheduler().currentVSyncTick();
             if (!s.requestWaiting)
             {
                 s.requestWaiting = true;
                 s.requestSince = now;
             }
+            else if (tick == s.requestTriedTick && now - s.requestSince < kQuiescenceTimeout)
+                return;
+            s.requestTriedTick = tick;
             if (!runRequest(rt, static_cast<Op>(op), packed >> 8))
             {
                 if (now - s.requestSince < kQuiescenceTimeout)
                     return;
-                say(std::string(op == static_cast<int>(Op::Save) ? "Save" : "Load") +
-                    " failed: the game is busy (loading or playing a movie), try again");
+                const char *why = rt.stateBusy();
+                say(std::string(op == static_cast<int>(Op::Save) ? "Save" : "Load") + " failed: the game is busy (" +
+                    (why ? why : "inside a system call") + "), try again");
             }
             s.requestWaiting = false;
             s.request.store(0, std::memory_order_release);
         }
 
-        // Save refused because a game file, host file or movie is in flight (a later field may work).
+        // Save refused because a file or movie is in flight (a later field may work).
         bool busyError(const std::exception &e)
         {
-            const std::string what = e.what();
-            return what == "a game file is open" || what == "a host file is open (fopen)" || what == "a movie is playing";
+            return dynamic_cast<const ps2x::state::StateBusy *>(&e) != nullptr;
         }
 
         void finishTest(PS2Runtime &rt)
@@ -800,7 +794,7 @@ namespace ps2x::savestate
 
             if (o.saveAtField != 0 && !s.savedAt && tick >= o.saveAtField)
             {
-                if (!quiescent(rt))
+                if (!quiescent(rt) || rt.stateBusy())
                     return;
                 try
                 {
@@ -829,7 +823,7 @@ namespace ps2x::savestate
             if (o.selftestField != 0)
             try
             {
-                if (s.selftestPhase == 0 && tick >= o.selftestField && quiescent(rt))
+                if (s.selftestPhase == 0 && tick >= o.selftestField && quiescent(rt) && !rt.stateBusy())
                 {
                     s.selftestState = captureMachine(rt);
                     s.selftestBase = tick;
@@ -892,6 +886,7 @@ namespace ps2x::savestate
                     try
                     {
                         loadPayload(rt, readFile(resolveLoadTarget(s.opt.loadAtStart)));
+                        s.vpsRestart.store(true, std::memory_order_relaxed);
                         say("Loaded state " + s.opt.loadAtStart + " (field " + std::to_string(rt.eeScheduler().currentVSyncTick()) + ")");
                         if (!s.opt.hashLog.empty())
                         {
@@ -952,13 +947,68 @@ namespace ps2x::savestate
         }
     }
 
+    void writeStateFile(const std::filesystem::path &path, const std::vector<uint8_t> &payload,
+                        const std::string &gameId, uint64_t exeHash, uint64_t vsyncTick)
+    {
+        FileHeader h{};
+        std::memcpy(h.magic, kMagic, sizeof(kMagic));
+        h.formatVersion = kFormatVersion;
+        h.headerSize = sizeof(FileHeader);
+        std::strncpy(h.gameId, gameId.c_str(), sizeof(h.gameId) - 1);
+        h.exeHash = exeHash;
+        h.payloadSize = payload.size();
+        h.payloadHash = hashBytes(payload.data(), payload.size());
+        h.vsyncTick = vsyncTick;
+
+        std::filesystem::create_directories(path.parent_path());
+        std::filesystem::path tmp = path;
+        tmp += ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char *>(&h), sizeof(h));
+            out.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            out.close(); // the last bytes are written here: never rename a cut-off file over a good slot
+            if (!out)
+            {
+                std::error_code ec;
+                std::filesystem::remove(tmp, ec);
+                throw std::runtime_error("cannot write " + tmp.string());
+            }
+        }
+        std::filesystem::rename(tmp, path);
+    }
+
+    std::vector<uint8_t> readStateFile(const std::filesystem::path &path, const std::string &gameId, uint64_t exeHash)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            throw std::runtime_error("no save state in this slot");
+        FileHeader h{};
+        in.read(reinterpret_cast<char *>(&h), sizeof(h));
+        if (!in || std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0)
+            throw std::runtime_error("not a save state file");
+        if (h.formatVersion != kFormatVersion || h.headerSize != sizeof(FileHeader))
+            throw std::runtime_error("save state format " + std::to_string(h.formatVersion) + " is not supported");
+        h.gameId[sizeof(h.gameId) - 1] = '\0';
+        if (gameId != h.gameId)
+            throw std::runtime_error(std::string("save state is for another game (") + h.gameId + ")");
+        if (h.exeHash != exeHash)
+            throw std::runtime_error("save state was made by a different build of the game");
+        if (h.payloadSize > (512ull << 20))
+            throw std::runtime_error("save state corrupt (size)");
+        std::vector<uint8_t> payload(static_cast<size_t>(h.payloadSize));
+        in.read(reinterpret_cast<char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+        if (!in || hashBytes(payload.data(), payload.size()) != h.payloadHash)
+            throw std::runtime_error("save state corrupt (checksum)");
+        return payload;
+    }
+
     void install(PS2Runtime &runtime)
     {
         Service &s = svc();
         s.opt = readOptions();
         s.gameId = PS2Runtime::getIoPaths().elfPath.filename().string();
         std::transform(s.gameId.begin(), s.gameId.end(), s.gameId.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        s.exeHash = std::async(std::launch::async, computeExeHash).share();
         s.frameskip.store(static_cast<int>(s.opt.frameskip), std::memory_order_relaxed);
         s.turboToggle.store(s.opt.turboAtStart, std::memory_order_relaxed);
 #if !PS2X_HOST_RAYLIB
@@ -970,13 +1020,13 @@ namespace ps2x::savestate
 
     void onHostFrame(PS2Runtime &runtime)
     {
-        (void)runtime;
         Service &s = svc();
         ++s.hostFrame;
         const auto now = std::chrono::steady_clock::now();
 
         int slot = s.opt.slot;
-        const bool comboHeld = IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_THUMB);
+        // Pad hotkeys all need L3 held, so plain game input never triggers them.
+        const bool comboHeld = s.opt.padHotkeys && IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_THUMB);
         const bool padSave = padPressed(GAMEPAD_BUTTON_RIGHT_TRIGGER_1) && comboHeld;
         const bool padLoad = padPressed(GAMEPAD_BUTTON_LEFT_TRIGGER_1) && comboHeld;
         const bool padPrev = padPressed(GAMEPAD_BUTTON_LEFT_FACE_LEFT) && comboHeld;
@@ -997,11 +1047,11 @@ namespace ps2x::savestate
         if (IsKeyPressed(KEY_F7) || padLoad)
             request(Op::Load, s.opt.slot);
 
-        // Turbo: F9 toggles, ` (grave) or R3 hold.
+        // Turbo: F9 toggles, ` (grave) or L3+R3 hold.
         const bool wasTurbo = turboActive();
         if (IsKeyPressed(KEY_F9))
             s.turboToggle.store(!s.turboToggle.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        s.turboHeld.store(IsKeyDown(KEY_GRAVE) || (IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_THUMB)),
+        s.turboHeld.store(IsKeyDown(KEY_GRAVE) || (comboHeld && IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_THUMB)),
                           std::memory_order_relaxed);
         if (IsKeyPressed(KEY_F10))
         {
@@ -1010,12 +1060,15 @@ namespace ps2x::savestate
             say(std::string("Turbo frameskip: ") + frameskipName(next));
         }
         const bool isTurbo = turboActive();
+        if (isTurbo != wasTurbo || s.vpsRestart.exchange(false, std::memory_order_relaxed))
+        {
+            s.vpsSince = now;
+            s.vpsTicks = runtime.memory().gs().vsyncTick.load(std::memory_order_acquire);
+        }
         if (isTurbo != wasTurbo)
         {
             applySpeed();
             s.autoLevel.store(1, std::memory_order_relaxed);
-            s.vpsSince = now;
-            s.vpsTicks = runtime.eeScheduler().currentVSyncTick();
             if (s.turboToggle.load(std::memory_order_relaxed) || !s.turboHeld.load(std::memory_order_relaxed))
                 say(isTurbo ? (s.opt.turboPercent ? "Turbo " + std::to_string(s.opt.turboPercent / 100.0).substr(0, 3) + "x" : std::string("Turbo unlimited"))
                             : std::string("Turbo off"));
@@ -1025,7 +1078,7 @@ namespace ps2x::savestate
         // speed and the dropped draws go to stdout.
         if (isTurbo && now - s.vpsSince >= std::chrono::seconds(1))
         {
-            const uint64_t ticks = runtime.eeScheduler().currentVSyncTick();
+            const uint64_t ticks = runtime.memory().gs().vsyncTick.load(std::memory_order_acquire);
             const double seconds = std::chrono::duration<double>(now - s.vpsSince).count();
             const double vps = static_cast<double>(ticks - s.vpsTicks) / seconds;
             const double target = s.opt.turboPercent ? 59.94 * s.opt.turboPercent / 100.0 : 1e9;
@@ -1036,7 +1089,10 @@ namespace ps2x::savestate
             const uint64_t dropped = ps2x::pacing::g_frameskipDropped.exchange(0, std::memory_order_relaxed);
             const uint64_t submitted = ps2x::pacing::g_frameskipSubmitted.exchange(0, std::memory_order_relaxed);
             std::cout << "[savestate] turbo " << static_cast<int>(vps + 0.5) << " VPS, frameskip " << effectiveFrameskip()
-                      << ", draws dropped " << dropped << " of " << (dropped + submitted) << std::endl;
+                      << ", draws dropped " << dropped << " of " << (dropped + submitted)
+                      << ", swaps " << ps2x::pacing::g_frameskipSwaps.exchange(0, std::memory_order_relaxed)
+                      << ", dropping frames " << ps2x::pacing::g_frameskipDropFrames.exchange(0, std::memory_order_relaxed)
+                      << ", reads back " << ps2x::pacing::g_frameskipReadsBack.load(std::memory_order_relaxed) << std::endl;
             s.vpsSince = now;
             s.vpsTicks = ticks;
         }

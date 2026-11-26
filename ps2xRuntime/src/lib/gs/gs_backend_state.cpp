@@ -9,6 +9,8 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_pacing.h"
 
+#include <algorithm>
+#include <iostream>
 #include <stdexcept>
 
 namespace
@@ -79,10 +81,47 @@ namespace
         uint32_t backFbp = 0;
         bool dropCurrent = false;
         bool hadDrops = false; // the frame in the back buffer lost draws
+        bool readsBack = false; // the game reads the back buffer (texture or transfer): never drop into it
+        uint32_t backRows = 512; // rows of the displayed frame buffer (DISPLAY height)
         SkipPhase phase = SkipPhase::Drawing;
     };
 
-    SkipState g_skip; // guarded by GS::m_stateMutex (vertexKick runs under it)
+    SkipState g_skip; // guarded by GS::m_stateMutex (vertexKick and TRXDIR run under it)
+
+    // Rows of the displayed frame buffer: DISPLAY height over the vertical magnification, halved in field mode.
+    uint32_t displayRows(const GSRegisters &regs)
+    {
+        const uint64_t display = (regs.pmode & 2u) ? regs.display2 : regs.display1;
+        uint32_t rows = static_cast<uint32_t>(((display >> 44) & 0x7FFu) + 1u) / static_cast<uint32_t>(((display >> 27) & 3u) + 1u);
+        if ((regs.smode2 & 3u) == 3u) // interlaced, field mode
+            rows = (rows + 1u) / 2u;
+        return std::clamp<uint32_t>(rows, 1u, 2048u);
+    }
+
+    // Once per turbo: which read stopped the drops (turbo stats on stdout).
+    void noteReadsBack(int why, uint32_t blockAddress, uint32_t fbw)
+    {
+        if (!g_skip.readsBack)
+            std::cout << "[frameskip] back buffer read (" << (why == 1 ? "texture" : "transfer") << "): block " << blockAddress
+                      << ", back fbp " << g_skip.backFbp << ", fbw " << fbw << ", rows " << g_skip.backRows << std::endl;
+        g_skip.readsBack = true;
+        ps2x::pacing::g_frameskipReadsBack.store(why, std::memory_order_relaxed);
+    }
+
+    // Counts PSMCT32 pages (32 rows): a 16-bit buffer is covered twice over, which only stops more drops.
+    bool readsBackBuffer(uint32_t blockAddress, uint32_t fbw)
+    {
+        const uint32_t start = g_skip.backFbp * 32u;
+        const uint32_t pages = std::max<uint32_t>(fbw, 1u) * ((g_skip.backRows + 31u) / 32u);
+        return g_skip.known && blockAddress >= start && blockAddress < start + pages * 32u;
+    }
+}
+
+void GS::frameskipNoteTransfer(const GSTransferCommand &command) const
+{
+    // Directions 1 (local to host) and 2 (local to local) read GS memory.
+    if ((command.direction == 1u || command.direction == 2u) && readsBackBuffer(command.bitbltbuf.sbp, command.bitbltbuf.sbw))
+        noteReadsBack(2, command.bitbltbuf.sbp, command.bitbltbuf.sbw);
 }
 
 bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
@@ -96,9 +135,11 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
         // Turbo ended: draw everything now; a frame that already lost draws is still not latched.
         g_skip.dropCurrent = false;
         g_skip.phase = SkipPhase::Drawing;
+        g_skip.readsBack = false;
         if (!g_skip.hadDrops)
         {
             g_skip.known = false;
+            g_frameskipDisplayDrawn.store(true, std::memory_order_release); // nothing dropped: the host may latch
             return false;
         }
     }
@@ -111,6 +152,7 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
         g_skip.known = true;
         g_skip.displayFbp = displayFbp;
         g_skip.backFbp = displayFbp;
+        g_skip.backRows = displayRows(*m_privRegs);
         g_skip.dropCurrent = false;
         g_skip.phase = SkipPhase::Drawing;
     }
@@ -120,8 +162,10 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
         g_frameskipDisplayDrawn.store(!g_skip.hadDrops, std::memory_order_release);
         g_skip.backFbp = g_skip.displayFbp;
         g_skip.displayFbp = displayFbp;
+        g_skip.backRows = displayRows(*m_privRegs);
         if (enabled)
         {
+            g_frameskipSwaps.fetch_add(1u, std::memory_order_relaxed);
             switch (g_skip.phase)
             {
             case SkipPhase::Drawing:
@@ -139,11 +183,16 @@ bool GS::frameskipDropsDraw(const GSPrimitiveBatch &batch) const
                 break;
             }
             g_skip.dropCurrent = g_skip.phase == SkipPhase::Dropping;
+            if (g_skip.dropCurrent)
+                g_frameskipDropFrames.fetch_add(1u, std::memory_order_relaxed);
         }
         g_skip.hadDrops = false;
     }
 
-    const bool drop = g_skip.dropCurrent && batch.state.context.frame.fbp == g_skip.backFbp;
+    const GSContext &context = batch.state.context;
+    if (batch.state.prim.tme && readsBackBuffer(context.tex0.tbp0, context.frame.fbw))
+        noteReadsBack(1, context.tex0.tbp0, context.frame.fbw);
+    const bool drop = g_skip.dropCurrent && !g_skip.readsBack && context.frame.fbp == g_skip.backFbp;
     g_skip.hadDrops = g_skip.hadDrops || drop;
     if (enabled)
         (drop ? g_frameskipDropped : g_frameskipSubmitted).fetch_add(1u, std::memory_order_relaxed);

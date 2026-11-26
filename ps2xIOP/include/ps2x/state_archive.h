@@ -4,6 +4,7 @@
 // The format is only valid for the exact same executable (checked by the save state header),
 // so trivially copyable types are written as raw bytes.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -22,6 +23,13 @@
 
 namespace ps2x::state
 {
+    // Saving refused for now (a file or movie in flight); a later field may work.
+    class StateBusy : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
     class Archive
     {
     public:
@@ -52,7 +60,8 @@ namespace ps2x::state
         uint64_t size(uint64_t value)
         {
             raw(&value, sizeof(value));
-            if (loading() && value > remaining() + (1ull << 32))
+            // Every element takes at least one byte, so a larger count is a damaged or crafted file.
+            if (loading() && value > remaining())
                 throw std::runtime_error("save state corrupt (size)");
             return value;
         }
@@ -209,19 +218,28 @@ namespace ps2x::state
             }
         }
 
-        // Unordered containers: iteration order matters to the guest when the runtime walks them
-        // (e.g. picking the first ready handler), so keep the bucket count and re-insert in the saved
-        // order. With the same standard library this reproduces the original iteration order.
+        // Unordered containers are written in key order, and loading does NOT keep the old iteration
+        // order: a walk over one must never pick "the first match" in a way the guest can see.
         template <typename M>
         void ioUnordered(Archive &ar, M &m)
         {
-            uint64_t buckets = m.bucket_count();
-            ar.raw(&buckets, sizeof(buckets));
             const uint64_t n = ar.size(m.size());
             if (!ar.loading())
             {
-                for (auto &e : m)
+                // Key order, so equal contents give equal bytes whatever the insertion history (hash tests).
+                std::vector<typename M::iterator> sorted;
+                sorted.reserve(m.size());
+                for (auto it = m.begin(); it != m.end(); ++it)
+                    sorted.push_back(it);
+                std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) {
+                    if constexpr (std::is_same_v<typename M::key_type, typename M::value_type>)
+                        return *a < *b;
+                    else
+                        return a->first < b->first;
+                });
+                for (auto &it : sorted)
                 {
+                    auto &e = *it;
                     if constexpr (std::is_same_v<typename M::key_type, typename M::value_type>)
                     {
                         auto key = e;
@@ -237,7 +255,6 @@ namespace ps2x::state
                 return;
             }
             M fresh;
-            fresh.rehash(static_cast<size_t>(buckets));
             for (uint64_t i = 0; i < n; ++i)
             {
                 typename M::key_type key{};

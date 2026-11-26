@@ -2536,10 +2536,13 @@ void PS2Runtime::run()
         bool freshField = false;
         if (!skipPresent)
         {
-            if (ps2x::pacing::g_frameskipDisplayDrawn.load(std::memory_order_acquire) || ++undrawnHostFrames > 4u)
+            const bool displayDrawn = ps2x::pacing::g_frameskipDisplayDrawn.load(std::memory_order_acquire);
+            if (displayDrawn || ++undrawnHostFrames > 4u)
             {
                 undrawnHostFrames = 0u;
-                ps2x::pacing::g_frameskipDisplayDrawn.store(true, std::memory_order_relaxed);
+                // Only the fallback marks the display drawn, so a GS swap meanwhile is never overwritten.
+                if (!displayDrawn)
+                    ps2x::pacing::g_frameskipDisplayDrawn.store(true, std::memory_order_relaxed);
                 freshField = LatchHostFrame(this, hostLatch, useFullMpegFrame);
                 if (freshField)
                     ps2x::pacing::g_frameskipLatched.store(true, std::memory_order_release);

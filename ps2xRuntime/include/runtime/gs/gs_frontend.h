@@ -156,6 +156,8 @@ public:
     void stateIo(ps2x::state::Archive &ar);
     // Turbo frameskip (gs_backend_state.cpp): true when this draw goes to a frame the host never shows.
     bool frameskipDropsDraw(const GSPrimitiveBatch &batch) const;
+    // Turbo frameskip: a transfer that reads the back buffer stops the dropping (the game reads that frame).
+    void frameskipNoteTransfer(const GSTransferCommand &command) const;
 
 private:
     void snapshotVRAM();

@@ -296,6 +296,8 @@ public:
     void run();
     // Whole-machine save state (Kernel/SaveState.cpp). Only at the EE scheduler safe point.
     void stateIo(ps2x::state::Archive &ar);
+    // Why a save state has to wait (a file or movie in flight), or nullptr.
+    [[nodiscard]] const char *stateBusy();
 
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);

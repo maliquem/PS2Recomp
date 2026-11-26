@@ -30,4 +30,7 @@ namespace ps2x::pacing
     inline std::atomic<bool> g_frameskipLatched{false};      // host: latched the drawn frame on display
     inline std::atomic<uint64_t> g_frameskipDropped{0};      // GS draws dropped / kept (turbo stats)
     inline std::atomic<uint64_t> g_frameskipSubmitted{0};
+    inline std::atomic<uint64_t> g_frameskipSwaps{0};        // display swaps / frames entering Dropping
+    inline std::atomic<uint64_t> g_frameskipDropFrames{0};
+    inline std::atomic<int> g_frameskipReadsBack{0};         // 0 no, 1 back buffer textured, 2 read by a transfer
 }

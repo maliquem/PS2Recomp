@@ -1199,14 +1199,17 @@ namespace ps2_stubs
 
 namespace ps2_stubs
 {
+    const char *libcStubBusy()
+    {
+        std::lock_guard<std::mutex> lock(g_file_mutex);
+        return g_file_map.empty() ? nullptr : "a host file is open (fopen)";
+    }
+
     void libcStubStateIo(ps2x::state::Archive &ar)
     {
         if (!ar.loading())
-        {
-            std::lock_guard<std::mutex> lock(g_file_mutex);
-            if (!g_file_map.empty())
-                throw std::runtime_error("a host file is open (fopen)");
-        }
+            if (const char *why = libcStubBusy())
+                throw ps2x::state::StateBusy(why);
         ar(g_randState, g_next_file_handle);
     }
 }
