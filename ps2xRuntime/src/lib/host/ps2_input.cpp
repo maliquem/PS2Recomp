@@ -380,7 +380,10 @@ namespace ps2input
         }
         loadBindings();
         if (!g_simPath.empty())
+        {
             std::fprintf(stderr, "[input] simulation from %s\n", g_simPath.c_str());
+            simJoystick(); // attach now: SDL only reports a pad's buttons once its ADDED event opened it
+        }
     }
 
     void shutdown()

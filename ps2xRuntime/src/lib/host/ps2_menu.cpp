@@ -84,6 +84,7 @@ namespace
 
     // EE side: scePadRead parks in waitWhileMenuOpen while the menu is open.
     std::atomic<bool> g_open{false};
+    bool g_comboHeld = false; // opened by Back+Start: the partner button's press must not close it again
     std::atomic<bool> g_parked{false};
     std::mutex g_pauseMutex;
     std::condition_variable g_pauseCv;
@@ -864,6 +865,14 @@ namespace ps2menu::host
             if (!openShortcut(e))
                 return false;
             setOpen(true);
+            g_comboHeld = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e.gbutton.button != SDL_GAMEPAD_BUTTON_GUIDE;
+            return true;
+        }
+        if (g_comboHeld && (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+            (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK || e.gbutton.button == SDL_GAMEPAD_BUTTON_START))
+        {
+            if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP)
+                g_comboHeld = false;
             return true;
         }
         if (g_capture != Capture::None)
