@@ -164,6 +164,10 @@ namespace ps2host
             if (scale == ps2fmv::kScaleNames[i])
                 ps2fmv::scale = i;
         ps2fmv::deband = ps2cfg::envBool("PS2X_FMV_DEBAND", "video.fmv_deband", false);
+        const std::string sharpen = ps2cfg::envString("PS2X_FMV_SHARPEN", "video.fmv_sharpen", "off");
+        for (int i = 0; i < 3; ++i)
+            if (sharpen == ps2fmv::kSharpenNames[i])
+                ps2fmv::sharpen = i;
         g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;

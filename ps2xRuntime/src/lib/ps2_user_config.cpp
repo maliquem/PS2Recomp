@@ -36,6 +36,8 @@ fmv_csc = true
 fmv_scale = "lanczos"
 # Smooth the colour steps in dark movie gradients (adds a fine dither). Not with "pixel".
 fmv_deband = false
+# Sharpen movies after scaling: "off", "light" or "medium". Medium also brings out compression blocks. Not with "pixel".
+fmv_sharpen = "off"
 
 [gs]
 # "vulkan" (default) or "cpu".

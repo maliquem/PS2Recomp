@@ -1,5 +1,5 @@
 #version 450
-// FMV steps 2 and 5 (Shadow Hearts plan 4.1): scales the movie frame (the scene image) to the letterbox rect with
+// FMV steps 2, 3 and 5 (Shadow Hearts plan 4.1): scales the movie frame (the scene image) to the letterbox rect with
 // a quality filter, optionally smoothing 8-bit banding in flat gradients, and writes 8-bit RGBA for a 1:1 blit.
 // Only runs while a movie is on screen; "Pixel" keeps the presenter's nearest blit and never gets here.
 
@@ -12,8 +12,9 @@ layout(push_constant, std430) uniform Params
 {
     ivec2 srcSize;
     ivec2 dstSize;
-    uint mode; // 1 bilinear, 2 bicubic (Catmull-Rom), 3 Lanczos-3 with anti-ringing
+    uint mode; // 1 bilinear, 2 bicubic (Catmull-Rom), 3 Lanczos-3 with anti-ringing, 4 RCAS (src and dst same size)
     uint deband;
+    float sharpen; // RCAS amount, mode 4
 } pc;
 
 vec3 texel(ivec2 p)
@@ -90,6 +91,20 @@ vec3 lanczos(vec2 p)
     return clamp(sum, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
 }
 
+// Step 3: FSR1 RCAS (MIT, AMD FidelityFX), no denoise. Sharpens by the largest negative lobe that cannot push any
+// channel out of the 0..1 range or past its four neighbours, so it does not ring.
+vec3 rcas(ivec2 q)
+{
+    vec3 b = texel(q + ivec2(0, -1)), d = texel(q + ivec2(-1, 0)), e = texel(q);
+    vec3 f = texel(q + ivec2(1, 0)), h = texel(q + ivec2(0, 1));
+    vec3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));
+    vec3 hitMin = min(mn4, e) / (4.0 * mx4 + 1e-6);
+    vec3 hitMax = (1.0 - max(mx4, e)) / (4.0 * mn4 - 4.0 - 1e-6);
+    vec3 l = max(-hitMin, hitMax);
+    float lobe = max(-0.1875, min(max(l.r, max(l.g, l.b)), 0.0)) * pc.sharpen;
+    return (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+}
+
 // Interleaved gradient noise (Jimenez 2014): cheap, evenly spread, close to blue noise; static so stills repeat.
 float ign(vec2 p)
 {
@@ -115,6 +130,11 @@ void main()
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(q, pc.dstSize)))
         return;
+    if (pc.mode == 4u)
+    {
+        imageStore(dst, q, vec4(clamp(rcas(q), 0.0, 1.0), 1.0));
+        return;
+    }
     vec2 p = (vec2(q) + 0.5) * vec2(pc.srcSize) / vec2(pc.dstSize) - 0.5;
     vec3 c = pc.mode == 3u ? lanczos(p) : pc.mode == 2u ? bicubic(p) : bilinear(p);
     if (pc.deband != 0u)

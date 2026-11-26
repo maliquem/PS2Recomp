@@ -24,6 +24,10 @@ namespace ps2fmv
     inline std::atomic<int> scale{Lanczos};
     // Step 5: smooth 8-bit banding in flat gradients, with dither (needs a filter other than Pixel).
     inline std::atomic<bool> deband{false};
+    // Step 3: FSR1 RCAS sharpening after the scale (off by default: 1.0 brought out blocks and grain in the photos).
+    inline constexpr const char *kSharpenNames[] = {"off", "light", "medium"};
+    inline constexpr float kSharpenAmounts[] = {0.0f, 0.25f, 0.5f};
+    inline std::atomic<int> sharpen{0};
 
     inline bool cscOn() { return enabled.load(std::memory_order_relaxed) && csc.load(std::memory_order_relaxed); }
     inline int scaleFilter() { return enabled.load(std::memory_order_relaxed) ? scale.load(std::memory_order_relaxed) : Pixel; }

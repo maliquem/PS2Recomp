@@ -104,6 +104,7 @@ namespace
     {
         int32_t srcW, srcH, dstW, dstH;
         uint32_t filter, deband;
+        float sharpen;
     };
 
     // §4 extension point: post-process passes run here on the scene image, between the GS copy and the
@@ -157,6 +158,7 @@ struct VkPresenter::Impl
     VkPipeline fmvPipeline = VK_NULL_HANDLE;
     VkDescriptorPool fmvPool = VK_NULL_HANDLE;
     VkDescriptorSet fmvSet = VK_NULL_HANDLE;
+    VkDescriptorSet fmvSharpenSet = VK_NULL_HANDLE; // step 3: fmvOut -> fmvSharp
     bool fmvSetStale = true; // scene or fmvOut was recreated since the set was written
     bool fmvFailed = false;
     bool fmvLogged = false; // last pass state logged: each movie start and end shows once
@@ -164,6 +166,9 @@ struct VkPresenter::Impl
     VkDeviceMemory fmvOutMemory = VK_NULL_HANDLE;
     VkImageView fmvOutView = VK_NULL_HANDLE;
     uint32_t fmvOutW = 0, fmvOutH = 0;
+    VkImage fmvSharp = VK_NULL_HANDLE; // same size as fmvOut
+    VkDeviceMemory fmvSharpMemory = VK_NULL_HANDLE;
+    VkImageView fmvSharpView = VK_NULL_HANDLE;
 
     bool imgui = false;
 
@@ -434,22 +439,23 @@ struct VkPresenter::Impl
             fmvPipeline = VK_NULL_HANDLE;
             return false;
         }
-        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2};
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpi.maxSets = 1;
+        dpi.maxSets = 2;
         dpi.poolSizeCount = 1;
         dpi.pPoolSizes = &size;
         if (vk.vkCreateDescriptorPool(device, &dpi, nullptr, &fmvPool) != VK_SUCCESS)
             return false;
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorPool = fmvPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &fmvSetLayout;
-        if (vk.vkAllocateDescriptorSets(device, &ai, &fmvSet) != VK_SUCCESS)
-        {
-            fmvSet = VK_NULL_HANDLE;
+        const VkDescriptorSetLayout layouts[2] = {fmvSetLayout, fmvSetLayout};
+        ai.descriptorSetCount = 2;
+        ai.pSetLayouts = layouts;
+        VkDescriptorSet sets[2]{};
+        if (vk.vkAllocateDescriptorSets(device, &ai, sets) != VK_SUCCESS)
             return false;
-        }
+        fmvSet = sets[0];
+        fmvSharpenSet = sets[1];
         fmvFailed = false;
         return true;
     }
@@ -459,14 +465,19 @@ struct VkPresenter::Impl
     bool ensureFmvTarget(uint32_t w, uint32_t h)
     {
         if (fmvOut && (w != fmvOutW || h != fmvOutH))
+        {
             destroyImage(fmvOut, fmvOutMemory, fmvOutView);
+            destroyImage(fmvSharp, fmvSharpMemory, fmvSharpView);
+        }
         if (!fmvOut)
         {
             fmvSetStale = true;
-            if (!createImage(w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, fmvOut, fmvOutMemory,
-                             fmvOutView))
+            const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            if (!createImage(w, h, usage, fmvOut, fmvOutMemory, fmvOutView) ||
+                !createImage(w, h, usage, fmvSharp, fmvSharpMemory, fmvSharpView))
             {
                 destroyImage(fmvOut, fmvOutMemory, fmvOutView);
+                destroyImage(fmvSharp, fmvSharpMemory, fmvSharpView);
                 return false;
             }
             fmvOutW = w;
@@ -474,19 +485,21 @@ struct VkPresenter::Impl
         }
         if (fmvSetStale)
         {
-            const VkDescriptorImageInfo img[2] = {{VK_NULL_HANDLE, sceneView, VK_IMAGE_LAYOUT_GENERAL},
-                                                  {VK_NULL_HANDLE, fmvOutView, VK_IMAGE_LAYOUT_GENERAL}};
-            VkWriteDescriptorSet wr[2]{};
-            for (uint32_t i = 0; i < 2; ++i)
+            const VkDescriptorImageInfo img[4] = {{VK_NULL_HANDLE, sceneView, VK_IMAGE_LAYOUT_GENERAL},
+                                                  {VK_NULL_HANDLE, fmvOutView, VK_IMAGE_LAYOUT_GENERAL},
+                                                  {VK_NULL_HANDLE, fmvOutView, VK_IMAGE_LAYOUT_GENERAL},
+                                                  {VK_NULL_HANDLE, fmvSharpView, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet wr[4]{};
+            for (uint32_t i = 0; i < 4; ++i)
             {
                 wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                wr[i].dstSet = fmvSet;
-                wr[i].dstBinding = i;
+                wr[i].dstSet = i < 2 ? fmvSet : fmvSharpenSet;
+                wr[i].dstBinding = i % 2;
                 wr[i].descriptorCount = 1;
                 wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 wr[i].pImageInfo = &img[i];
             }
-            vk.vkUpdateDescriptorSets(device, 2, wr, 0, nullptr);
+            vk.vkUpdateDescriptorSets(device, 4, wr, 0, nullptr);
             fmvSetStale = false;
         }
         return true;
@@ -495,6 +508,7 @@ struct VkPresenter::Impl
     void destroyFmv()
     {
         destroyImage(fmvOut, fmvOutMemory, fmvOutView);
+        destroyImage(fmvSharp, fmvSharpMemory, fmvSharpView);
         if (fmvPool)
             vk.vkDestroyDescriptorPool(device, fmvPool, nullptr); // frees the set
         if (fmvPipeline)
@@ -643,20 +657,23 @@ struct VkPresenter::Impl
     }
 
     // FMV steps 2/5: scales the movie scene into fmvOut (rect size); true when the letterbox should copy fmvOut.
-    bool recordFmvScale(const OutputRect &r)
+    // Returns the image holding the filtered movie frame (rect-sized, TRANSFER_SRC), or null for the plain blit.
+    VkImage recordFmvScale(const OutputRect &r)
     {
         const int filter = ps2fmv::scaleFilter();
+        const float sharpen = ps2fmv::kSharpenAmounts[ps2fmv::sharpen.load(std::memory_order_relaxed)];
         const bool on = sceneValid && sceneMovie && filter != ps2fmv::Pixel;
         const uint32_t w = static_cast<uint32_t>(r.w), h = static_cast<uint32_t>(r.h);
         const bool run = on && w && h && ensureFmvPipeline() && ensureFmvTarget(w, h);
         if (run != fmvLogged)
         {
-            std::fprintf(stderr, "[host] FMV scale pass %s (filter=%s %ux%u -> %ux%u deband=%d)\n", run ? "on" : "off",
-                         ps2fmv::kScaleNames[filter], sceneW, sceneH, w, h, ps2fmv::deband.load() ? 1 : 0);
+            std::fprintf(stderr, "[host] FMV scale pass %s (filter=%s %ux%u -> %ux%u deband=%d sharpen=%.2f)\n",
+                         run ? "on" : "off", ps2fmv::kScaleNames[filter], sceneW, sceneH, w, h,
+                         ps2fmv::deband.load() ? 1 : 0, sharpen);
             fmvLogged = run;
         }
         if (!run)
-            return false;
+            return VK_NULL_HANDLE;
         imageBarrier(vk, cmd, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -667,23 +684,42 @@ struct VkPresenter::Impl
         vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fmvLayout, 0, 1, &fmvSet, 0, nullptr);
         const FmvParams params{static_cast<int32_t>(sceneW), static_cast<int32_t>(sceneH), static_cast<int32_t>(w),
                                static_cast<int32_t>(h), static_cast<uint32_t>(filter),
-                               ps2fmv::deband.load(std::memory_order_relaxed) ? 1u : 0u};
+                               ps2fmv::deband.load(std::memory_order_relaxed) ? 1u : 0u, 0.0f};
         vk.vkCmdPushConstants(cmd, fmvLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
         vk.vkCmdDispatch(cmd, (w + 15) / 16, (h + 7) / 8, 1);
-        imageBarrier(vk, cmd, fmvOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VkImage result = fmvOut;
+        if (sharpen > 0.0f)
+        {
+            // Step 3: RCAS reads fmvOut's neighbours, so it is a second dispatch into fmvSharp.
+            imageBarrier(vk, cmd, fmvOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            imageBarrier(vk, cmd, fmvSharp, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fmvLayout, 0, 1, &fmvSharpenSet, 0,
+                                       nullptr);
+            const FmvParams sp{static_cast<int32_t>(w), static_cast<int32_t>(h), static_cast<int32_t>(w),
+                               static_cast<int32_t>(h), 4u, 0u, sharpen};
+            vk.vkCmdPushConstants(cmd, fmvLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sp), &sp);
+            vk.vkCmdDispatch(cmd, (w + 15) / 16, (h + 7) / 8, 1);
+            result = fmvSharp;
+        }
+        imageBarrier(vk, cmd, result, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         // The next frame's copy and the dump expect the scene back in TRANSFER_SRC.
         imageBarrier(vk, cmd, scene, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                      VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        return true;
+        return result;
     }
 
     void recordLetterbox(VkImage target)
     {
         const OutputRect r = letterbox43(static_cast<float>(extent.width), static_cast<float>(extent.height));
-        const bool scaled = recordFmvScale(r);
+        const VkImage filtered = recordFmvScale(r);
+        const bool scaled = filtered != VK_NULL_HANDLE;
         imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      0, VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -704,7 +740,7 @@ struct VkPresenter::Impl
             blit.dstOffsets[0] = {x0, y0, 0};
             blit.dstOffsets[1] = {x0 + static_cast<int32_t>(dw), y0 + static_cast<int32_t>(dh), 1};
             // Point filtering, as the raylib path drew it; a filtered movie frame is already rect-sized (1:1).
-            vk.vkCmdBlitImage(cmd, scaled ? fmvOut : scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+            vk.vkCmdBlitImage(cmd, scaled ? filtered : scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
         }
         imageBarrier(vk, cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,

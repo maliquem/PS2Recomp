@@ -262,6 +262,17 @@ namespace
             };
             display.items.push_back(std::move(it));
         }
+        {
+            Item it{Kind::Choice, {"FMV: sharpening", "FMV: nitidez"}};
+            it.choices = {{"Off", "Desligada"}, {"Light", "Leve"}, {"Medium", "Média"}};
+            it.getIndex = [] { return ps2fmv::sharpen.load(); };
+            it.setIndex = [](int i) {
+                ps2fmv::sharpen = i;
+                ps2cfg::setString("video.fmv_sharpen", ps2fmv::kSharpenNames[i]);
+                ps2cfg::save();
+            };
+            display.items.push_back(std::move(it));
+        }
         display.items.push_back(toggle({"FMV: smooth banding", "FMV: suavizar faixas"}, [] { return ps2fmv::deband.load(); }, [](bool on) {
             ps2fmv::deband = on;
             ps2cfg::setBool("video.fmv_deband", on);
