@@ -1301,6 +1301,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         if (spriteH < 1.0f)
             spriteH = 1.0f;
 
+        // Same rule as the Vulkan backend (recordSpriteUnlocked and the shader's field blend).
+        const bool fieldBlend = state.spriteFieldBlend && !state.linearFilter && std::fabs(v1f - v0f) > spriteH;
+        const int fieldEdge = v1f < v0f ? 1 : 0; // the line edge on the lower-v side: a flipped sprite stays inside itself
+
         const bool ateEnabled = (ctx.test & 1u) != 0u;
         const bool dateEnabled = ((ctx.test >> 14) & 1u) != 0u;
         const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
@@ -1397,6 +1401,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                     const int32_t vFixed = static_cast<int32_t>((texVf - (linear ? 0.5f : 0.0f)) * 65536.0f);
                     const int v0i = wrapTextureCoordinate(vFixed >> 16, texH, wrapV, minV, maxV);
                     const int v1i = linear ? wrapTextureCoordinate((vFixed >> 16) + 1, texH, wrapV, minV, maxV) : v0i;
+                    const int vFieldRaw = fieldBlend
+                                              ? static_cast<int32_t>((v0f + (v1f - v0f) * (static_cast<float>(y - unclippedY0 + fieldEdge) * invH)) * 65536.0f) >> 16
+                                              : (vFixed >> 16);
+                    const int vFieldI = (vFieldRaw != (vFixed >> 16)) ? wrapTextureCoordinate(vFieldRaw, texH, wrapV, minV, maxV) : -1;
                     const uint32_t fy4 = static_cast<uint32_t>((vFixed >> 12) & 15);
                     const uint32_t ify4 = 16u - fy4;
                     int32_t uCur = uBaseFixed;
@@ -1427,6 +1435,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                         {
                             const int u0i = wrapTextureCoordinate(uCur >> 16, texW, wrapU, minU, maxU);
                             texel = readTexelRaw(u0i, v0i);
+                            if (vFieldI >= 0)
+                                texel = blendFieldTexels(texel, readTexelRaw(u0i, vFieldI), tex.tcc != 0u);
                         }
                         else
                         {
@@ -1596,24 +1606,27 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         {
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
+            const float texVfField = v0f + (v1f - v0f) * (static_cast<float>(y - unclippedY0 + fieldEdge) / spriteH);
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
                 float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
-                uint32_t texel = 0xFFFF00FFu;
-                if (state.prim.fst)
+                auto sampleRow = [&](float rowV) -> uint32_t
                 {
-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
-                }
-                else
-                {
-                    texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
-                }
+                    if (state.prim.fst)
+                    {
+                        const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
+                        const int fixedV = static_cast<int>((rowV * 16.0f) + 0.5f);
+                        const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+                        const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+                        return SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+                    }
+                    return SampleTexture(state, texUf / static_cast<float>(texW), rowV / static_cast<float>(texH), 1.0f, 0u, 0u);
+                };
+                uint32_t texel = sampleRow(texVf);
+                if (fieldBlend) // the same row twice blends to itself
+                    texel = blendFieldTexels(texel, sampleRow(texVfField), tex.tcc != 0u);
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);

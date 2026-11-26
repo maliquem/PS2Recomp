@@ -210,6 +210,111 @@ namespace
         runtime->requestStop();
     }
 
+    constexpr uint32_t kRecurCallerPc = 0x00160600u;
+    constexpr uint32_t kRecurCallerResumePc = 0x00160608u;
+    constexpr uint32_t kRecurPc = 0x00160610u;
+    constexpr uint32_t kRecurResumePc = 0x00160618u;
+    constexpr uint32_t kRecurSp = 0x001F0000u;
+    uint32_t g_recurEpilogues = 0u;
+    uint32_t g_recurCallerSp = 0u;
+
+    // What the recompiler emits for "jal recur" and the code after it.
+    void recurCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kRecurCallerPc)
+        {
+            setRegU32(*ctx, 29, kRecurSp);
+            setRegU32(*ctx, 4, 1u);
+            setRegU32(*ctx, 31, kRecurCallerResumePc);
+            ctx->pc = kRecurPc;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kRecurPc, kRecurCallerPc, kRecurCallerResumePc,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "recur"))
+            {
+                return;
+            }
+        }
+        g_recurCallerSp = ::getRegU32(ctx, 29);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // A function that calls its own address (a0 levels deep), keeping ra in a stack frame. The
+    // nested call is made with a checkpoint due, so it yields with ctx->pc == kRecurPc.
+    void recur(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kRecurPc)
+        {
+            const uint32_t depth = ::getRegU32(ctx, 4);
+            if (depth == 0u)
+            {
+                ctx->pc = ::getRegU32(ctx, 31);
+                return;
+            }
+            const uint32_t sp = ::getRegU32(ctx, 29) - 16u;
+            setRegU32(*ctx, 29, sp);
+            writeGuestU32(rdram, sp, ::getRegU32(ctx, 31));
+            setRegU32(*ctx, 4, depth - 1u);
+            EeEvent wake;
+            wake.type = EeEventType::Dmac; // handled as a no-op: only makes the next checkpoint due
+            runtime->eeScheduler().postEvent(wake);
+            setRegU32(*ctx, 31, kRecurResumePc);
+            ctx->pc = kRecurPc;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kRecurPc, kRecurPc, kRecurResumePc,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "recur"))
+            {
+                return;
+            }
+        }
+        ++g_recurEpilogues;
+        const uint32_t sp = ::getRegU32(ctx, 29);
+        setRegU32(*ctx, 29, sp + 16u);
+        ctx->pc = readGuestU32(rdram, sp);
+    }
+
+    constexpr uint32_t kLoopCallerPc = 0x00160620u;
+    constexpr uint32_t kLoopCallerResumePc = 0x00160628u;
+    constexpr uint32_t kLoopPc = 0x00160630u;
+    uint32_t g_loopIterations = 0u;
+    uint32_t g_loopSeenByCaller = 0u;
+    uint32_t g_loopYields = 0u;
+
+    void loopCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kLoopCallerPc)
+        {
+            setRegU32(*ctx, 31, kLoopCallerResumePc);
+            ctx->pc = kLoopPc;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kLoopPc, kLoopCallerPc, kLoopCallerResumePc,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "loopBack"))
+            {
+                return;
+            }
+        }
+        g_loopSeenByCaller = g_loopIterations;
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // A function whose loop goes back to its first instruction: the back edge's checkpoint yields
+    // with ctx->pc == kLoopPc.
+    void loopBack(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        while (g_loopIterations < 2u)
+        {
+            ++g_loopIterations;
+            EeEvent wake;
+            wake.type = EeEventType::Dmac; // handled as a no-op: only makes the next checkpoint due
+            runtime->eeScheduler().postEvent(wake);
+            ctx->pc = kLoopPc;
+            if (runtime->eeCheckpointDue(1u))
+            {
+                ++g_loopYields;
+                return;
+            }
+        }
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
     void runSpin(const std::vector<uint32_t> &loopCode, PS2Runtime::RecompiledFunction entry = spinEntry)
     {
         TestEnv env;
@@ -623,6 +728,43 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("a call that yields at the callee's own entry address is not taken as returned", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kRecurCallerPc, recurCaller);
+            env.runtime.registerFunction(kRecurCallerResumePc, recurCaller);
+            env.runtime.registerFunction(kRecurPc, recur);
+            env.runtime.registerFunction(kRecurResumePc, recur);
+            g_recurEpilogues = 0u;
+            g_recurCallerSp = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kRecurCallerPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_recurEpilogues, 1u, "the outer call must run its epilogue before its caller continues");
+            t.Equals(g_recurCallerSp, kRecurSp, "the caller must continue with its own stack pointer");
+        });
+
+        tc.Run("a loop that yields at the callee's own entry address is not taken as returned", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kLoopCallerPc, loopCaller);
+            env.runtime.registerFunction(kLoopCallerResumePc, loopCaller);
+            env.runtime.registerFunction(kLoopPc, loopBack);
+            g_loopIterations = 0u;
+            g_loopSeenByCaller = 0u;
+            g_loopYields = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kLoopCallerPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_loopYields > 0u, "the loop must have yielded at its own entry for this test to mean anything");
+            t.Equals(g_loopSeenByCaller, 2u, "the callee's loop must finish before its caller continues");
         });
 
         tc.Run("pure spin loops are skipped to the same cycle as running every iteration", [](TestCase &t)

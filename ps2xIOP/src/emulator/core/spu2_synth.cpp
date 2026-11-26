@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -665,5 +666,10 @@ namespace ps2x::iop::detail
         }
 
         return anyActive;
+    }
+
+    void Spu2Synth::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_ram, m_rawRegs, m_cores, m_admas);
     }
 }

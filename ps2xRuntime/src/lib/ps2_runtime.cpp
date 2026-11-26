@@ -7,11 +7,16 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_vulkan_backend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_pacing.h"
+#include "runtime/ps2_savestate.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#if !PS2X_HOST_RAYLIB
+#include "ps2_user_config.h"
+#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -90,6 +95,10 @@ namespace
 {
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+    // Console newlib rounds a request to (size + 4 + 15) & ~15 with a 4-byte header, so a request that
+    // is a multiple of 16 has 12 spare bytes there, and games write into them (Shadow Hearts puts a
+    // VIF word right after its last packet). The same rounding here keeps those writes off the next block.
+    constexpr uint32_t kGuestHeapBlockSlack = 4u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
 
@@ -716,8 +725,13 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     {
+#if PS2X_HOST_RAYLIB
         const char *backendEnv = std::getenv("PS2X_GS_BACKEND");
         const bool forceCpu = backendEnv && (std::strcmp(backendEnv, "cpu") == 0 || std::strcmp(backendEnv, "CPU") == 0);
+#else
+        const std::string backend = ps2cfg::envString("PS2X_GS_BACKEND", "gs.backend", "vulkan");
+        const bool forceCpu = backend == "cpu" || backend == "CPU";
+#endif
         if (!forceCpu)
         {
             std::string vkReason;
@@ -1448,7 +1462,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    m_guestUnwinding = m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles);
+    if (m_guestUnwinding)
     {
         return false;
     }
@@ -1461,6 +1476,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        m_guestUnwinding = kind != GuestBranchKind::Return; // jr $ra (strict diagnostics) is a plain return
         return false;
     }
 
@@ -1490,7 +1506,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    // The callee left through a checkpoint or a jump: ctx->pc is where to resume, even when it
+    // equals entryPc (a call to its own address, a loop back to its first instruction).
+    if (isStopRequested() || ctx->pc == 0u || m_guestUnwinding)
     {
         return false;
     }
@@ -1798,12 +1816,12 @@ uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
     }
 
     const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
-    if (size > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u)))
+    if (size > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u) - kGuestHeapBlockSlack))
     {
         return 0u;
     }
 
-    const uint32_t allocSize = alignGuestHeapValue(size, kGuestHeapDefaultAlignment);
+    const uint32_t allocSize = alignGuestHeapValue(size + kGuestHeapBlockSlack, kGuestHeapDefaultAlignment);
     if (allocSize == 0u)
     {
         return 0u;
@@ -1957,13 +1975,13 @@ uint32_t PS2Runtime::guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t
         return 0u;
     }
 
-    if (newSize > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u)))
+    if (newSize > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u) - kGuestHeapBlockSlack))
     {
         return 0u;
     }
 
     const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
-    const uint32_t requestedSize = alignGuestHeapValue(newSize, kGuestHeapDefaultAlignment);
+    const uint32_t requestedSize = alignGuestHeapValue(newSize + kGuestHeapBlockSlack, kGuestHeapDefaultAlignment);
 
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
     ensureGuestHeapInitializedLocked();
@@ -2306,19 +2324,15 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->loopCheckpointDue(cycles);
+    m_guestUnwinding = m_eeScheduler->loopCheckpointDue(cycles);
+    return m_guestUnwinding;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
 {
     const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
     const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
-    m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
-                             0,
-                             [resumePc](R5900Context &context)
-                             {
-                                 context.pc = resumePc;
-                             });
+    m_eeScheduler->waitVSyncResumeAt(currentTick + waitTicks - 1u, 0, resumePc);
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)
@@ -2462,6 +2476,7 @@ void PS2Runtime::run()
 #endif
 
     std::atomic<bool> gameThreadFinished{false};
+    ps2x::savestate::install(*this);
 
     std::thread gameThread([&]()
                            {
@@ -2488,6 +2503,7 @@ void PS2Runtime::run()
     const auto elfName = getIoPaths().elfPath.filename().string();
     const bool useFullMpegFrame = elfName == "SLUS_203.47" || elfName == "slus_203.47";
     uint64_t tick = 0;
+    uint32_t undrawnHostFrames = 0u;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2529,19 +2545,41 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+        ps2x::savestate::onHostFrame(*this);
         ps2host::beginFrame();
-        const bool freshField = LatchHostFrame(this, hostLatch, useFullMpegFrame);
+        // Turbo frameskip: level 1 skips presents; level 2 latches only a frame the GS drew in full
+        // (a few host frames at most, so a game that stopped flipping still shows).
+        const bool skipPresent = ps2x::savestate::skipPresent();
+        bool freshField = false;
+        if (!skipPresent)
+        {
+            const bool displayDrawn = ps2x::pacing::g_frameskipDisplayDrawn.load(std::memory_order_acquire);
+            if (displayDrawn || ++undrawnHostFrames > 4u)
+            {
+                undrawnHostFrames = 0u;
+                // Only the fallback marks the display drawn, so a GS swap meanwhile is never overwritten.
+                if (!displayDrawn)
+                    ps2x::pacing::g_frameskipDisplayDrawn.store(true, std::memory_order_relaxed);
+                freshField = LatchHostFrame(this, hostLatch, useFullMpegFrame);
+                if (freshField)
+                    ps2x::pacing::g_frameskipLatched.store(true, std::memory_order_release);
+            }
+            else
+            {
+                ps2x::pacing::g_frameskipWant.store(true, std::memory_order_release);
+            }
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        if (ps2host::gpuPresent())
+        if (!skipPresent)
         {
-            ps2host::presentGpuFrame(hostLatch.gpu, freshField);
-        }
-        else
-        {
-            ps2host::presentPixels(hostLatch.pixels.data(), hostLatch.width, hostLatch.width, hostLatch.height, freshField);
+            ps2host::drawOverlay(m_memory.gs().vsyncTick.load(std::memory_order_relaxed));
+            if (ps2host::gpuPresent())
+                ps2host::presentGpuFrame(hostLatch.gpu, freshField);
+            else
+                ps2host::presentPixels(hostLatch.pixels.data(), hostLatch.width, hostLatch.width, hostLatch.height, freshField);
         }
         ps2host::waitNextFrame();
 #else

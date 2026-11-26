@@ -8,8 +8,8 @@
 class GS;
 struct GSGpuFrame;
 
-// shortcut: raylib-named input shim over SDL3 so Pad.cpp/ps2_pad.cpp keep today's mapping unchanged;
-// replace with the real input layer (rebind, rumble, per-player config) in Etapa F.
+// raylib-named input shim kept for the debug panel (F1 keys) and the raylib build; the game reads
+// ps2host::padInput (rebindable, see ps2_input.cpp) and the SDL host reports no gamepad here.
 // Key values are SDL scancodes (checked in ps2_host_sdl.cpp).
 enum HostKey : int
 {
@@ -29,8 +29,15 @@ enum HostKey : int
     KEY_ESCAPE = 41,
     KEY_TAB = 43,
     KEY_SPACE = 44,
+    KEY_GRAVE = 53,
     KEY_F1 = 58,
     KEY_F3 = 60,
+    KEY_F5 = 62,
+    KEY_F6 = 63,
+    KEY_F7 = 64,
+    KEY_F8 = 65,
+    KEY_F9 = 66,
+    KEY_F10 = 67,
     KEY_RIGHT = 79,
     KEY_LEFT = 80,
     KEY_DOWN = 81,
@@ -108,9 +115,35 @@ namespace ps2host
     // Shows "<title> - <suffix>"; null or empty restores the title.
     void setWindowTitleSuffix(const char *suffix);
 
-    // Dev-tools ImGui drawn over the game in the presenter's pass.
+    // ImGui drawn over the game in the presenter's pass (debug panel, FPS counter, pause menu).
+    // Begin/End may be called by several users per loop; the frame is rendered once in drawOverlay.
     bool imguiInit();
     void imguiShutdown();
     bool imguiBeginFrame();
     void imguiEndFrame();
+    // Main thread, after the debug UI and before present: FPS counter (F3) and the pause menu.
+    void drawOverlay(uint64_t vsyncTick);
+
+    // Main thread. setShowFps saves display.show_fps; setVsync applies at once (the menu saves display.vsync).
+    bool showFps();
+    void setShowFps(bool on);
+    bool vsync();
+    void setVsync(bool on);
+
+    // DualShock 2 state for one port, built on the main thread from the bindings (ps2_input.cpp).
+    struct PadInput
+    {
+        uint16_t held = 0; // PS2 button bits (libpad order), 1 = pressed
+        uint8_t rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
+        // Pressure in libpad order (Right, Left, Up, Down, Triangle, Circle, Cross, Square, L1, L2, R1, R2);
+        // 0xFF for buttons not held, so a button forced from elsewhere reads as a full press.
+        uint8_t pressure[12] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    };
+    // Any thread. Neutral while the pause menu is open.
+    PadInput padInput(int port);
+    // Any thread: DS2 motors (small is on/off, large 0..255), applied by the main thread.
+    void setRumble(int port, uint8_t small, uint8_t large);
+    // EE thread, from scePadRead: while the pause menu is open, blocks up to `timeoutMs` and returns true
+    // (the caller loops, checking for a stop request); returns false at once when the menu is closed.
+    bool waitWhileMenuOpen(int timeoutMs);
 }

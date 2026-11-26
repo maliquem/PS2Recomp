@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -740,5 +741,14 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+
+    void IopKernel::stateIo(ps2x::state::Archive &ar)
+    {
+        // Saved only between IOP timeslices, when no thread is current.
+        if (!ar.loading() && m_currentThread != nullptr)
+            throw std::runtime_error("IOP thread is running");
+        ar(m_threads, m_semaphores, m_eventFlags, m_nextThreadId, m_nextSemaphoreId, m_nextEventFlagId);
+        m_currentThread = nullptr;
     }
 }

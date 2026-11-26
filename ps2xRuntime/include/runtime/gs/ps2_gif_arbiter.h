@@ -5,6 +5,11 @@
 #include <functional>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 enum class GifPathId : uint8_t
 {
     Path1 = 1,
@@ -35,6 +40,7 @@ public:
 
     void drain();
     bool empty() const { return m_queue.empty(); }
+    void stateIo(ps2x::state::Archive &ar);
 
 private:
     ProcessPacketFn m_processFn;

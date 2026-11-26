@@ -1,4 +1,8 @@
 #include "ps2_host_sdl.h"
+#include "ps2_input.h"
+#include "ps2_menu_host.h"
+#include "ps2_menu.h"
+#include "ps2_user_config.h"
 #include "ps2_vk_presenter.h"
 
 #include "runtime/gs/gs_frontend.h"
@@ -25,6 +29,7 @@ static_assert(KEY_A == SDL_SCANCODE_A && KEY_C == SDL_SCANCODE_C && KEY_D == SDL
               KEY_X == SDL_SCANCODE_X && KEY_Z == SDL_SCANCODE_Z && KEY_ONE == SDL_SCANCODE_1 && KEY_THREE == SDL_SCANCODE_3 &&
               KEY_ENTER == SDL_SCANCODE_RETURN && KEY_ESCAPE == SDL_SCANCODE_ESCAPE && KEY_TAB == SDL_SCANCODE_TAB &&
               KEY_SPACE == SDL_SCANCODE_SPACE && KEY_F1 == SDL_SCANCODE_F1 && KEY_F3 == SDL_SCANCODE_F3 &&
+              KEY_GRAVE == SDL_SCANCODE_GRAVE && KEY_F5 == SDL_SCANCODE_F5 && KEY_F10 == SDL_SCANCODE_F10 &&
               KEY_RIGHT == SDL_SCANCODE_RIGHT &&
               KEY_LEFT == SDL_SCANCODE_LEFT && KEY_DOWN == SDL_SCANCODE_DOWN && KEY_UP == SDL_SCANCODE_UP &&
               KEY_KP_1 == SDL_SCANCODE_KP_1 && KEY_KP_0 == SDL_SCANCODE_KP_0 && KEY_LEFT_CONTROL == SDL_SCANCODE_LCTRL &&
@@ -34,21 +39,11 @@ static_assert(KEY_A == SDL_SCANCODE_A && KEY_C == SDL_SCANCODE_C && KEY_D == SDL
 
 namespace
 {
-    constexpr int kMaxPads = 4;
     constexpr uint64_t kFramePeriodNs = 1000000000ull / 60ull;
-
-    struct PadSnapshot
-    {
-        std::atomic<bool> connected{false};
-        std::atomic<uint32_t> buttons{0};
-        std::atomic<float> axes[GAMEPAD_AXIS_COUNT]{};
-    };
 
     std::atomic<bool> g_windowReady{false};
     std::atomic<uint8_t> g_keys[SDL_SCANCODE_COUNT]{};
     std::atomic<uint8_t> g_pressed[SDL_SCANCODE_COUNT]{};
-    PadSnapshot g_pads[kMaxPads];
-    SDL_Gamepad *g_padHandles[kMaxPads]{};
 
     SDL_Window *g_window = nullptr;
     SDL_AudioDeviceID g_audio = 0;
@@ -60,8 +55,16 @@ namespace
     int g_textureW = 0, g_textureH = 0;
 
     bool g_imguiContext = false;
+    bool g_imguiFrameBegun = false;
     bool g_imguiFrameReady = false;
     bool g_imguiDrewLastFrame = false; // ImGui only drains its input queue inside NewFrame
+    bool g_vsync = false;
+
+    // F3 counter: presents per second (FPS) and EE VBlanks per second (VPS).
+    bool g_showRate = false;
+    uint64_t g_rateStartNs = 0, g_rateTick = 0;
+    unsigned int g_rateFrames = 0;
+    float g_fps = 0.0f, g_vps = 0.0f;
     uint64_t g_nextFrameNs = 0;
     std::string g_baseTitle;
 
@@ -69,59 +72,6 @@ namespace
     {
         const char *v = std::getenv(name);
         return v && *v && std::strcmp(v, "0") != 0;
-    }
-
-    void snapshotPads()
-    {
-        static const SDL_GamepadButton kButtons[GAMEPAD_BUTTON_COUNT] = {
-            SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT,
-            SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_WEST,
-            SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_INVALID,
-            SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK};
-        static const SDL_GamepadAxis kAxes[GAMEPAD_AXIS_COUNT] = {
-            SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY};
-        for (int i = 0; i < kMaxPads; ++i)
-        {
-            SDL_Gamepad *pad = g_padHandles[i];
-            g_pads[i].connected.store(pad != nullptr, std::memory_order_relaxed);
-            if (!pad)
-                continue;
-            uint32_t bits = 0;
-            for (int b = 0; b < GAMEPAD_BUTTON_COUNT; ++b)
-                if (kButtons[b] != SDL_GAMEPAD_BUTTON_INVALID && SDL_GetGamepadButton(pad, kButtons[b]))
-                    bits |= 1u << b;
-            // Analog triggers count as pressed past half travel (raylib/GLFW reported them as buttons).
-            if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384)
-                bits |= 1u << GAMEPAD_BUTTON_LEFT_TRIGGER_2;
-            if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384)
-                bits |= 1u << GAMEPAD_BUTTON_RIGHT_TRIGGER_2;
-            g_pads[i].buttons.store(bits, std::memory_order_relaxed);
-            for (int a = 0; a < GAMEPAD_AXIS_COUNT; ++a)
-                g_pads[i].axes[a].store(std::max(-1.0f, SDL_GetGamepadAxis(pad, kAxes[a]) / 32767.0f), std::memory_order_relaxed);
-        }
-    }
-
-    void addPad(SDL_JoystickID id)
-    {
-        for (SDL_Gamepad *pad : g_padHandles)
-            if (pad && SDL_GetGamepadID(pad) == id)
-                return;
-        for (SDL_Gamepad *&slot : g_padHandles)
-            if (!slot)
-            {
-                slot = SDL_OpenGamepad(id);
-                return;
-            }
-    }
-
-    void removePad(SDL_JoystickID id)
-    {
-        for (SDL_Gamepad *&slot : g_padHandles)
-            if (slot && SDL_GetGamepadID(slot) == id)
-            {
-                SDL_CloseGamepad(slot);
-                slot = nullptr;
-            }
     }
 
     void toggleFullscreen(bool exclusive)
@@ -161,24 +111,10 @@ bool IsKeyPressed(int key)
     return key > 0 && key < SDL_SCANCODE_COUNT && g_pressed[key].load(std::memory_order_relaxed) != 0;
 }
 
-bool IsGamepadAvailable(int gamepad)
-{
-    return gamepad >= 0 && gamepad < kMaxPads && g_pads[gamepad].connected.load(std::memory_order_relaxed);
-}
-
-bool IsGamepadButtonDown(int gamepad, int button)
-{
-    if (!IsGamepadAvailable(gamepad) || button < 0 || button >= GAMEPAD_BUTTON_COUNT)
-        return false;
-    return (g_pads[gamepad].buttons.load(std::memory_order_relaxed) >> button) & 1u;
-}
-
-float GetGamepadAxisMovement(int gamepad, int axis)
-{
-    if (!IsGamepadAvailable(gamepad) || axis < 0 || axis >= GAMEPAD_AXIS_COUNT)
-        return 0.0f;
-    return g_pads[gamepad].axes[axis].load(std::memory_order_relaxed);
-}
+// Controllers are read through ps2host::padInput (bindings, both ports); the raylib-named gamepad shim reports none.
+bool IsGamepadAvailable(int) { return false; }
+bool IsGamepadButtonDown(int, int) { return false; }
+float GetGamepadAxisMovement(int, int) { return 0.0f; }
 
 namespace ps2host
 {
@@ -192,6 +128,7 @@ namespace ps2host
         // Without audio or gamepads the game still runs (muted / keyboard only).
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
             std::fprintf(stderr, "[host] no audio subsystem: %s\n", SDL_GetError());
+        ps2input::preInit();
         if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
             std::fprintf(stderr, "[host] no gamepad subsystem: %s\n", SDL_GetError());
         if (!SDL_Vulkan_LoadLibrary(nullptr))
@@ -211,10 +148,14 @@ namespace ps2host
     bool openWindow(const char *title, int width, int height, GS &gs)
     {
         const bool hidden = envFlag("PS2X_HIDDEN_WINDOW");
-        // Default: visible windows sync to the display (no tearing); hidden runs are measurements and do not.
+        if (!hidden)
+            ps2cfg::writeTemplateIfMissing(); // test runs leave the player's folder alone
+        // Visible windows follow the player file (default on); hidden runs are measurements and do not sync.
         // An explicit PS2X_VSYNC wins either way (PS2X_VSYNC=1 paces hidden parity runs).
         const char *vsyncEnv = std::getenv("PS2X_VSYNC");
-        const bool vsync = (vsyncEnv && *vsyncEnv) ? envFlag("PS2X_VSYNC") : !hidden;
+        const bool vsync = (vsyncEnv && *vsyncEnv) ? envFlag("PS2X_VSYNC") : (!hidden && ps2cfg::getBool("display.vsync", true));
+        g_vsync = vsync;
+        g_showRate = ps2cfg::envBool("PS2X_SHOW_FPS", "display.show_fps", false);
         g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;
@@ -248,6 +189,11 @@ namespace ps2host
         if (!g_audio)
             std::fprintf(stderr, "[host] no audio device: %s\n", SDL_GetError());
 
+        ps2input::init(g_window);
+        // The pause menu draws through ImGui, so the host owns the ImGui context (with or without the debug panel).
+        if (imguiInit())
+            ps2menu::host::init(g_window);
+
         g_windowReady.store(true, std::memory_order_relaxed);
         g_nextFrameNs = SDL_GetTicksNS();
         return true;
@@ -256,7 +202,9 @@ namespace ps2host
     void shutdown()
     {
         g_windowReady.store(false, std::memory_order_relaxed);
+        ps2menu::host::shutdown();
         imguiShutdown();
+        ps2menu::host::freeTextures();
         if (g_presenter)
             g_presenter->shutdown();
         g_presenter.reset();
@@ -269,12 +217,7 @@ namespace ps2host
         if (g_audio)
             SDL_CloseAudioDevice(g_audio);
         g_audio = 0;
-        for (SDL_Gamepad *&pad : g_padHandles)
-            if (pad)
-            {
-                SDL_CloseGamepad(pad);
-                pad = nullptr;
-            }
+        ps2input::shutdown();
         if (g_window)
             SDL_DestroyWindow(g_window);
         g_window = nullptr;
@@ -294,15 +237,16 @@ namespace ps2host
     bool pumpEvents()
     {
         bool keepRunning = true;
+        const bool wasOpen = ps2menu::isOpen(); // the press that closes the menu must not reach the game
         for (auto &p : g_pressed)
             p.store(0, std::memory_order_relaxed);
         const bool forwardToImgui = g_imguiContext && g_imguiDrewLastFrame;
         g_imguiDrewLastFrame = false;
+        ps2input::pollSimulation();
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {
-            if (forwardToImgui)
-                ImGui_ImplSDL3_ProcessEvent(&e);
+            ps2input::handleEvent(e);
             switch (e.type)
             {
             case SDL_EVENT_QUIT:
@@ -314,40 +258,46 @@ namespace ps2host
                 if (g_presenter)
                     g_presenter->requestResize();
                 break;
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                for (auto &k : g_keys)
+                    k.store(0, std::memory_order_relaxed);
+                break;
             case SDL_EVENT_KEY_DOWN:
                 if (e.key.repeat)
                     break;
-                if (e.key.scancode < SDL_SCANCODE_COUNT)
-                    g_pressed[e.key.scancode].store(1, std::memory_order_relaxed);
-                if (e.key.scancode == SDL_SCANCODE_ESCAPE)
-                    keepRunning = false; // raylib's default exit key; kept so ESC still quits
-                else if (e.key.scancode == SDL_SCANCODE_F11)
-                    toggleFullscreen(false);
-                else if (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))
+                if (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))
+                {
                     toggleFullscreen(true);
-                break;
-            case SDL_EVENT_GAMEPAD_ADDED:
-                addPad(e.gdevice.which);
-                break;
-            case SDL_EVENT_GAMEPAD_REMOVED:
-                removePad(e.gdevice.which);
+                    continue; // Enter is Start: Alt+Enter must not reach the game or the menu
+                }
+                if (ps2menu::isOpen())
+                    break; // F3/F11 are bindable: the menu (key capture) gets them
+                if (e.key.scancode == SDL_SCANCODE_F11)
+                    toggleFullscreen(false);
+                else if (e.key.scancode == SDL_SCANCODE_F3)
+                    setShowFps(!g_showRate);
                 break;
             default:
                 break;
             }
+            if (ps2menu::host::handleEvent(e))
+                continue; // the menu took it (open, or its shortcut)
+            if (forwardToImgui)
+                ImGui_ImplSDL3_ProcessEvent(&e);
+            if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) && e.key.scancode < SDL_SCANCODE_COUNT)
+            {
+                g_keys[e.key.scancode].store(e.key.down ? 1 : 0, std::memory_order_relaxed);
+                if (e.key.down && !e.key.repeat)
+                    g_pressed[e.key.scancode].store(1, std::memory_order_relaxed);
+            }
         }
-        int numKeys = 0;
-        const bool *state = SDL_GetKeyboardState(&numKeys);
-        for (int i = 0; i < SDL_SCANCODE_COUNT && i < numKeys; ++i)
-            g_keys[i].store(state[i] ? 1 : 0, std::memory_order_relaxed);
-        // Enter is Start on the pad: Alt+Enter toggles fullscreen and must not press Start too.
-        if (SDL_GetModState() & SDL_KMOD_ALT)
-        {
-            g_keys[SDL_SCANCODE_RETURN].store(0, std::memory_order_relaxed);
-            g_pressed[SDL_SCANCODE_RETURN].store(0, std::memory_order_relaxed);
-        }
-        snapshotPads();
-        return keepRunning;
+        const bool menuOpen = ps2menu::isOpen();
+        if (menuOpen)
+            for (auto &k : g_keys)
+                k.store(0, std::memory_order_relaxed);
+        ps2input::update(menuOpen || wasOpen);
+        ps2menu::host::update();
+        return keepRunning && !ps2menu::host::quitRequested();
     }
 
     void presentGpuFrame(const GSGpuFrame &frame, bool fresh)
@@ -377,6 +327,23 @@ namespace ps2host
                 g_textureH = static_cast<int>(height);
             }
             SDL_UpdateTexture(g_texture, nullptr, rgba, static_cast<int>(rowPixels * 4u));
+            // PS2X_PRESENT_DUMP_REQ on the CPU path: same request file as the Vulkan presenter, scene only.
+            static const char *dumpReq = std::getenv("PS2X_PRESENT_DUMP_REQ");
+            if (dumpReq && *dumpReq)
+            {
+                if (const std::string prefix = readDumpRequest(dumpReq); !prefix.empty())
+                {
+                    if (std::FILE *out = std::fopen((prefix + ".scene.ppm").c_str(), "wb"))
+                    {
+                        std::fprintf(out, "P6\n%u %u\n255\n", width, height);
+                        for (uint32_t y = 0; y < height; ++y)
+                            for (uint32_t x = 0; x < width; ++x)
+                                std::fwrite(rgba + (size_t(y) * rowPixels + x) * 4u, 1, 3, out);
+                        std::fclose(out);
+                    }
+                    std::remove(dumpReq);
+                }
+            }
         }
         else if (fresh && g_texture)
         {
@@ -449,6 +416,7 @@ namespace ps2host
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
         g_imguiContext = false;
+        g_imguiFrameBegun = false;
         g_imguiFrameReady = false;
     }
 
@@ -456,21 +424,90 @@ namespace ps2host
     {
         if (!g_imguiContext)
             return false;
+        if (g_imguiFrameBegun)
+            return true;
         if (g_presenter)
             g_presenter->imguiNewFrame();
         else
             ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        g_imguiFrameBegun = true;
         return true;
     }
 
-    void imguiEndFrame()
+    void imguiEndFrame() {} // the frame is rendered once in drawOverlay, after the counter and the menu
+
+    void drawOverlay(uint64_t vsyncTick)
     {
-        if (!g_imguiContext)
+        if (g_showRate)
+        {
+            const uint64_t now = SDL_GetTicksNS();
+            if (g_rateStartNs == 0)
+            {
+                g_rateStartNs = now;
+                g_rateTick = vsyncTick;
+                g_rateFrames = 0;
+            }
+            else if (++g_rateFrames, now - g_rateStartNs >= 1000000000ull)
+            {
+                // Called once per host present, so its call rate is the screen FPS.
+                const double secs = static_cast<double>(now - g_rateStartNs) / 1e9;
+                g_fps = static_cast<float>(g_rateFrames / secs);
+                g_vps = static_cast<float>(static_cast<double>(vsyncTick - g_rateTick) / secs);
+                g_rateStartNs = now;
+                g_rateTick = vsyncTick;
+                g_rateFrames = 0;
+                char text[64];
+                std::snprintf(text, sizeof(text), "%.0f FPS / %.0f VPS", g_fps, g_vps);
+                setWindowTitleSuffix(text);
+            }
+        }
+        const bool menu = ps2menu::isOpen();
+        if (!g_imguiFrameBegun && !g_showRate && !menu)
+            return; // nothing over the game: no ImGui frame at all
+        if (!imguiBeginFrame())
             return;
+        if (g_showRate)
+        {
+            ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f));
+            ImGui::SetNextWindowBgAlpha(0.6f);
+            ImGui::Begin("##rate", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
+            ImGui::Text("%.0f FPS  %.0f VPS", g_fps, g_vps);
+            ImGui::End();
+        }
+        if (menu)
+            ps2menu::host::render();
         ImGui::Render();
+        g_imguiFrameBegun = false;
         g_imguiFrameReady = true;
         g_imguiDrewLastFrame = true;
+    }
+
+    bool showFps() { return g_showRate; }
+
+    void setShowFps(bool on)
+    {
+        if (on == g_showRate)
+            return;
+        g_showRate = on;
+        g_rateStartNs = 0;
+        if (!on)
+            setWindowTitleSuffix(nullptr);
+        ps2cfg::setBool("display.show_fps", on);
+        ps2cfg::save();
+    }
+
+    bool vsync() { return g_vsync; }
+
+    void setVsync(bool on)
+    {
+        g_vsync = on;
+        if (g_presenter)
+            g_presenter->setVsync(on);
+        else if (g_renderer)
+            SDL_SetRenderVSync(g_renderer, on ? 1 : 0);
     }
 }

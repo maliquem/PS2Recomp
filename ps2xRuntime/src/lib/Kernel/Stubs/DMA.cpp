@@ -234,3 +234,15 @@ namespace ps2_stubs
         TODO_NAMED("sceDmaWatch", rdram, ctx, runtime);
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void dmaStubStateIo(ps2x::state::Archive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
+        ar(g_dmaCurrentEnv);
+    }
+}

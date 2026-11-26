@@ -25,7 +25,7 @@ namespace
     constexpr uint16_t PAD_L2 = 0x0100u;
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -38,6 +38,17 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
+#if !PS2X_HOST_RAYLIB
+    // Bindings, both controllers and the keyboard are resolved by the host (ps2_input.cpp).
+    const ps2host::PadInput in = ps2host::padInput(port);
+    btns = static_cast<uint16_t>(~in.held);
+    data[4] = in.rx;
+    data[5] = in.ry;
+    data[6] = in.lx;
+    data[7] = in.ly;
+#else
+    (void)port;
+    std::memset(data + 8, 0xFF, 12); // full pressure; Pad.cpp reports it only for held buttons
     constexpr int kGamepad = 0;
     const bool useGamepad = IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
@@ -118,8 +129,16 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
     }
+#endif
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
+#if !PS2X_HOST_RAYLIB
+    // Pressure bytes in libpad order; Pad.cpp only reports them in pressure mode.
+    static constexpr uint16_t kPressureMask[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
+                                                   PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_L2, PAD_R1, PAD_R2};
+    for (int i = 0; i < 12; ++i)
+        data[8 + i] = (btns & kPressureMask[i]) ? 0 : in.pressure[i];
+#endif
     return true;
 }

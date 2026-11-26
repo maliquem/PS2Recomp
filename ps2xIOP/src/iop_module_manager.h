@@ -10,6 +10,11 @@
 #include <unordered_set>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopModuleManager
@@ -28,12 +33,18 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isLoaded(std::span<const std::string_view> aliases) const;
         [[nodiscard]] bool recognizes(std::string_view path) const;
 
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
+
     private:
         struct Record
         {
             std::string key;
             uint32_t references = 0u;
             bool physical = false;
+
+            template <class A>
+            void stateIo(A &ar) { ar(key, references, physical); }
         };
 
         void addLoadedKey(std::string_view key);

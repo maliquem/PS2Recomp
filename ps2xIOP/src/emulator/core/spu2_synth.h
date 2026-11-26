@@ -7,6 +7,11 @@
 #include <memory>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     // Minimal hardware-accurate PS2 SPU2 core: 2 MiB SPU2 RAM, 2 cores x 24 ADPCM voices,
@@ -42,6 +47,9 @@ namespace ps2x::iop::detail
 
         // The AutoDMA PCM block is mixed by the caller; it passes through here only to reach the trace.
         void traceAutoDma(int core, int32_t volL, int32_t volR, const uint8_t *block1024);
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         enum class AdsrPhase : uint8_t

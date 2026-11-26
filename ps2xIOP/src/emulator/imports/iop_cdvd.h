@@ -4,6 +4,11 @@
 #include <memory>
 #include <optional>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop
 {
     class IopHost;
@@ -35,6 +40,9 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         class Impl;

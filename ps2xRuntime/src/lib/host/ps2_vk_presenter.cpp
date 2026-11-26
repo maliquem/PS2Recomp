@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -99,6 +101,7 @@ struct VkPresenter::Impl
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSurfaceFormatKHR format{};
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR unsyncedMode = VK_PRESENT_MODE_FIFO_KHR; // best non-vsync mode the surface offers
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D extent{};
     std::vector<VkImage> images;
@@ -126,6 +129,7 @@ struct VkPresenter::Impl
     // image as presented and the scene it was blitted from, to check colors on the presented pixels.
     std::string dumpPrefix;
     uint64_t dumpAt = 0, presentCount = 0;
+    std::string dumpReq; // PS2X_PRESENT_DUMP_REQ: while this file exists, dump to the prefix it holds, then delete it
     VkBuffer dumpBuffer = VK_NULL_HANDLE;
     VkDeviceMemory dumpMemory = VK_NULL_HANDLE;
 
@@ -402,7 +406,7 @@ struct VkPresenter::Impl
     }
 
     // Binary PPMs (RGB); the swapchain may be BGRA.
-    void writeDump()
+    void writeDump(const std::string &dumpPrefix)
     {
         waitFence();
         void *mapped = nullptr;
@@ -482,6 +486,20 @@ struct VkPresenter::Impl
     }
 };
 
+std::string readDumpRequest(const char *path)
+{
+    std::FILE *f = std::fopen(path, "rb");
+    if (!f)
+        return {};
+    char prefix[512]{};
+    const bool ok = std::fgets(prefix, sizeof(prefix), f) != nullptr;
+    std::fclose(f);
+    prefix[std::strcspn(prefix, "\r\n")] = 0;
+    if (!ok || !prefix[0])
+        std::remove(path);
+    return prefix;
+}
+
 VkPresenter::VkPresenter() : m(std::make_unique<Impl>()) {}
 VkPresenter::~VkPresenter() { shutdown(); }
 
@@ -501,6 +519,12 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
         const char *at = std::getenv("PS2X_PRESENT_DUMP_AT");
         p.dumpPrefix = dump;
         p.dumpAt = (at && *at) ? std::strtoull(at, nullptr, 10) : 600u;
+    }
+    if (const char *req = std::getenv("PS2X_PRESENT_DUMP_REQ"); req && *req)
+    {
+        p.dumpReq = req;
+        if (!p.dumpAt)
+            p.dumpAt = UINT64_MAX; // never reached: only enables the transfer-source swapchain the dump needs
     }
     if (!ctx.swapchainEnabled || !p.instance || !p.device || !p.queue)
     {
@@ -565,14 +589,11 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
     std::vector<VkPresentModeKHR> modes(count);
     p.vk.vkGetPhysicalDeviceSurfacePresentModesKHR(p.physicalDevice, p.surface, &count, modes.data());
     auto has = [&](VkPresentModeKHR mode) { return std::find(modes.begin(), modes.end(), mode) != modes.end(); };
-    p.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    if (!vsync)
-    {
-        if (has(VK_PRESENT_MODE_MAILBOX_KHR))
-            p.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-        else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
-            p.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    }
+    if (has(VK_PRESENT_MODE_MAILBOX_KHR))
+        p.unsyncedMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
+        p.unsyncedMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    p.presentMode = vsync ? VK_PRESENT_MODE_FIFO_KHR : p.unsyncedMode;
 
     VkAttachmentDescription att{};
     att.format = p.format.format;
@@ -704,7 +725,11 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
         ImGui_ImplVulkan_RenderDrawData(imgui, p.cmd);
     p.vk.vkCmdEndRenderPass(p.cmd);
     const bool dumpNow = p.dumpAt && ++p.presentCount == p.dumpAt;
-    const bool dump = dumpNow && p.sceneValid && p.recordDump(p.images[index]);
+    // dumpAt is zero when the swapchain cannot be read back. A request that cannot be served this present
+    // (no scene, no host memory) stays in its file for the next one.
+    const std::string request =
+        (!dumpNow && p.dumpAt && !p.dumpReq.empty()) ? readDumpRequest(p.dumpReq.c_str()) : std::string();
+    const bool dump = (dumpNow || !request.empty()) && p.sceneValid && p.recordDump(p.images[index]);
     if (dumpNow && !dump)
         std::fprintf(stderr, "[host] present dump skipped at present %llu (no scene or no host memory)\n",
                      static_cast<unsigned long long>(p.presentCount));
@@ -738,7 +763,11 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     r = p.vk.vkQueuePresentKHR(p.queue, &pi);
     lock = {}; // writeDump waits on the fence; the queue is free again
     if (dump)
-        p.writeDump();
+    {
+        p.writeDump(request.empty() ? p.dumpPrefix : request);
+        if (!request.empty())
+            std::remove(p.dumpReq.c_str());
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         m_resizePending = true;
 }
@@ -773,6 +802,16 @@ bool VkPresenter::imguiInit()
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     p.imgui = ImGui_ImplVulkan_Init(&info);
     return p.imgui;
+}
+
+void VkPresenter::setVsync(bool vsync)
+{
+    const VkPresentModeKHR mode = vsync ? VK_PRESENT_MODE_FIFO_KHR : m->unsyncedMode;
+    if (mode == m->presentMode)
+        return;
+    m->presentMode = mode;
+    m->vsync = vsync;
+    m_resizePending = true; // the next present recreates the swapchain with the new mode
 }
 
 void VkPresenter::imguiNewFrame()

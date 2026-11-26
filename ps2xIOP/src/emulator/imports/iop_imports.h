@@ -8,6 +8,11 @@
 #include <string_view>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopMemory;
@@ -33,6 +38,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] int32_t setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode);
         void eraseRange(uint32_t base, uint32_t size);
 
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
+
     private:
         struct ExportLibrary
         {
@@ -40,6 +48,9 @@ namespace ps2x::iop::detail
             uint16_t version = 0;
             std::string name;
             std::vector<uint32_t> functions;
+
+            template <class A>
+            void stateIo(A &ar) { ar(tableAddress, version, name, functions); }
         };
 
         [[nodiscard]] const ExportLibrary *findLibrary(std::string_view name, std::optional<uint16_t> version) const;

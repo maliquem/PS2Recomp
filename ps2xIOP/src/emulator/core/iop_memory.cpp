@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -394,5 +395,11 @@ namespace ps2x::iop::detail
             result.push_back(ch);
         }
         return result;
+    }
+
+    void IopMemory::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_ram, m_owned, m_scratch, m_hardware, m_allocations, m_heapCursor,
+           m_interruptStatus, m_interruptMask, m_interruptControl, m_dmaStart, m_spu2);
     }
 }

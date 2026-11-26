@@ -16,6 +16,11 @@
 #include <variant>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 // This exception is the EE equivalent of a longjmp to the dispatcher.  It is
 // not an error and must only be caught at EeScheduler::run().
 struct EeDispatcherTransfer final
@@ -60,6 +65,8 @@ struct EeVSyncWait
 {
     uint64_t afterTick = 0;
     int fixedResult = -1;
+    // Non-zero: the thread resumes at this pc (a plain value instead of a completion, so it can be saved).
+    uint32_t resumePc = 0;
 };
 
 struct EeExternalWait
@@ -339,6 +346,14 @@ public:
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSyncResumeAt(uint64_t afterTick, int fixedResult, uint32_t resumePc);
+
+    // Save state. The hook runs on the EE thread at the top of every dispatch loop iteration, when no
+    // guest code is on the host stack. stateQuiescent() is false while any host continuation
+    // (std::function) is pending, since those cannot be saved; the caller retries later.
+    void setSafePointHook(std::function<void()> hook) { m_safePointHook = std::move(hook); }
+    [[nodiscard]] bool stateQuiescent() const;
+    void stateIo(ps2x::state::Archive &ar);
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
@@ -452,6 +467,7 @@ private:
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
     uint32_t m_spinProbeCountdown = 0;
+    std::function<void()> m_safePointHook;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

@@ -105,6 +105,8 @@ public:
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+    // Game option, see GSDrawState::spriteFieldBlend. Set it before the game starts drawing.
+    void setSpriteFieldBlend(bool on) { m_spriteFieldBlend = on; }
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -151,6 +153,13 @@ public:
 
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+
+    // Save state (gs_backend_state.cpp): GS registers plus the backend's VRAM and CLUT.
+    void stateIo(ps2x::state::Archive &ar);
+    // Turbo frameskip (gs_backend_state.cpp): true when this draw goes to a frame the host never shows.
+    bool frameskipDropsDraw(const GSPrimitiveBatch &batch) const;
+    // Turbo frameskip: a transfer that reads the back buffer stops the dropping (the game reads that frame).
+    void frameskipNoteTransfer(const GSTransferCommand &command) const;
 
 private:
     void snapshotVRAM();
@@ -205,6 +214,7 @@ private:
 
     bool m_prmodecont = true;
     bool m_pabe = false;
+    bool m_spriteFieldBlend = false;
     uint64_t m_scanmsk = 0;
     uint64_t m_dimx = 0;
     uint64_t m_dthe = 0;

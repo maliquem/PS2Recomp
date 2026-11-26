@@ -1530,3 +1530,26 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    const char *mcStubBusy()
+    {
+        std::lock_guard<std::mutex> lock(g_mcStateMutex);
+        return g_mcFiles.empty() ? nullptr : "a memory card file is open";
+    }
+
+    void mcStubStateIo(ps2x::state::Archive &ar)
+    {
+        if (!ar.loading())
+            if (const char *why = mcStubBusy())
+                throw ps2x::state::StateBusy(why);
+        std::lock_guard<std::mutex> lock(g_mcStateMutex);
+        ar(g_mcNextFd, g_mcLastCmd, g_mcCommandPending, g_mcLastResult, g_cvMcFileCursor);
+        for (auto &port : g_mcPorts)
+            ar(port.currentDir, port.formatted);
+    }
+}

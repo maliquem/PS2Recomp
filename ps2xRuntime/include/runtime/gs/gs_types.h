@@ -248,6 +248,9 @@ struct GSDrawState
     uint16_t textureWidth = 1;
     uint16_t textureHeight = 1;
     bool linearFilter = false;
+    // Game option (GS::setSpriteFieldBlend): a nearest sprite that squeezes texture rows also reads the row the
+    // other interlace field would show, and the two are averaged.
+    bool spriteFieldBlend = false;
 };
 
 struct GSPrimitiveBatch
