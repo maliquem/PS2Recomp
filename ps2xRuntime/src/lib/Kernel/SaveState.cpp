@@ -753,6 +753,13 @@ namespace ps2x::savestate
             s.request.store(0, std::memory_order_release);
         }
 
+        // Save refused because a game file, host file or movie is in flight (a later field may work).
+        bool busyError(const std::exception &e)
+        {
+            const std::string what = e.what();
+            return what == "a game file is open" || what == "a host file is open (fopen)" || what == "a movie is playing";
+        }
+
         void finishTest(PS2Runtime &rt)
         {
             if (svc().opt.exitAfterTest)
@@ -809,12 +816,11 @@ namespace ps2x::savestate
                 }
                 catch (const std::exception &e)
                 {
-                    const std::string what = e.what();
                     // A file or movie in flight: try again on a later field.
-                    if (what != "a game file is open" && what != "a host file is open (fopen)")
+                    if (!busyError(e))
                     {
                         s.savedAt = true;
-                        say("Save failed: " + what);
+                        say(std::string("Save failed: ") + e.what());
                     }
                 }
             }
@@ -865,11 +871,10 @@ namespace ps2x::savestate
             }
             catch (const std::exception &e)
             {
-                const std::string what = e.what();
-                if (s.selftestPhase == 0 && (what == "a game file is open" || what == "a host file is open (fopen)"))
+                if (s.selftestPhase == 0 && busyError(e))
                     return; // try again on a later field
                 s.selftestPhase = 3;
-                std::cout << "[savestate] selftest FAIL: " << what << std::endl;
+                std::cout << "[savestate] selftest FAIL: " << e.what() << std::endl;
                 finishTest(rt);
             }
         }
