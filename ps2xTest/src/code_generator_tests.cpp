@@ -205,6 +205,37 @@ void register_code_generator_tests()
                  "LWU must not sign-extend bit 31 into the allocator bitmap value");
     });
 
+    tc.Run("sign-test branches compare the whole 64-bit register", [](TestCase &t) {
+        // Soft-double add (_fpadd_parts) branches with BLTZ on a 64-bit mantissa difference.
+        struct Case { uint32_t opcode; uint32_t rt; const char *cond; };
+        const Case cases[] = {
+            {OPCODE_BLEZ, 0, "GPR_S64(ctx, 2) <= 0"}, {OPCODE_BLEZL, 0, "GPR_S64(ctx, 2) <= 0"},
+            {OPCODE_BGTZ, 0, "GPR_S64(ctx, 2) > 0"}, {OPCODE_BGTZL, 0, "GPR_S64(ctx, 2) > 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZ, "GPR_S64(ctx, 2) < 0"}, {OPCODE_REGIMM, REGIMM_BLTZL, "GPR_S64(ctx, 2) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZ, "GPR_S64(ctx, 2) >= 0"}, {OPCODE_REGIMM, REGIMM_BGEZL, "GPR_S64(ctx, 2) >= 0"},
+        };
+        for (const Case &c : cases)
+        {
+            Function func;
+            func.name = "sign_branch";
+            func.start = 0x3000;
+            func.end = 0x300C;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction br = makeIType(0x3000, c.opcode, 2, static_cast<uint8_t>(c.rt), 1); // target 0x3008
+            br.isBranch = true;
+            br.hasDelaySlot = true;
+            std::vector<Instruction> instructions{br, makeNop(0x3004), makeNop(0x3008)};
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find(c.cond) != std::string::npos,
+                     std::string("branch must test bit 63, expected: ") + c.cond + " in: " + generated);
+            t.IsTrue(generated.find("GPR_S32(ctx, 2)") == std::string::npos, "branch must not test only the low word");
+        }
+    });
+
     tc.Run("SYSCALL publishes its continuation before entering the runtime", [](TestCase &t) {
         Function func;
         func.name = "syscall_resume";
