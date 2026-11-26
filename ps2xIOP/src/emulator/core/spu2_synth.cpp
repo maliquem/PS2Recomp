@@ -1,6 +1,8 @@
 #include "spu2_synth.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -57,7 +59,29 @@ namespace ps2x::iop::detail
     Spu2Synth::Spu2Synth()
         : m_ram(kRamBytes, 0u)
     {
+        if (const char *path = std::getenv("PS2X_SPU2_TRACE"); path && *path)
+            m_trace.reset(std::fopen(path, "wb"), [](std::FILE *f) { if (f) std::fclose(f); });
         reset();
+    }
+
+    void Spu2Synth::trace(char tag, const void *a, size_t aSize, const void *b, size_t bSize)
+    {
+        if (!m_trace)
+            return;
+        std::fputc(tag, m_trace.get());
+        std::fwrite(a, 1u, aSize, m_trace.get());
+        if (b)
+            std::fwrite(b, 1u, bSize, m_trace.get());
+    }
+
+    void Spu2Synth::traceAutoDma(int core, int32_t volL, int32_t volR, const uint8_t *block1024)
+    {
+        if (!m_trace)
+            return;
+#pragma pack(push, 1)
+        const struct { uint8_t core; int32_t volL, volR; } head{static_cast<uint8_t>(core), volL, volR};
+#pragma pack(pop)
+        trace('A', &head, sizeof(head), block1024, 1024u);
     }
 
     void Spu2Synth::reset()
@@ -173,6 +197,11 @@ namespace ps2x::iop::detail
 
         const uint32_t offset = (physAddr - kSpu2Base) & 0x7FEu;
         m_rawRegs[offset >> 1u] = value;
+        if (m_trace)
+        {
+            const uint16_t event[2] = {static_cast<uint16_t>(offset), value};
+            trace('W', event, sizeof(event));
+        }
 
         if (offset >= 0x760u && offset < 0x7B0u)
         {
@@ -292,6 +321,10 @@ namespace ps2x::iop::detail
         if (!src || byteSize == 0u || coreIndex < 0 || coreIndex >= static_cast<int>(kCoreCount))
             return;
 
+#pragma pack(push, 1)
+        const struct { uint8_t core; uint32_t bytes; } dmaEvent{static_cast<uint8_t>(coreIndex), byteSize};
+#pragma pack(pop)
+        trace('D', &dmaEvent, sizeof(dmaEvent), src, byteSize);
         Core &core = m_cores[static_cast<size_t>(coreIndex)];
         uint32_t dstByte = (core.tsa & kRamHalfwordMask) * 2u;
         uint32_t remaining = byteSize;
@@ -313,6 +346,10 @@ namespace ps2x::iop::detail
         if (!dst || byteSize == 0u || coreIndex < 0 || coreIndex >= static_cast<int>(kCoreCount))
             return;
 
+#pragma pack(push, 1)
+        const struct { uint8_t core; uint32_t bytes; } dmaEvent{static_cast<uint8_t>(coreIndex), byteSize};
+#pragma pack(pop)
+        trace('d', &dmaEvent, sizeof(dmaEvent));
         Core &core = m_cores[static_cast<size_t>(coreIndex)];
         uint32_t srcByte = (core.tsa & kRamHalfwordMask) * 2u;
         uint32_t remaining = byteSize;
@@ -538,6 +575,18 @@ namespace ps2x::iop::detail
     {
         if (!interleavedStereo || frameCount == 0u)
             return false;
+
+        if (m_trace)
+        {
+            using Clock = std::chrono::steady_clock;
+            static const Clock::time_point start = Clock::now();
+#pragma pack(push, 1)
+            const struct { uint32_t frames; uint64_t micros; } event{static_cast<uint32_t>(frameCount),
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count())};
+#pragma pack(pop)
+            trace('R', &event, sizeof(event));
+            std::fflush(m_trace.get()); // the test scripts kill the process
+        }
 
         std::memset(interleavedStereo, 0, frameCount * 2u * sizeof(int16_t));
         bool anyActive = false;

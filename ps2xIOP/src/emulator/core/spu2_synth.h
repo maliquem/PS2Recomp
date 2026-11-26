@@ -3,6 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <memory>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -37,6 +39,9 @@ namespace ps2x::iop::detail
         // Renders interleaved 48 kHz 16-bit stereo samples for all 48 ADPCM voices.
         // Returns true if any voice was active during the rendered block.
         bool render(int16_t *interleavedStereo, size_t frameCount);
+
+        // The AutoDMA PCM block is mixed by the caller; it passes through here only to reach the trace.
+        void traceAutoDma(int core, int32_t volL, int32_t volR, const uint8_t *block1024);
 
     private:
         enum class AdsrPhase : uint8_t
@@ -104,6 +109,13 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_ram;
         std::array<uint16_t, 0x400u> m_rawRegs{};
         std::array<Core, kCoreCount> m_cores{};
+        // PS2X_SPU2_TRACE=<file>: every register write, DMA and render call goes to the file, for the
+        // offline replayer (tests/spu2_trace_replay.cpp). Format: one tag byte per event, then
+        // W u16 offset, u16 value | D u8 core, u32 bytes, data | d u8 core, u32 bytes (DMA read) |
+        // R u32 frames, u64 microseconds since the first event | A u8 core, i32 volL, i32 volR, 1024 bytes.
+        // shortcut: the trace only replays from a power-on synth, start it at boot (not after a save state).
+        void trace(char tag, const void *a, size_t aSize, const void *b = nullptr, size_t bSize = 0u);
+        std::shared_ptr<std::FILE> m_trace;
         uint16_t m_admas = 0u; // Shared AutoDMA control register (0x1F9001B0): bit 0 = Core 0, bit 1 = Core 1
     };
 }

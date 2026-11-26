@@ -260,6 +260,7 @@ namespace ps2x::iop::detail
                         int32_t volL = 0x7FFE;
                         int32_t volR = 0x7FFE;
                         memory.spu2().getAutoDmaVolume(c, volL, volR);
+                        memory.spu2().traceAutoDma(c, volL, volR, raw);
                         const int16_t *left = reinterpret_cast<const int16_t *>(raw);
                         const int16_t *right = reinterpret_cast<const int16_t *>(raw + 512u);
                         for (uint32_t i = 0u; i < kAudioChunkFrames; ++i)
