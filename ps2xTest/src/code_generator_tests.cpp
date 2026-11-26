@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -205,6 +206,39 @@ void register_code_generator_tests()
                  "LWU must not sign-extend bit 31 into the allocator bitmap value");
     });
 
+    tc.Run("sign-test branches compare the whole 64-bit register", [](TestCase &t) {
+        // Soft-double add (_fpadd_parts) branches with BLTZ on a 64-bit mantissa difference.
+        struct Case { uint32_t opcode; uint32_t rt; const char *cond; };
+        const Case cases[] = {
+            {OPCODE_BLEZ, 0, "GPR_S64(ctx, 2) <= 0"}, {OPCODE_BLEZL, 0, "GPR_S64(ctx, 2) <= 0"},
+            {OPCODE_BGTZ, 0, "GPR_S64(ctx, 2) > 0"}, {OPCODE_BGTZL, 0, "GPR_S64(ctx, 2) > 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZ, "GPR_S64(ctx, 2) < 0"}, {OPCODE_REGIMM, REGIMM_BLTZL, "GPR_S64(ctx, 2) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZ, "GPR_S64(ctx, 2) >= 0"}, {OPCODE_REGIMM, REGIMM_BGEZL, "GPR_S64(ctx, 2) >= 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZAL, "GPR_S64(ctx, 2) < 0"}, {OPCODE_REGIMM, REGIMM_BLTZALL, "GPR_S64(ctx, 2) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZAL, "GPR_S64(ctx, 2) >= 0"}, {OPCODE_REGIMM, REGIMM_BGEZALL, "GPR_S64(ctx, 2) >= 0"},
+        };
+        for (const Case &c : cases)
+        {
+            Function func;
+            func.name = "sign_branch";
+            func.start = 0x3000;
+            func.end = 0x300C;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction br = makeIType(0x3000, c.opcode, 2, static_cast<uint8_t>(c.rt), 1); // target 0x3008
+            br.isBranch = true;
+            br.hasDelaySlot = true;
+            std::vector<Instruction> instructions{br, makeNop(0x3004), makeNop(0x3008)};
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find(c.cond) != std::string::npos,
+                     std::string("branch must test bit 63, expected: ") + c.cond + " in: " + generated);
+            t.IsTrue(generated.find("GPR_S32(ctx, 2)") == std::string::npos, "branch must not test only the low word");
+        }
+    });
+
     tc.Run("SYSCALL publishes its continuation before entering the runtime", [](TestCase &t) {
         Function func;
         func.name = "syscall_resume";
@@ -267,6 +301,23 @@ void register_code_generator_tests()
                      "g_ps2RecompiledFunctionTable[1] = syscall_resume_entry_0x9100; // 0x9104") !=
                      std::string::npos,
                  "the syscall continuation must register to the owner wrapper");
+    });
+
+    tc.Run("MOVZ and MOVN move only the low 64 bits", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        Instruction mov{};
+        mov.opcode = OPCODE_SPECIAL;
+        mov.rs = 4;
+        mov.rt = 5;
+        mov.rd = 3;
+        mov.function = SPECIAL_MOVZ;
+        std::string generated = gen.translateInstruction(mov);
+        t.IsTrue(generated.find("if (GPR_U64(ctx, 5) == 0) SET_GPR_U64(ctx, 3, GPR_U64(ctx, 4));") != std::string::npos,
+                 "MOVZ must copy the low doubleword only: " + generated);
+        mov.function = SPECIAL_MOVN;
+        generated = gen.translateInstruction(mov);
+        t.IsTrue(generated.find("if (GPR_U64(ctx, 5) != 0) SET_GPR_U64(ctx, 3, GPR_U64(ctx, 4));") != std::string::npos,
+                 "MOVN must copy the low doubleword only: " + generated);
     });
 
     tc.Run("R5900 MULT writes rd when rd is non-zero", [](TestCase &t) {
@@ -1356,6 +1407,19 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vu0_vf[13]") != std::string::npos, "S1 q/i source should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[4]") != std::string::npos, "S1 q/i destination should come from sa");
             t.IsTrue(out.find("ctx->vu0_vf[25]") == std::string::npos, "S1 q/i must not use rs(format) as register index");
+        });
+
+        tc.Run("VU0 VCLIPw sets the +plane bit before the -plane bit and compares with |w|", [](TestCase &t) {
+            // Shadow Hearts' Gsx::GsClipRmVertex masks the clip flags with 0xA95 (x,y,z > 4095 or < 0).
+            const Instruction inst = R5900Decoder().decodeInstruction(0x2fc70c, 0x4BC121FFu); // vclipw.xyz vf4, vf1w
+            const std::string code = CodeGenerator({}, {}).translateInstruction(inst);
+            t.IsTrue(code.find("((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1)") != std::string::npos,
+                     "bit 0 is +x (x > |w|), bit 1 is -x: " + code);
+            t.IsTrue(code.find("((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2)") != std::string::npos,
+                     "bit 2 is +y, bit 3 is -y: " + code);
+            t.IsTrue(code.find("((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3)") != std::string::npos,
+                     "bit 4 is +z, bit 5 is -z: " + code);
+            t.IsTrue(code.find("_mm_set1_epi32(0x7FFFFFFF)") != std::string::npos, "the clip plane is |w|: " + code);
         });
 
         tc.Run("VU0 destination MADD and MSUB forms preserve ACC", [](TestCase &t) {

@@ -1383,6 +1383,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TEST_2:
     {
         int ci = (regAddr == GS_REG_TEST_2) ? 1 : 0;
+        // ZTE=0 turns the depth test off: every pixel passes whatever ZTST says (as on hardware and PCSX2).
+        // Shadow Hearts draws its battle menu panel with ZTE=0, ZTST=NEVER.
+        if (!(value & (1ull << 16)))
+            value = (value & ~(3ull << 17)) | (1ull << 17);
         m_ctx[ci].test = value;
         break;
     }

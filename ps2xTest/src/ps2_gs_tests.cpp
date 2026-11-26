@@ -3905,6 +3905,18 @@ void register_ps2_gs_tests()
                      "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
         });
 
+        tc.Run("GS ZTE=0 disables the depth test even when ZTST is NEVER", [](TestCase &t)
+        {
+            // Shadow Hearts' battle menu panel: TEST = ATE, ATST=GEQUAL, AREF=0, ZTE=0, ZTST=NEVER.
+            const GsPixelTestResult panel =
+                drawGsPixelForTests(GS_PSM_CT32, 0xBull, false, 0xAB030201u, 0x11111111u, 0x78u);
+            t.Equals(panel.framebuffer, 0x78563412u, "with ZTE=0 the pixel must be drawn whatever ZTST says");
+
+            const GsPixelTestResult never =
+                drawGsPixelForTests(GS_PSM_CT32, (1ull << 16), false, 0xAB030201u, 0x11111111u, 0x78u);
+            t.Equals(never.framebuffer, 0xAB030201u, "with ZTE=1 ZTST=NEVER still rejects the pixel");
+        });
+
         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
         {
             constexpr uint32_t kInitialFramebuffer = 0xAB030201u;
