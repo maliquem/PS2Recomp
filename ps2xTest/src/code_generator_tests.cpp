@@ -1415,6 +1415,8 @@ void register_code_generator_tests()
             const std::string code = CodeGenerator({}, {}).translateInstruction(inst);
             t.IsTrue(code.find("((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1)") != std::string::npos,
                      "bit 0 is +x (x > |w|), bit 1 is -x: " + code);
+            t.IsTrue(code.find("((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2)") != std::string::npos,
+                     "bit 2 is +y, bit 3 is -y: " + code);
             t.IsTrue(code.find("((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3)") != std::string::npos,
                      "bit 4 is +z, bit 5 is -z: " + code);
             t.IsTrue(code.find("_mm_set1_epi32(0x7FFFFFFF)") != std::string::npos, "the clip plane is |w|: " + code);
