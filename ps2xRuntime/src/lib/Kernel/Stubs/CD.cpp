@@ -999,14 +999,45 @@ namespace ps2_stubs
 
 #include "StubState.h"
 #include "ps2x/state_archive.h"
+#include <map>
 
 namespace ps2_stubs
 {
     void cdStubStateIo(ps2x::state::Archive &ar)
     {
-        // shortcut: the pseudo-LBN table for loose files (g_cdFilesByKey) is not saved; Shadow Hearts
-        // reads from the disc image, where LBNs are real. Save it if a game runs from loose files.
         ar(g_cdStreamTiming, g_lastCdError, g_cdMode, g_cdStreamingLbn, g_cdStreamingEndLbn, g_cdInitialized,
            g_nextPseudoLbn);
+
+        // Pseudo LBNs handed out by sceCdSearchFile live in guest RAM, so the table that resolves them must
+        // travel with it. Paths are kept relative to the CD root so a moved install still loads.
+        const std::filesystem::path root = getCdRootPath();
+        uint64_t files = ar.size(g_cdFilesByKey.size());
+        if (ar.loading())
+        {
+            g_cdFilesByKey.clear();
+            for (uint64_t i = 0; i < files; ++i)
+            {
+                std::string key, path;
+                CdFileEntry entry;
+                ar(key, path, entry.sizeBytes, entry.baseLbn, entry.sectors);
+                const std::filesystem::path p(std::u8string(path.begin(), path.end()));
+                entry.hostPath = p.is_relative() ? root / p : p;
+                g_cdFilesByKey.emplace(std::move(key), std::move(entry));
+            }
+        }
+        else
+        {
+            // Key order, so equal maps give equal bytes whatever the insertion history (state_archive.h rule).
+            std::map<std::string, CdFileEntry> sorted(g_cdFilesByKey.begin(), g_cdFilesByKey.end());
+            for (auto &[key, entry] : sorted)
+            {
+                std::filesystem::path p = entry.hostPath.lexically_relative(root);
+                if (p.empty() || *p.begin() == "..")
+                    p = entry.hostPath;
+                const std::u8string u = p.u8string();
+                std::string k = key, path(u.begin(), u.end());
+                ar(k, path, entry.sizeBytes, entry.baseLbn, entry.sectors);
+            }
+        }
     }
 }
