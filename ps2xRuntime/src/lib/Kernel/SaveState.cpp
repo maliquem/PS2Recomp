@@ -257,7 +257,7 @@ void PS2Runtime::stateIo(Archive &ar)
     m_iopSubsystem->stateIo(ar);
     section(ar, "SYSC", 1);
     syscallStateIo(ar);
-    section(ar, "STUB", 1);
+    section(ar, "STUB", 2);
     ps2_stubs::audioStubStateIo(ar);
     ps2_stubs::cdStubStateIo(ar);
     ps2_stubs::dmaStubStateIo(ar);
