@@ -32,6 +32,10 @@ show_fps = false
 fmv = true
 # Precise colour conversion of the movies (sharper colour edges, no colour shift).
 fmv_csc = true
+# How movies are scaled to the screen: "pixel" (as before), "bilinear", "bicubic" or "lanczos" (sharpest, no halos).
+fmv_scale = "lanczos"
+# Smooth the colour steps in dark movie gradients (adds a fine dither). Not with "pixel".
+fmv_deband = false
 
 [gs]
 # "vulkan" (default) or "cpu".

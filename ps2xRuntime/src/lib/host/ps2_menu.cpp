@@ -250,6 +250,23 @@ namespace
             ps2cfg::setBool("video.fmv_csc", on);
             ps2cfg::save();
         }));
+        {
+            Item it{Kind::Choice, {"FMV: scaling", "FMV: ampliação"}};
+            it.choices = {{"Pixel (original)", "Pixel (original)"}, {"Bilinear", "Bilinear"}, {"Bicubic", "Bicúbica"},
+                          {"Lanczos", "Lanczos"}};
+            it.getIndex = [] { return ps2fmv::scale.load(); };
+            it.setIndex = [](int i) {
+                ps2fmv::scale = i;
+                ps2cfg::setString("video.fmv_scale", ps2fmv::kScaleNames[i]);
+                ps2cfg::save();
+            };
+            display.items.push_back(std::move(it));
+        }
+        display.items.push_back(toggle({"FMV: smooth banding", "FMV: suavizar faixas"}, [] { return ps2fmv::deband.load(); }, [](bool on) {
+            ps2fmv::deband = on;
+            ps2cfg::setBool("video.fmv_deband", on);
+            ps2cfg::save();
+        }));
         display.items.push_back(info({"HDR", "HDR"}, {"Coming soon", "Em breve"}));
         display.items.push_back(info({"Resolution scale", "Escala de resolução"}, {"Coming soon", "Em breve"}));
         display.items.push_back(info({"Post-processing", "Pós-processamento"}, {"Coming soon", "Em breve"}));

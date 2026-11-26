@@ -321,6 +321,7 @@ struct GSGpuFrame
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;
+    bool movie = false; // an MPEG movie frame (sceMpeg presentation active): the presenter may scale it with a filter
 
     explicit operator bool() const { return buffer != 0u && width != 0u && height != 0u; }
 };

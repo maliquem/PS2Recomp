@@ -159,6 +159,11 @@ namespace ps2host
         g_showRate = ps2cfg::envBool("PS2X_SHOW_FPS", "display.show_fps", false);
         ps2fmv::enabled = ps2cfg::envBool("PS2X_FMV", "video.fmv", true);
         ps2fmv::csc = ps2cfg::envBool("PS2X_FMV_CSC", "video.fmv_csc", true);
+        const std::string scale = ps2cfg::envString("PS2X_FMV_SCALE", "video.fmv_scale", "lanczos");
+        for (int i = 0; i < ps2fmv::ScaleCount; ++i)
+            if (scale == ps2fmv::kScaleNames[i])
+                ps2fmv::scale = i;
+        ps2fmv::deband = ps2cfg::envBool("PS2X_FMV_DEBAND", "video.fmv_deband", false);
         g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;

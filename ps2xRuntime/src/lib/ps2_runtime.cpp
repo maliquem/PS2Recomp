@@ -514,6 +514,7 @@ namespace
         if (ps2host::gpuPresent())
         {
             rt->gs().latchHostPresentationFrameGpu(fullFrameHeight, s.gpu);
+            s.gpu.movie = ps2_stubs::mpegPresentationHeight() != 0u;
             return true;
         }
         rt->gs().latchHostPresentationFrame(fullFrameHeight);

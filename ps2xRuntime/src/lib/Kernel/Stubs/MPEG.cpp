@@ -390,6 +390,8 @@ namespace ps2_stubs
                 av_opt_set_int(ctx, "sws_flags", SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, 0);
                 av_opt_set_int(ctx, "src_h_chr_pos", 0, 0);
                 av_opt_set_int(ctx, "src_v_chr_pos", 128, 0);
+                // ~2 ms per 640x448 frame on one core cost 3-5 VPS on the EE thread; slices give the same pixels.
+                av_opt_set_int(ctx, "threads", 4, 0);
                 if (sws_init_context(ctx, nullptr, nullptr) < 0)
                 {
                     sws_freeContext(ctx);
@@ -455,16 +457,38 @@ namespace ps2_stubs
                                      : -1;
                 decoded.rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
 
-                uint8_t *dstData[4] = {decoded.rgba.data(), nullptr, nullptr, nullptr};
-                int dstLinesize[4] = {width * 4, 0, 0, 0};
-                const int scaledRows = sws_scale(
-                    m_swsCtx,
-                    m_frame->data,
-                    m_frame->linesize,
-                    0,
-                    height,
-                    dstData,
-                    dstLinesize);
+                int scaledRows = 0;
+                if (accurate)
+                {
+                    // Only sws_scale_frame runs the slice threads; dst wraps decoded.rgba without copying.
+                    AVFrame *dst = av_frame_alloc();
+                    if (dst)
+                    {
+                        dst->width = width;
+                        dst->height = height;
+                        dst->format = AV_PIX_FMT_RGBA;
+                        dst->data[0] = decoded.rgba.data();
+                        dst->linesize[0] = width * 4;
+                        dst->buf[0] = av_buffer_create(decoded.rgba.data(), decoded.rgba.size(),
+                                                       [](void *, uint8_t *) {}, nullptr, 0);
+                        if (dst->buf[0] && sws_scale_frame(m_swsCtx, dst, m_frame) >= 0)
+                            scaledRows = height;
+                        av_frame_free(&dst);
+                    }
+                }
+                else
+                {
+                    uint8_t *dstData[4] = {decoded.rgba.data(), nullptr, nullptr, nullptr};
+                    int dstLinesize[4] = {width * 4, 0, 0, 0};
+                    scaledRows = sws_scale(
+                        m_swsCtx,
+                        m_frame->data,
+                        m_frame->linesize,
+                        0,
+                        height,
+                        dstData,
+                        dstLinesize);
+                }
                 if (scaledRows <= 0)
                 {
                     std::cerr << "[MPEG] FFmpeg scaler produced no rows." << std::endl;

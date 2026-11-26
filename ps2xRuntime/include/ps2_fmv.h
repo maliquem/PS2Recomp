@@ -11,6 +11,20 @@ namespace ps2fmv
     inline std::atomic<bool> enabled{true};
     // Step 1: bicubic chroma, accurate rounding, MPEG-2 chroma siting, BT.601 limited range in the YUV -> RGB.
     inline std::atomic<bool> csc{true};
+    // Step 2: how the presenter scales a movie frame to the screen (fmv_scale.comp). Pixel = today's nearest blit.
+    enum Scale : int
+    {
+        Pixel,
+        Bilinear,
+        Bicubic,
+        Lanczos,
+        ScaleCount
+    };
+    inline constexpr const char *kScaleNames[ScaleCount] = {"pixel", "bilinear", "bicubic", "lanczos"};
+    inline std::atomic<int> scale{Lanczos};
+    // Step 5: smooth 8-bit banding in flat gradients, with dither (needs a filter other than Pixel).
+    inline std::atomic<bool> deband{false};
 
     inline bool cscOn() { return enabled.load(std::memory_order_relaxed) && csc.load(std::memory_order_relaxed); }
+    inline int scaleFilter() { return enabled.load(std::memory_order_relaxed) ? scale.load(std::memory_order_relaxed) : Pixel; }
 }

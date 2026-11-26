@@ -1,0 +1,126 @@
+#version 450
+// FMV steps 2 and 5 (Shadow Hearts plan 4.1): scales the movie frame (the scene image) to the letterbox rect with
+// a quality filter, optionally smoothing 8-bit banding in flat gradients, and writes 8-bit RGBA for a 1:1 blit.
+// Only runs while a movie is on screen; "Pixel" keeps the presenter's nearest blit and never gets here.
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D src; // allocated at capacity; valid texels: srcSize
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+
+layout(push_constant, std430) uniform Params
+{
+    ivec2 srcSize;
+    ivec2 dstSize;
+    uint mode; // 1 bilinear, 2 bicubic (Catmull-Rom), 3 Lanczos-3 with anti-ringing
+    uint deband;
+} pc;
+
+vec3 texel(ivec2 p)
+{
+    // Clamp to the valid frame, not the image: rows past srcSize hold stale data.
+    return imageLoad(src, clamp(p, ivec2(0), pc.srcSize - 1)).rgb;
+}
+
+vec3 bilinear(vec2 p)
+{
+    ivec2 i = ivec2(floor(p));
+    vec2 f = p - vec2(i);
+    return mix(mix(texel(i), texel(i + ivec2(1, 0)), f.x), mix(texel(i + ivec2(0, 1)), texel(i + ivec2(1, 1)), f.x), f.y);
+}
+
+vec4 catmullRom(float t)
+{
+    float t2 = t * t, t3 = t2 * t;
+    return vec4(-t3 + 2.0 * t2 - t, 3.0 * t3 - 5.0 * t2 + 2.0, -3.0 * t3 + 4.0 * t2 + t, t3 - t2) * 0.5;
+}
+
+vec3 bicubic(vec2 p)
+{
+    ivec2 i = ivec2(floor(p));
+    vec2 f = p - vec2(i);
+    vec4 wx = catmullRom(f.x), wy = catmullRom(f.y);
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 4; ++y)
+    {
+        vec3 row = vec3(0.0);
+        for (int x = 0; x < 4; ++x)
+            row += texel(i + ivec2(x - 1, y - 1)) * wx[x];
+        sum += row * wy[y];
+    }
+    return sum;
+}
+
+float lanczos3(float x)
+{
+    x = abs(x);
+    if (x < 1e-5)
+        return 1.0;
+    if (x >= 3.0)
+        return 0.0;
+    const float pi = 3.14159265;
+    float px = pi * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+vec3 lanczos(vec2 p)
+{
+    ivec2 i = ivec2(floor(p));
+    vec2 f = p - vec2(i);
+    float wx[6], wy[6];
+    float sx = 0.0, sy = 0.0;
+    for (int k = 0; k < 6; ++k)
+    {
+        wx[k] = lanczos3(float(k - 2) - f.x);
+        wy[k] = lanczos3(float(k - 2) - f.y);
+        sx += wx[k];
+        sy += wy[k];
+    }
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 6; ++y)
+    {
+        vec3 row = vec3(0.0);
+        for (int x = 0; x < 6; ++x)
+            row += texel(i + ivec2(x - 2, y - 2)) * wx[x];
+        sum += row * wy[y];
+    }
+    sum /= sx * sy;
+    // Anti-ringing: no halo past the four texels around the sample (keeps Lanczos sharpness, drops overshoot).
+    vec3 a = texel(i), b = texel(i + ivec2(1, 0)), c = texel(i + ivec2(0, 1)), d = texel(i + ivec2(1, 1));
+    return clamp(sum, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+}
+
+// Interleaved gradient noise (Jimenez 2014): cheap, evenly spread, close to blue noise; static so stills repeat.
+float ign(vec2 p)
+{
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+// Step 5: where four samples around the pixel all sit within a couple of 8-bit levels of it, the area is a flat
+// gradient and its average replaces it (removes the 1-level steps); edges and grain fail the test and stay.
+vec3 deband(vec3 c, vec2 p, vec2 q)
+{
+    const float threshold = 2.5 / 255.0;
+    float angle = 6.2831853 * ign(q + vec2(17.0, 5.0));
+    float radius = 2.0 + 6.0 * ign(q.yx + vec2(3.0, 29.0)); // source pixels
+    vec2 o = radius * vec2(cos(angle), sin(angle));
+    vec3 s0 = bilinear(p + o), s1 = bilinear(p - o), s2 = bilinear(p + vec2(-o.y, o.x)), s3 = bilinear(p - vec2(-o.y, o.x));
+    vec3 diff = max(max(abs(s0 - c), abs(s1 - c)), max(abs(s2 - c), abs(s3 - c)));
+    vec3 avg = (s0 + s1 + s2 + s3) * 0.25;
+    return mix(c, avg, step(diff, vec3(threshold)));
+}
+
+void main()
+{
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(q, pc.dstSize)))
+        return;
+    vec2 p = (vec2(q) + 0.5) * vec2(pc.srcSize) / vec2(pc.dstSize) - 0.5;
+    vec3 c = pc.mode == 3u ? lanczos(p) : pc.mode == 2u ? bicubic(p) : bilinear(p);
+    if (pc.deband != 0u)
+    {
+        c = deband(c, p, vec2(q));
+        c += (ign(vec2(q)) - 0.5) / 255.0; // dither: the smoothed gradient must not re-band at the 8-bit write
+    }
+    imageStore(dst, q, vec4(clamp(c, 0.0, 1.0), 1.0));
+}
