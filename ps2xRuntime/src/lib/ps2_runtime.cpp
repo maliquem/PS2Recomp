@@ -90,6 +90,10 @@ namespace
 {
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+    // Console newlib rounds a request to (size + 4 + 15) & ~15 with a 4-byte header, so a request that
+    // is a multiple of 16 has 12 spare bytes there, and games write into them (Shadow Hearts puts a
+    // VIF word right after its last packet). The same rounding here keeps those writes off the next block.
+    constexpr uint32_t kGuestHeapBlockSlack = 4u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
 
@@ -1448,7 +1452,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    m_guestUnwinding = m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles);
+    if (m_guestUnwinding)
     {
         return false;
     }
@@ -1461,6 +1466,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        m_guestUnwinding = true;
         return false;
     }
 
@@ -1490,7 +1496,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    // The callee left through a checkpoint or a jump: ctx->pc is where to resume, even when it
+    // equals entryPc (a call to its own address, a loop back to its first instruction).
+    if (isStopRequested() || ctx->pc == 0u || m_guestUnwinding)
     {
         return false;
     }
@@ -1798,12 +1806,12 @@ uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
     }
 
     const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
-    if (size > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u)))
+    if (size > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u) - kGuestHeapBlockSlack))
     {
         return 0u;
     }
 
-    const uint32_t allocSize = alignGuestHeapValue(size, kGuestHeapDefaultAlignment);
+    const uint32_t allocSize = alignGuestHeapValue(size + kGuestHeapBlockSlack, kGuestHeapDefaultAlignment);
     if (allocSize == 0u)
     {
         return 0u;
@@ -1957,13 +1965,13 @@ uint32_t PS2Runtime::guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t
         return 0u;
     }
 
-    if (newSize > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u)))
+    if (newSize > (std::numeric_limits<uint32_t>::max() - (kGuestHeapDefaultAlignment - 1u) - kGuestHeapBlockSlack))
     {
         return 0u;
     }
 
     const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
-    const uint32_t requestedSize = alignGuestHeapValue(newSize, kGuestHeapDefaultAlignment);
+    const uint32_t requestedSize = alignGuestHeapValue(newSize + kGuestHeapBlockSlack, kGuestHeapDefaultAlignment);
 
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
     ensureGuestHeapInitializedLocked();
@@ -2306,7 +2314,8 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->loopCheckpointDue(cycles);
+    m_guestUnwinding = m_eeScheduler->loopCheckpointDue(cycles);
+    return m_guestUnwinding;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)

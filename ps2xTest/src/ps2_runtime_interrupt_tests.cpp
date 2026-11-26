@@ -210,6 +210,67 @@ namespace
         runtime->requestStop();
     }
 
+    constexpr uint32_t kRecurCallerPc = 0x00160600u;
+    constexpr uint32_t kRecurCallerResumePc = 0x00160608u;
+    constexpr uint32_t kRecurPc = 0x00160610u;
+    constexpr uint32_t kRecurResumePc = 0x00160618u;
+    constexpr uint32_t kRecurSp = 0x001F0000u;
+    uint32_t g_recurEpilogues = 0u;
+    uint32_t g_recurCallerSp = 0u;
+
+    // What the recompiler emits for "jal recur" and the code after it.
+    void recurCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kRecurCallerPc)
+        {
+            setRegU32(*ctx, 29, kRecurSp);
+            setRegU32(*ctx, 4, 1u);
+            setRegU32(*ctx, 31, kRecurCallerResumePc);
+            ctx->pc = kRecurPc;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kRecurPc, kRecurCallerPc, kRecurCallerResumePc,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "recur"))
+            {
+                return;
+            }
+        }
+        g_recurCallerSp = ::getRegU32(ctx, 29);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // A function that calls its own address (a0 levels deep), keeping ra in a stack frame. The
+    // nested call is made with a checkpoint due, so it yields with ctx->pc == kRecurPc.
+    void recur(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kRecurPc)
+        {
+            const uint32_t depth = ::getRegU32(ctx, 4);
+            if (depth == 0u)
+            {
+                ctx->pc = ::getRegU32(ctx, 31);
+                return;
+            }
+            const uint32_t sp = ::getRegU32(ctx, 29) - 16u;
+            setRegU32(*ctx, 29, sp);
+            writeGuestU32(rdram, sp, ::getRegU32(ctx, 31));
+            setRegU32(*ctx, 4, depth - 1u);
+            EeEvent wake;
+            wake.type = EeEventType::Dmac; // handled as a no-op: only makes the next checkpoint due
+            runtime->eeScheduler().postEvent(wake);
+            setRegU32(*ctx, 31, kRecurResumePc);
+            ctx->pc = kRecurPc;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kRecurPc, kRecurPc, kRecurResumePc,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "recur"))
+            {
+                return;
+            }
+        }
+        ++g_recurEpilogues;
+        const uint32_t sp = ::getRegU32(ctx, 29);
+        setRegU32(*ctx, 29, sp + 16u);
+        ctx->pc = readGuestU32(rdram, sp);
+    }
+
     void runSpin(const std::vector<uint32_t> &loopCode, PS2Runtime::RecompiledFunction entry = spinEntry)
     {
         TestEnv env;
@@ -623,6 +684,25 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("a call that yields at the callee's own entry address is not taken as returned", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kRecurCallerPc, recurCaller);
+            env.runtime.registerFunction(kRecurCallerResumePc, recurCaller);
+            env.runtime.registerFunction(kRecurPc, recur);
+            env.runtime.registerFunction(kRecurResumePc, recur);
+            g_recurEpilogues = 0u;
+            g_recurCallerSp = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kRecurCallerPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_recurEpilogues, 1u, "the outer call must run its epilogue before its caller continues");
+            t.Equals(g_recurCallerSp, kRecurSp, "the caller must continue with its own stack pointer");
         });
 
         tc.Run("pure spin loops are skipped to the same cycle as running every iteration", [](TestCase &t)

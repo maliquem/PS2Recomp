@@ -922,6 +922,21 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(reused, heapBase, "guestFree should make the head block reusable");
         });
 
+        tc.Run("guestMalloc leaves the spare bytes console malloc leaves after a 16-byte multiple", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.configureGuestHeap(0x00180010u, 0x00190010u);
+
+            // Shadow Hearts writes 4 bytes past new[](N * 0xF0); they must not land in the next block.
+            const uint32_t a = env.runtime.guestMalloc(0x2EE0u, 16u);
+            const uint32_t b = env.runtime.guestMalloc(0x2EE0u, 16u);
+            t.IsTrue(a != 0u && b >= a + 0x2EE0u + 4u, "the next block must start past the spare bytes");
+
+            const uint32_t grown = env.runtime.guestRealloc(b, 0x2EF0u, 16u);
+            const uint32_t c = env.runtime.guestMalloc(0x10u, 16u);
+            t.IsTrue(grown != 0u && c >= grown + 0x2EF0u + 4u, "guestRealloc must keep the spare bytes too");
+        });
+
         tc.Run("memalign stubs allocate aligned guest memory", [](TestCase &t)
         {
             TestEnv env;
