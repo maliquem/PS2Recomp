@@ -51,6 +51,20 @@ static inline int clampInt(int v, int lo, int hi)
     return v;
 }
 
+// Average of the texels (packed RGBA8) the two interlace fields show at one pixel. With texture alpha in use the
+// colours are weighted by alpha: the same as blending each field over the background and averaging the results.
+static inline uint32_t blendFieldTexels(uint32_t a, uint32_t b, bool alphaWeighted)
+{
+    const uint32_t aa = a >> 24, ab = b >> 24, ws = aa + ab;
+    uint32_t out = 0u;
+    for (uint32_t shift = 0u; shift < 24u; shift += 8u)
+    {
+        const uint32_t ca = (a >> shift) & 255u, cb = (b >> shift) & 255u;
+        out |= ((alphaWeighted && ws != 0u) ? (ca * aa + cb * ab + (ws >> 1)) / ws : (ca + cb + 1u) >> 1) << shift;
+    }
+    return out | (((ws + 1u) >> 1) << 24);
+}
+
 static inline uint8_t clampU8(int v)
 {
     if (v < 0) return 0;

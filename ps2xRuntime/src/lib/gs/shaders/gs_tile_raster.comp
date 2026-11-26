@@ -145,7 +145,8 @@ void main()
         // Texture coordinates for unified sampling (shared between sprite & triangle).
         bool useSpriteBilinear = false;
         bool useTriBilinear = false;
-        int u0 = 0, v0 = 0;
+        bool useFieldBlend = false;
+        int u0 = 0, v0 = 0, vField = 0;
         uint fx4 = 0u, fy4 = 0u;
         precise float fx = 0.0, fy = 0.0;
 
@@ -191,6 +192,14 @@ void main()
                 fx4 = uint((uCur >> 12) & 15);
                 fy4 = uint((vFixed >> 12) & 15);
                 useSpriteBilinear = linear && (fx4 != 0u || fy4 != 0u);
+                // Field blend (game option, texMeta bit 27, nearest only): also the row the other interlace field
+                // shows, half a line up.
+                if (((texMeta >> 27u) & 1u) != 0u)
+                {
+                    float tyField = float(py - d.unclippedY0) * d.invH;
+                    vField = int((d.v0f + (d.v1f - d.v0f) * tyField) * 65536.0) >> 16;
+                    useFieldBlend = vField != v0;
+                }
             }
         }
         else
@@ -312,7 +321,7 @@ void main()
             int texH = int(texDim >> 16u);
 
             ivec4 texColor;
-            int tapCount = (useSpriteBilinear || useTriBilinear) ? 4 : 1;
+            int tapCount = (useSpriteBilinear || useTriBilinear) ? 4 : (useFieldBlend ? 2 : 1);
             uint taps[4];
             for (int tap = 0; tap < tapCount; ++tap)
             {
@@ -321,7 +330,9 @@ void main()
                 taps[tap] = sampleUnifiedTexel(tbp0, tbw, tpsm, texW, texH,
                                                clampLo, clampHi, texaPacked,
                                                cpsm, csm, csa,
-                                               stagingTexOff, stagingTexRect, u0 + du, v0 + dv);
+                                               stagingTexOff, stagingTexRect,
+                                               useFieldBlend ? u0 : u0 + du,
+                                               useFieldBlend ? (tap == 0 ? v0 : vField) : v0 + dv);
             }
 
             if (useSpriteBilinear)
@@ -334,6 +345,17 @@ void main()
                 uint tb = (((taps[0] >> 16u) & 0xFFu) * w00 + ((taps[1] >> 16u) & 0xFFu) * w10 + ((taps[2] >> 16u) & 0xFFu) * w01 + ((taps[3] >> 16u) & 0xFFu) * w11 + 128u) >> 8u;
                 uint ta = (((taps[0] >> 24u) & 0xFFu) * w00 + ((taps[1] >> 24u) & 0xFFu) * w10 + ((taps[2] >> 24u) & 0xFFu) * w01 + ((taps[3] >> 24u) & 0xFFu) * w11 + 128u) >> 8u;
                 texColor = ivec4(int(tr), int(tg), int(tb), int(ta));
+            }
+            else if (useFieldBlend)
+            {
+                // Same integer rule as blendFieldTexels() in ps2_gs_common.h.
+                ivec4 fa = unpackRgba(taps[0]);
+                ivec4 fb = unpackRgba(taps[1]);
+                int ws = fa.a + fb.a;
+                if (tcc != 0u && ws != 0)
+                    texColor = ivec4((fa.rgb * fa.a + fb.rgb * fb.a + ivec3(ws >> 1)) / ws, (ws + 1) >> 1);
+                else
+                    texColor = (fa + fb + ivec4(1)) >> 1;
             }
             else if (useTriBilinear)
             {

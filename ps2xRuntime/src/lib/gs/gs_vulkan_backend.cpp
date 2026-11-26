@@ -1934,6 +1934,8 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
 
     const float invW = 1.0f / static_cast<float>(spanX);
     const float invH = 1.0f / static_cast<float>(spanY);
+    const bool fieldBlend = state.spriteFieldBlend && state.prim.tme && !linear &&
+                            std::fabs(v1f - v0f) > static_cast<float>(spanY);
     const float duPerPx = (u1f - u0f) * invW;
     const float uStart = u0f + (static_cast<float>(drawX0 - unclippedX0) + 0.5f) * duPerPx;
     const int32_t uBaseFixed = static_cast<int32_t>((uStart - (linear ? 0.5f : 0.0f)) * 65536.0f);
@@ -1958,7 +1960,7 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
     if (state.prim.tme)
     {
         // Check if this sprite can read directly from a deferred linear PSMCT32 upload in staging[].
-        if (ctx.tex0.psm == GS_PSM_CT32 && !linear && !m_deferredUploads.empty())
+        if (ctx.tex0.psm == GS_PSM_CT32 && !linear && !fieldBlend && !m_deferredUploads.empty())
         {
             const uint32_t tbw = std::max<uint32_t>(ctx.tex0.tbw, 1u);
             const uint8_t wrapU = static_cast<uint8_t>(ctx.clamp & 3u);
@@ -2052,7 +2054,7 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
     d.alphaLo = static_cast<uint32_t>(ctx.alpha & 0xFFu);
     d.alphaFix = static_cast<uint32_t>((ctx.alpha >> 32u) & 0xFFu);
     d.tbp0 = ctx.tex0.tbp0;
-    d.texMeta = packTexMeta(ctx.tex0);
+    d.texMeta = packTexMeta(ctx.tex0) | (fieldBlend ? (1u << 27u) : 0u); // bit 27: shader field blend
     d.texDim = (static_cast<uint32_t>(texW) & 0xFFFFu) | (static_cast<uint32_t>(texH) << 16u);
     d.clampLo = static_cast<uint32_t>(ctx.clamp & 0xFFFFFFFFull);
     d.clampHi = static_cast<uint32_t>(ctx.clamp >> 32u);

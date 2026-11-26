@@ -105,6 +105,8 @@ public:
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+    // Game option, see GSDrawState::spriteFieldBlend. Set it before the game starts drawing.
+    void setSpriteFieldBlend(bool on) { m_spriteFieldBlend = on; }
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -205,6 +207,7 @@ private:
 
     bool m_prmodecont = true;
     bool m_pabe = false;
+    bool m_spriteFieldBlend = false;
     uint64_t m_scanmsk = 0;
     uint64_t m_dimx = 0;
     uint64_t m_dthe = 0;

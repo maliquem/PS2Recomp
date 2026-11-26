@@ -1144,6 +1144,69 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("sprite field blend shows every texture row of a squeezed nearest sprite", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            // 24 texture rows drawn into 13 lines (the game's 448-line font in a 224-line field). Row r is red 8*r.
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kRows = 24u;
+            constexpr uint32_t kLines = 13u;
+            constexpr uint64_t kFrame = 150ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                static_cast<uint64_t>(kTexTbp) | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                (1ull << 26) | (5ull << 30) | (1ull << 34);
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8);
+            for (uint32_t y = 0u; y < 32u; ++y)
+                for (uint32_t x = 0u; x < 2u; ++x)
+                    writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, 0x80000000u | (y * 8u));
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (15ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            auto drawAt = [&](uint32_t x0)
+            {
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x0 << 4));
+                gs.writeRegister(GS_REG_UV, (2ull * 16ull) | ((static_cast<uint64_t>(kRows) * 16ull) << 16));
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>((x0 + 2u) << 4) | (static_cast<uint64_t>(kLines << 4) << 16));
+            };
+            drawAt(0u);
+            gs.setSpriteFieldBlend(true);
+            drawAt(2u);
+            // Not squeezed (13 rows in 13 lines): the option must leave it alone.
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(4u << 4));
+            gs.writeRegister(GS_REG_UV, (2ull * 16ull) | ((static_cast<uint64_t>(kLines) * 16ull) << 16));
+            gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(6u << 4) | (static_cast<uint64_t>(kLines << 4) << 16));
+
+            bool rowSeen[kRows] = {};
+            for (uint32_t line = 0u; line < kLines; ++line)
+            {
+                const uint32_t rowHalf = ((2u * line + 1u) * kRows) / (2u * kLines); // sampled half a line down
+                const uint32_t rowLine = (line * kRows) / kLines;                    // the other field's row
+                t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, line), 0x80000000u | (rowHalf * 8u),
+                         "without the option a squeezed nearest sprite keeps its single row per line");
+                t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 2u, line), 0x80000000u | ((rowHalf + rowLine) * 4u),
+                         "with the option each line is the average of the rows of the two fields");
+                t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 4u, line), 0x80000000u | (line * 8u),
+                         "a sprite that does not squeeze rows is unchanged by the option");
+                rowSeen[rowHalf] = rowSeen[rowLine] = true;
+            }
+            for (uint32_t row = 0u; row < kRows; ++row)
+                t.IsTrue(rowSeen[row], "every texture row must reach the screen");
+        });
+
         tc.Run("FST sprite skips texture cache fill for depth-rejected texels", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -4912,6 +4975,36 @@ void register_ps2_gs_tests()
                     sp.vertices[0] = {sx, sy, 0.0, 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 0, 0, 0};
                     sp.vertices[1] = {sx + 16.0f, sy + 8.0f, static_cast<double>(200 + i * 10), 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 256, 128, 0};
                     b.Submit(sp);
+                }
+
+                // 2b. Field blend option: nearest sprites that squeeze texture rows (PSMCT32 and PSMT8 + CLUT alpha).
+                for (int i = 0; i < 2; ++i)
+                {
+                    GSPrimitiveBatch fb{};
+                    fb.vertexCount = 2u;
+                    fb.state.prim.type = GS_PRIM_SPRITE;
+                    fb.state.prim.tme = true;
+                    fb.state.prim.abe = true;
+                    fb.state.prim.fst = true;
+                    fb.state.spriteFieldBlend = true;
+                    fb.state.textureWidth = (i == 0) ? 16u : 32u;
+                    fb.state.textureHeight = (i == 0) ? 16u : 32u;
+                    fb.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                    fb.state.context.zbuf = {80u, GS_PSM_Z16S, false};
+                    fb.state.context.scissor = {0u, 639u, 0u, 223u};
+                    fb.state.context.test = (1ull << 17u); // ZTEST ALWAYS
+                    fb.state.context.alpha = 0x44ull;
+                    fb.state.context.clamp = 5ull;
+                    if (i == 0)
+                        fb.state.context.tex0 = {6400u, 1u, GS_PSM_CT32, 4u, 4u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
+                    else
+                        fb.state.context.tex0 = {6720u, 2u, GS_PSM_T8, 5u, 5u, 1u, 0u, 7040u, GS_PSM_CT32, 0u, 0u, 0u};
+                    const float sx = 200.0f + static_cast<float>(i * 24);
+                    const uint16_t rows = (i == 0) ? 16u : 24u;
+                    fb.vertices[0] = {sx, 60.0f, 0.0, 128, 128, 128, 128, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                    fb.vertices[1] = {sx + 16.0f, 60.0f + ((i == 0) ? 9.0f : 13.0f), 300.0, 128, 128, 128, 128, 1.0f, 0.0f, 0.0f,
+                                      256, static_cast<uint16_t>(rows * 16u), 0};
+                    b.Submit(fb);
                 }
 
                 // 3. Textured bilinear Gouraud + flat triangles (PSMT8 + CLUT, Z16S, alpha blend, fba, fbmsk).
