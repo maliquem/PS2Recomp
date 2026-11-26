@@ -655,3 +655,15 @@ namespace ps2_stubs
         TODO_NAMED("sceSynthSizerLfoTriangle", rdram, ctx, runtime);
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void audioStubStateIo(ps2x::state::Archive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+        ar(g_audio_stub_state.initialized, g_audio_stub_state.voiceTransfers, g_audio_stub_state.blockTransfers);
+    }
+}

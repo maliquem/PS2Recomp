@@ -6,6 +6,11 @@
 #include <cstdint>
 #include <unordered_map>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop
 {
     class IopHost;
@@ -54,6 +59,9 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         struct RpcServer

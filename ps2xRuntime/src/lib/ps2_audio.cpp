@@ -1,5 +1,7 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_audio_turbo.h"
+#include "runtime/ps2_pacing.h"
 #include "ps2_host_backend.h"
 #if !PS2X_HOST_RAYLIB
 #include <SDL3/SDL.h>
@@ -14,69 +16,40 @@ namespace
     // shortcut: SPU2 AutoDMA PCM streaming plays 48 kHz 16-bit stereo directly without
     // SPU2 mixer volume/reverb or 48-voice ADPCM synthesis. Upgrade when a full SPU2
     // voice/mixer backend is integrated.
+    // At normal speed the compressor is a plain FIFO with the old 0.5 s latency cap; in turbo it
+    // plays the faster input at normal pitch (ps2_audio_turbo.h).
     struct Spu2PcmRing
     {
-        static constexpr size_t kCapacitySamples = 48000u * 2u; // 1s stereo at 48 kHz
-        static constexpr size_t kMaxBufferedSamples = 24000u * 2u; // 0.5s latency cap
-        std::array<int16_t, kCapacitySamples> data{};
-        size_t readPos = 0u;
-        size_t count = 0u;
+        ps2x::audio::TurboCompressor stream;
+        std::vector<int16_t> scratch;
 
         void push(const int16_t *samples, size_t sampleCount)
         {
-            if (sampleCount >= kMaxBufferedSamples)
-            {
-                samples += (sampleCount - kMaxBufferedSamples);
-                sampleCount = kMaxBufferedSamples;
-                readPos = 0u;
-                count = 0u;
-            }
-            if (count + sampleCount > kMaxBufferedSamples)
-            {
-                const size_t drop = (count + sampleCount) - kMaxBufferedSamples;
-                readPos = (readPos + drop) % kCapacitySamples;
-                count -= drop;
-            }
-            size_t writePos = (readPos + count) % kCapacitySamples;
-            const size_t first = std::min(sampleCount, kCapacitySamples - writePos);
-            std::memcpy(data.data() + writePos, samples, first * sizeof(int16_t));
-            if (sampleCount > first)
-            {
-                std::memcpy(data.data(), samples + first, (sampleCount - first) * sizeof(int16_t));
-            }
-            count += sampleCount;
+            stream.push(samples, sampleCount / 2u);
         }
 
         void mixInto(int16_t *dst, size_t sampleCount, bool overwrite)
         {
-            const size_t toRead = std::min(sampleCount, count);
+            const bool turbo = ps2x::pacing::g_speedPercent.load(std::memory_order_relaxed) != 100u;
             if (overwrite)
             {
-                for (size_t i = 0; i < toRead; ++i)
-                {
-                    dst[i] = data[(readPos + i) % kCapacitySamples];
-                }
-                if (toRead < sampleCount)
-                {
-                    std::memset(dst + toRead, 0, (sampleCount - toRead) * sizeof(int16_t));
-                }
+                const size_t got = stream.pull(dst, sampleCount / 2u, turbo) * 2u;
+                if (got < sampleCount)
+                    std::memset(dst + got, 0, (sampleCount - got) * sizeof(int16_t));
+                return;
             }
-            else
+            scratch.resize(sampleCount);
+            const size_t got = stream.pull(scratch.data(), sampleCount / 2u, turbo) * 2u;
+            for (size_t i = 0; i < got; ++i)
             {
-                for (size_t i = 0; i < toRead; ++i)
-                {
-                    const int32_t sum = static_cast<int32_t>(dst[i]) + data[(readPos + i) % kCapacitySamples];
-                    dst[i] = static_cast<int16_t>(std::clamp(sum, -32768, 32767));
-                }
+                const int32_t sum = static_cast<int32_t>(dst[i]) + scratch[i];
+                dst[i] = static_cast<int16_t>(std::clamp(sum, -32768, 32767));
             }
-            readPos = (readPos + toRead) % kCapacitySamples;
-            count -= toRead;
         }
 
         void clear()
         {
-            readPos = 0u;
-            count = 0u;
+            stream.reset();
         }
     };
 

@@ -932,3 +932,15 @@ namespace ps2_stubs
         g_padOverrideState = PadInputState{};
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void padStubStateIo(ps2x::state::Archive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        ar(g_padPorts);
+    }
+}

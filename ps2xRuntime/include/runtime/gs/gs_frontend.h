@@ -154,6 +154,13 @@ public:
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 
+    // Save state (gs_backend_state.cpp): GS registers plus the backend's VRAM and CLUT.
+    void stateIo(ps2x::state::Archive &ar);
+    // Turbo frameskip (gs_backend_state.cpp): true when this draw goes to a frame the host never shows.
+    bool frameskipDropsDraw(const GSPrimitiveBatch &batch) const;
+    // Turbo frameskip: a transfer that reads the back buffer stops the dropping (the game reads that frame).
+    void frameskipNoteTransfer(const GSTransferCommand &command) const;
+
 private:
     void snapshotVRAM();
     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);

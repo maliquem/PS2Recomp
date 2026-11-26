@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -472,5 +473,10 @@ namespace ps2x::iop::detail
             next = std::min(next, timer.overflowCycle);
         }
         return next;
+    }
+
+    void IopTimrman::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_timers, m_holdMode, m_servicing);
     }
 }

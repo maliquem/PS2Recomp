@@ -7,6 +7,10 @@
 #include <cstdint>
 
 class GS;
+namespace ps2x::state
+{
+    class Archive;
+}
 class PS2Memory;
 
 struct VU1State
@@ -63,6 +67,8 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+    // Save state (Kernel/SaveState.cpp): registers and pipelines; decoded caches are rebuilt.
+    void stateIo(ps2x::state::Archive &ar);
 
 private:
     enum Pipeline : uint8_t

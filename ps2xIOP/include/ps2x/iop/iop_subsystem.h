@@ -8,6 +8,11 @@
 #include <string_view>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop
 {
     class IopSubsystem
@@ -43,6 +48,10 @@ namespace ps2x::iop
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+
+        // Save state: saves or restores the whole IOP (same executable only). Call only while the IOP is
+        // not executing (outside runEeCycles and RPC handling).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         class Impl;

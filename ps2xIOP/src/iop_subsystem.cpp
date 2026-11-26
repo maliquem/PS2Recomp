@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop
 {
@@ -278,5 +279,12 @@ namespace ps2x::iop
             snapshot.services.push_back(std::move(row));
         }
         return snapshot;
+    }
+
+    void IopSubsystem::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_impl->moduleManager, m_impl->emulator);
+        if (ar.loading())
+            m_impl->rebuildRoutes();
     }
 }

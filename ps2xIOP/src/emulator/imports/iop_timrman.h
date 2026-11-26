@@ -4,6 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     struct IopCpuState;
@@ -17,6 +22,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         struct Callback

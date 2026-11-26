@@ -2639,3 +2639,29 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    // The host decoder behind a playback cannot be serialized: no save state during a movie.
+    const char *mpegStubBusy()
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        return g_mpeg_stub_state.playbackByMpeg.empty() ? nullptr : "a movie is playing";
+    }
+
+    void mpegStubStateIo(ps2x::state::Archive &ar)
+    {
+        if (!ar.loading())
+            if (const char *why = mpegStubBusy())
+                throw ps2x::state::StateBusy(why);
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        MpegStubState &s = g_mpeg_stub_state;
+        ar(s.initialized, s.nextCallbackHandle, s.cdStreamGeneration, s.cdStreamBytesProduced,
+           s.cdStreamBytesDemuxed, s.cdStreamEofPending, s.currentCdStreamEofSeen, s.callbacksByMpeg);
+        if (ar.loading())
+            s.playbackByMpeg.clear();
+    }
+}

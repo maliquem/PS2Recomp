@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -155,6 +156,8 @@ namespace ps2x::iop::detail
 
     class IopCdvd::Impl
     {
+        friend class IopCdvd;
+
     public:
         struct Callback
         {
@@ -747,5 +750,13 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+
+    void IopCdvd::stateIo(ps2x::state::Archive &ar)
+    {
+        // Host-side caches (virtual ISO, metadata sectors, image handle) stay as they are in this process.
+        Impl &d = *m_impl;
+        ar(d.callback, d.completionCallback, d.initialized, d.mediaMode, d.currentLsn, d.lastError,
+           d.streamFlag, d.lastReadTimeout, d.interruptEventFlagId);
     }
 }

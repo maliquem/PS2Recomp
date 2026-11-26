@@ -996,3 +996,17 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 }
+
+#include "StubState.h"
+#include "ps2x/state_archive.h"
+
+namespace ps2_stubs
+{
+    void cdStubStateIo(ps2x::state::Archive &ar)
+    {
+        // shortcut: the pseudo-LBN table for loose files (g_cdFilesByKey) is not saved; Shadow Hearts
+        // reads from the disc image, where LBNs are real. Save it if a game runs from loose files.
+        ar(g_cdStreamTiming, g_lastCdError, g_cdMode, g_cdStreamingLbn, g_cdStreamingEndLbn, g_cdInitialized,
+           g_nextPseudoLbn);
+    }
+}

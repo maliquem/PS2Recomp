@@ -25,6 +25,7 @@
 #include <span>
 #include <sstream>
 #include <utility>
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -79,6 +80,9 @@ namespace ps2x::iop::detail
             uint32_t entry = 0;
             uint32_t gp = 0;
             bool resident = false;
+
+            template <class A>
+            void stateIo(A &ar) { ar(id, path, name, base, size, entry, gp, resident); }
         };
 
         struct GuestCallback
@@ -867,6 +871,20 @@ namespace ps2x::iop::detail
     void IopEmulator::reset()
     {
         m_impl->reset();
+    }
+
+    void IopEmulator::stateIo(ps2x::state::Archive &ar)
+    {
+        Impl &d = *m_impl;
+        // Saved only between IOP runs: nothing of the guest may be on the host stack.
+        if (!ar.loading() && (d.runDepth != 0u || d.activeCpu != nullptr || d.callDepth != 0u ||
+                              d.servicingDmaInterrupts || d.servicingGuestCallbacks))
+            throw std::runtime_error("IOP is executing");
+        ar(d.memory, d.kernel, d.cdvd, d.rpc, d.intrman, d.timrman, d.ioman, d.imports,
+           d.modules, d.pendingDmaInterrupts, d.pendingGuestCallbacks, d.nextModuleId, d.moduleCursor,
+           d.totalCycles, d.idleUntil, d.totalInstructions, d.eeCycleCarry, d.cycleOvershoot,
+           d.nextAudioCycle, d.audioStreamActive, d.autoDma,
+           d.secrMcCommandHandler, d.secrMcDevIdHandler, d.checkKelfPathCallback);
     }
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)

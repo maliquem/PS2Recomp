@@ -3,6 +3,7 @@
 #include "../core/iop_cpu.h"
 #include "../core/iop_memory.h"
 #include "../services/iop_rpc.h"
+#include "ps2x/state_archive.h"
 
 namespace ps2x::iop::detail
 {
@@ -109,5 +110,10 @@ namespace ps2x::iop::detail
                                                       handler->second.gp,
                                                       100000u);
         return true;
+    }
+
+    void IopIntrman::stateIo(ps2x::state::Archive &ar)
+    {
+        ar(m_handlers, m_enabled);
     }
 }

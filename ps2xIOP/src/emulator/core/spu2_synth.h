@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Archive;
+}
+
 namespace ps2x::iop::detail
 {
     // Minimal hardware-accurate PS2 SPU2 core: 2 MiB SPU2 RAM, 2 cores x 24 ADPCM voices,
@@ -37,6 +42,9 @@ namespace ps2x::iop::detail
         // Renders interleaved 48 kHz 16-bit stereo samples for all 48 ADPCM voices.
         // Returns true if any voice was active during the rendered block.
         bool render(int16_t *interleavedStereo, size_t frameCount);
+
+        // Save state: saves or restores the guest-visible state (same executable only).
+        void stateIo(ps2x::state::Archive &ar);
 
     private:
         enum class AdsrPhase : uint8_t

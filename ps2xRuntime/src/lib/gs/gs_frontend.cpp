@@ -1448,6 +1448,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxpos = m_trxpos;
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
+            frameskipNoteTransfer(command);
             m_backend->BeginTransfer(command);
         }
         recordTransferDebugEventUnlocked();
@@ -1633,8 +1634,11 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
-        recordDrawDebugEventUnlocked(needed);
+        if (!frameskipDropsDraw(batch))
+        {
+            m_backend->Submit(batch);
+            recordDrawDebugEventUnlocked(needed);
+        }
     }
 
     switch (m_prim.type)
