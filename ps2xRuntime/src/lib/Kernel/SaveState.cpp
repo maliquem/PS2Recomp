@@ -361,7 +361,7 @@ namespace ps2x::savestate
             uint64_t selftestBase = 0;
             std::ofstream hashOut;
             uint64_t hashFrom = 0, hashTo = 0;
-            bool testTurbo = false;
+            std::atomic<bool> testTurbo{false}; // EE writes, main thread reads
 
             // Messages for the window title (EE and main thread).
             std::mutex messageMutex;
