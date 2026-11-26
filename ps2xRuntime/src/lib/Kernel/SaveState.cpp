@@ -363,7 +363,8 @@ namespace ps2x::savestate
             std::atomic<bool> turboToggle{false};
             std::atomic<bool> turboHeld{false};
             std::atomic<int> frameskip{0};
-            std::atomic<int> autoLevel{1};
+            std::atomic<int> autoLevel{0};
+            AutoFrameskip autoState; // main thread
             std::atomic<bool> vpsRestart{false}; // a load moved the field counter: restart the VPS sample
             std::atomic<bool> gpuPresent{false};
             uint64_t hostFrame = 0;
@@ -947,6 +948,36 @@ namespace ps2x::savestate
         }
     }
 
+    int autoFrameskipStep(AutoFrameskip &a, double vps, double target)
+    {
+        const int l = std::clamp(a.level, 0, 3);
+        for (int &age : a.age)
+            age = std::min(age + 1, kAutoStaleSeconds + 1);
+        const auto fresh = [&](int i) { return a.age[i] <= kAutoStaleSeconds; };
+        a.vps[l] = fresh(l) ? (a.vps[l] + vps) / 2.0 : vps; // one-second samples swing by ~10%
+        a.age[l] = 0;
+        const double enough = target * 0.95;
+        if (vps < enough)
+        {
+            if (l < 3 && !fresh(l + 1))
+                return a.level = l + 1;
+            // A lower level is measured again only if it was close: probing slower levels costs speed.
+            if (l > 0 && !fresh(l - 1) && a.vps[l - 1] >= a.vps[l] * 0.97)
+                return a.level = l - 1;
+            double fastest = 0.0;
+            for (int i = 0; i < 4; ++i)
+                if (fresh(i))
+                    fastest = std::max(fastest, a.vps[i]);
+            int best = 0; // the lowest fresh level within 2% of the fastest: more frames shown for the same speed
+            while (!fresh(best) || a.vps[best] * 1.02 < fastest)
+                ++best;
+            return a.level = best;
+        }
+        if (l > 0 && (!fresh(l - 1) || a.vps[l - 1] >= enough))
+            return a.level = l - 1;
+        return a.level = l;
+    }
+
     void writeStateFile(const std::filesystem::path &path, const std::vector<uint8_t> &payload,
                         const std::string &gameId, uint64_t exeHash, uint64_t vsyncTick)
     {
@@ -1057,6 +1088,9 @@ namespace ps2x::savestate
         {
             const int next = (s.frameskip.load(std::memory_order_relaxed) + 1) % 5;
             s.frameskip.store(next, std::memory_order_relaxed);
+            s.autoState = {}; // a sample run at the old level must not count for Auto
+            s.autoLevel.store(0, std::memory_order_relaxed);
+            s.vpsRestart.store(true, std::memory_order_relaxed);
             say(std::string("Turbo frameskip: ") + frameskipName(next));
         }
         const bool isTurbo = turboActive();
@@ -1068,24 +1102,23 @@ namespace ps2x::savestate
         if (isTurbo != wasTurbo)
         {
             applySpeed();
-            s.autoLevel.store(1, std::memory_order_relaxed);
+            s.autoState = {};
+            s.autoLevel.store(0, std::memory_order_relaxed);
             if (s.turboToggle.load(std::memory_order_relaxed) || !s.turboHeld.load(std::memory_order_relaxed))
                 say(isTurbo ? (s.opt.turboPercent ? "Turbo " + std::to_string(s.opt.turboPercent / 100.0).substr(0, 3) + "x" : std::string("Turbo unlimited"))
                             : std::string("Turbo off"));
         }
 
-        // Once a second in turbo: Auto frameskip raises the level while the target is not met, and the
-        // speed and the dropped draws go to stdout.
+        // Once a second in turbo: Auto frameskip picks the level for the next second, and the speed and the
+        // dropped draws go to stdout.
         if (isTurbo && now - s.vpsSince >= std::chrono::seconds(1))
         {
             const uint64_t ticks = runtime.memory().gs().vsyncTick.load(std::memory_order_acquire);
             const double seconds = std::chrono::duration<double>(now - s.vpsSince).count();
             const double vps = static_cast<double>(ticks - s.vpsTicks) / seconds;
             const double target = s.opt.turboPercent ? 59.94 * s.opt.turboPercent / 100.0 : 1e9;
-            int level = s.autoLevel.load(std::memory_order_relaxed);
-            if (s.frameskip.load(std::memory_order_relaxed) == static_cast<int>(Frameskip::Auto) &&
-                vps < target * 0.95 && level < 3)
-                s.autoLevel.store(level + 1, std::memory_order_relaxed);
+            if (s.frameskip.load(std::memory_order_relaxed) == static_cast<int>(Frameskip::Auto))
+                s.autoLevel.store(autoFrameskipStep(s.autoState, vps, target), std::memory_order_relaxed);
             const uint64_t dropped = ps2x::pacing::g_frameskipDropped.exchange(0, std::memory_order_relaxed);
             const uint64_t submitted = ps2x::pacing::g_frameskipSubmitted.exchange(0, std::memory_order_relaxed);
             std::cout << "[savestate] turbo " << static_cast<int>(vps + 0.5) << " VPS, frameskip " << effectiveFrameskip()

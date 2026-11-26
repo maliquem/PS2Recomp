@@ -6,6 +6,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2x/state_archive.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -210,6 +211,45 @@ void register_ps2_savestate_tests()
             t.IsFalse(draw(kB), "turbo off: back to idle");
             g_frameskipDropped.store(0);
             g_frameskipSubmitted.store(0);
+        });
+
+        tc.Run("AutoFrameskip_keeps_the_fastest_level_and_steps_down_with_spare_speed", [](TestCase &t)
+        {
+            namespace ss = ps2x::savestate;
+            // The pacer caps the speed at the target, so a level with spare speed measures as the target.
+            auto run = [](ss::AutoFrameskip &a, const double (&speed)[4], double target, int seconds, int level)
+            {
+                int on = 0;
+                for (int i = 0; i < seconds; ++i)
+                    on += ss::autoFrameskipStep(a, std::min(speed[a.level], target), target) == level;
+                return on;
+            };
+
+            // 300% (target 179.8) on a scene where no level reaches 95% and level 3 is slower than 2.
+            const double heavy[4] = {144.0, 160.0, 168.0, 158.0};
+            const double target = 179.82;
+            ss::AutoFrameskip a;
+            t.Equals(ss::autoFrameskipStep(a, heavy[0], target), 1, "too slow: try level 1");
+            t.Equals(ss::autoFrameskipStep(a, heavy[1], target), 2, "still slow: try level 2");
+            t.Equals(ss::autoFrameskipStep(a, heavy[2], target), 3, "still slow: try level 3");
+            t.Equals(ss::autoFrameskipStep(a, heavy[3], target), 2, "3 was slower: back to 2");
+            t.IsTrue(run(a, heavy, target, 60, 2) >= 48, "stays on the fastest level, apart from a probe when 3 goes stale");
+
+            // One noisy second at level 2 must not lock Auto onto another level.
+            t.Equals(a.level, 2, "on level 2 before the noisy second");
+            ss::autoFrameskipStep(a, 140.0, target);
+            run(a, heavy, target, 2 * ss::kAutoStaleSeconds, 2);
+            t.IsTrue(run(a, heavy, target, 30, 2) >= 25, "back on level 2 after the noisy second");
+
+            // The scene gets light (every level meets 200%, target 119.9): steps down to 0 and stays.
+            const double light[4] = {150.0, 160.0, 170.0, 165.0};
+            t.IsTrue(run(a, light, 119.88, 5, 0) >= 1, "spare speed: steps down to 0");
+            t.Equals(run(a, light, 119.88, 30, 0), 30, "target met at 0: stays");
+
+            // Level 0 just misses, level 1 meets: settles on 1 and only probes 0 when it goes stale.
+            const double mid[4] = {110.0, 125.0, 130.0, 128.0};
+            ss::AutoFrameskip c;
+            t.IsTrue(run(c, mid, 119.88, 60, 1) >= 50, "settles on the lowest level that meets the target");
         });
 
         tc.Run("StateFile_round_trip_and_rejections", [](TestCase &t)
