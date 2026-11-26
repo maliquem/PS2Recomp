@@ -932,5 +932,7 @@ namespace ps2x::iop::detail
         ar(m_ram, m_rawRegs, m_cores, m_busTicks, m_busUsed, m_outPos, m_musicAcc, m_irq);
         for (auto &area : m_reverbRam)
             ar(area);
+        if (ar.loading())
+            clearOutput(); // the chunk in progress belongs to the state being replaced
     }
 }

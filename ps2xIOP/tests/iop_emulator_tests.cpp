@@ -954,6 +954,43 @@ int main()
     if (!expect(iop.debugSnapshot().emulatorInstructions > soundInstructionsBefore,
                 "Sound RPC did not execute the physical IOP handler")) return 1;
 
+    // The SPU2 runs up to the instruction that touches it: a voice in linear attack (14 per sample)
+    // read twice, 7682 instructions (10 samples of 768 cycles) apart, has grown by 10 or 11 samples.
+    const uint32_t spu2TimingHandler[] = {
+        0x3C09BF90u, // lui t1, 0xBF90 (SPU2 registers)
+        0x340A28FFu, // ori t2, zero, 0x28FF (ADSR1: linear attack, shift 10)
+        0xA52A0006u, // sh t2, 0x06(t1)
+        0x340A1FCAu, // ori t2, zero, 0x1FCA (ADSR2: held sustain)
+        0xA52A0008u, // sh t2, 0x08(t1)
+        0x340A0001u, // ori t2, zero, 1
+        0xA52A01A0u, // sh t2, 0x1A0(t1) (key on voice 0)
+        0x34080A00u, // ori t0, zero, 2560
+        0x2508FFFFu, // addiu t0, t0, -1
+        0x1500FFFEu, // bne t0, zero, -2
+        0x00000000u, // nop
+        0x952B000Au, // lhu t3, 0x0A(t1) (ENVX)
+        0x34080A00u, // ori t0, zero, 2560
+        0x2508FFFFu, // addiu t0, t0, -1
+        0x1500FFFEu, // bne t0, zero, -2
+        0x00000000u, // nop
+        0x952C000Au, // lhu t4, 0x0A(t1)
+        0x00000000u, // nop (load delay)
+        0x018B5823u, // subu t3, t4, t3
+        0x3C020001u, // lui v0, 1
+        0x34420400u, // ori v0, v0, 0x400
+        0xAC4B0000u, // sw t3, 0(v0)
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+    };
+    if (!expect(iop.writeMemory(0x00010300u, spu2TimingHandler, sizeof(spu2TimingHandler)),
+                "Could not install the SPU2 timing handler")) return 1;
+    const RpcResult spu2TimingResult = iop.handleRpc(soundRequest);
+    uint32_t envelopeGrowth = 0u;
+    std::memcpy(&envelopeGrowth, host.guest.data() + 0x900u, sizeof(envelopeGrowth));
+    if (!expect(spu2TimingResult.handled && (envelopeGrowth == 140u || envelopeGrowth == 154u),
+                ("SPU2 did not advance sample by sample between two register reads (ENVX grew " +
+                 std::to_string(envelopeGrowth) + ")").c_str())) return 1;
+
     constexpr uint32_t relocatableRpcSid = 0xA11CE001u;
     writeRelocatableRpcServerIrx(host, 0x100u);
     const ModuleLoadResult relocatableRpcModule = iop.loadModuleBuffer(0x100u);

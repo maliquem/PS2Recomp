@@ -110,7 +110,8 @@ namespace ps2x::iop::detail
         };
 
         static constexpr uint32_t kAudioChunkFrames = 256u;
-        static constexpr uint64_t kAudioChunkCycles = static_cast<uint64_t>(kAudioChunkFrames) * 768u;
+        static constexpr uint64_t kAudioFrameCycles = 768u;
+        static constexpr uint64_t kAudioChunkCycles = static_cast<uint64_t>(kAudioChunkFrames) * kAudioFrameCycles;
 
         explicit Impl(IopHost &hostRef)
             : host(hostRef),
@@ -153,6 +154,7 @@ namespace ps2x::iop::detail
             eeCycleCarry = 0;
             cycleOvershoot = 0;
             nextAudioCycle = kAudioChunkCycles;
+            audioChunkFrames = 0u;
             audioStreamActive = false;
             autoDma = {};
             activeCpu = nullptr;
@@ -204,6 +206,7 @@ namespace ps2x::iop::detail
             {
                 if (dma->autoDma && dma->byteSize >= 1024u)
                 {
+                    advanceSpu2Audio(); // the first block is read at the next chunk boundary from here
                     const uint32_t alignedBytes = dma->byteSize & ~1023u;
                     auto &state = autoDma[static_cast<size_t>(dma->core & 1)];
                     state.active = true;
@@ -213,8 +216,6 @@ namespace ps2x::iop::detail
                     state.currentMadr = dma->madr;
                     state.totalBytes = alignedBytes;
                     state.bytesRemaining = alignedBytes;
-                    if (nextAudioCycle <= totalCycles)
-                        nextAudioCycle = totalCycles + kAudioChunkCycles;
                 }
                 else
                 {
@@ -237,16 +238,31 @@ namespace ps2x::iop::detail
             }
         }
 
+        // Cycle at which the next sample of the current chunk is due. nextAudioCycle is the end of the
+        // chunk, where the AutoDMA block is fed and the chunk goes to the host.
+        [[nodiscard]] uint64_t nextSampleCycle() const noexcept
+        {
+            return nextAudioCycle - (kAudioChunkFrames - 1u - audioChunkFrames) * kAudioFrameCycles;
+        }
+
+        // Runs the SPU2 up to the current cycle. Called after every instruction that crosses a sample,
+        // so a register write lands on its own sample and a read sees the state of that moment.
         void advanceSpu2Audio()
         {
-            while (totalCycles >= nextAudioCycle)
+            Spu2Synth &spu2 = memory.spu2();
+            while (totalCycles >= nextSampleCycle())
             {
-                nextAudioCycle += kAudioChunkCycles;
-
-                Spu2Synth &spu2 = memory.spu2();
-                bool producedAudio = spu2.render(kAudioChunkFrames);
+                const uint32_t frames = static_cast<uint32_t>(std::min<uint64_t>(
+                    kAudioChunkFrames - audioChunkFrames, (totalCycles - nextSampleCycle()) / kAudioFrameCycles + 1u));
+                audioChunkFrames += frames;
+                if (spu2.render(frames))
+                    audioStreamActive = true;
                 if (spu2.takeIrq())
                     pendingDmaInterrupts[9] = totalCycles; // SPU2 interrupt
+                if (audioChunkFrames < kAudioChunkFrames)
+                    continue;
+                audioChunkFrames = 0u;
+                nextAudioCycle += kAudioChunkCycles;
 
                 for (int c = 0; c < 2; ++c)
                 {
@@ -265,7 +281,7 @@ namespace ps2x::iop::detail
                     if (memory.readRam(state.currentMadr, raw, sizeof(raw)))
                     {
                         spu2.setInputBlock(c, raw);
-                        producedAudio = true;
+                        audioStreamActive = true;
                     }
 
                     state.currentMadr += 1024u;
@@ -291,8 +307,6 @@ namespace ps2x::iop::detail
                     }
                 }
 
-                if (producedAudio)
-                    audioStreamActive = true;
                 if (audioStreamActive)
                     for (int bus = 0; bus < Spu2Synth::kBusCount; ++bus)
                         host.submitSpu2Pcm(bus, spu2.output(bus).data(), spu2.output(bus).size() / 2u);
@@ -503,6 +517,8 @@ namespace ps2x::iop::detail
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
                 ++totalCycles;
+                if (totalCycles >= nextSampleCycle())
+                    advanceSpu2Audio();
                 if (disposition == ImportDisposition::JumpToGuest)
                     return true;
                 cpu.pc = cpu.gpr[31];
@@ -514,6 +530,8 @@ namespace ps2x::iop::detail
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
+            if (totalCycles >= nextSampleCycle())
+                advanceSpu2Audio();
             return running;
         }
 
@@ -843,6 +861,7 @@ namespace ps2x::iop::detail
         uint64_t eeCycleCarry = 0;
         uint64_t cycleOvershoot = 0;
         uint64_t nextAudioCycle = kAudioChunkCycles;
+        uint32_t audioChunkFrames = 0u; // samples of the current chunk already rendered
         bool audioStreamActive = false;
         std::array<AutoDmaState, 2> autoDma{};
         CpuState *activeCpu = nullptr;
@@ -877,7 +896,7 @@ namespace ps2x::iop::detail
         ar(d.memory, d.kernel, d.cdvd, d.rpc, d.intrman, d.timrman, d.ioman, d.imports,
            d.modules, d.pendingDmaInterrupts, d.pendingGuestCallbacks, d.nextModuleId, d.moduleCursor,
            d.totalCycles, d.idleUntil, d.totalInstructions, d.eeCycleCarry, d.cycleOvershoot,
-           d.nextAudioCycle, d.audioStreamActive, d.autoDma,
+           d.nextAudioCycle, d.audioChunkFrames, d.audioStreamActive, d.autoDma,
            d.secrMcCommandHandler, d.secrMcDevIdHandler, d.checkKelfPathCallback);
     }
 
