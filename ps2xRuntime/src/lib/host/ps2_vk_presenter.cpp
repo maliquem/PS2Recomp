@@ -462,27 +462,31 @@ struct VkPresenter::Impl
 
     // fmvOut sized to the letterbox rect, and the set pointing at the current scene and fmvOut.
     // Called before the command buffer uses either, and after waitFence: nothing in flight reads the old ones.
-    bool ensureFmvTarget(uint32_t w, uint32_t h)
+    bool ensureFmvTarget(uint32_t w, uint32_t h, bool sharpen)
     {
         if (fmvOut && (w != fmvOutW || h != fmvOutH))
         {
             destroyImage(fmvOut, fmvOutMemory, fmvOutView);
             destroyImage(fmvSharp, fmvSharpMemory, fmvSharpView);
         }
+        const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if (!fmvOut)
         {
             fmvSetStale = true;
-            const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-            if (!createImage(w, h, usage, fmvOut, fmvOutMemory, fmvOutView) ||
-                !createImage(w, h, usage, fmvSharp, fmvSharpMemory, fmvSharpView))
-            {
-                destroyImage(fmvOut, fmvOutMemory, fmvOutView);
-                destroyImage(fmvSharp, fmvSharpMemory, fmvSharpView);
+            if (!createImage(w, h, usage, fmvOut, fmvOutMemory, fmvOutView))
                 return false;
-            }
             fmvOutW = w;
             fmvOutH = h;
         }
+        // fmvSharp (step 3) only exists while sharpening is on: ~25 MB at 4K otherwise.
+        if (sharpen && !fmvSharp)
+        {
+            fmvSetStale = true;
+            if (!createImage(w, h, usage, fmvSharp, fmvSharpMemory, fmvSharpView))
+                return false;
+        }
+        else if (!sharpen && fmvSharp)
+            destroyImage(fmvSharp, fmvSharpMemory, fmvSharpView); // its set is rewritten before it is used again
         if (fmvSetStale)
         {
             const VkDescriptorImageInfo img[4] = {{VK_NULL_HANDLE, sceneView, VK_IMAGE_LAYOUT_GENERAL},
@@ -490,7 +494,8 @@ struct VkPresenter::Impl
                                                   {VK_NULL_HANDLE, fmvOutView, VK_IMAGE_LAYOUT_GENERAL},
                                                   {VK_NULL_HANDLE, fmvSharpView, VK_IMAGE_LAYOUT_GENERAL}};
             VkWriteDescriptorSet wr[4]{};
-            for (uint32_t i = 0; i < 4; ++i)
+            const uint32_t count = fmvSharp ? 4u : 2u;
+            for (uint32_t i = 0; i < count; ++i)
             {
                 wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 wr[i].dstSet = i < 2 ? fmvSet : fmvSharpenSet;
@@ -499,7 +504,7 @@ struct VkPresenter::Impl
                 wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 wr[i].pImageInfo = &img[i];
             }
-            vk.vkUpdateDescriptorSets(device, 4, wr, 0, nullptr);
+            vk.vkUpdateDescriptorSets(device, count, wr, 0, nullptr);
             fmvSetStale = false;
         }
         return true;
@@ -656,7 +661,7 @@ struct VkPresenter::Impl
             return;
     }
 
-    // FMV steps 2/5: scales the movie scene into fmvOut (rect size); true when the letterbox should copy fmvOut.
+    // FMV steps 2/3/5: scales the movie scene into fmvOut (rect size), then optionally sharpens it into fmvSharp.
     // Returns the image holding the filtered movie frame (rect-sized, TRANSFER_SRC), or null for the plain blit.
     VkImage recordFmvScale(const OutputRect &r)
     {
@@ -664,7 +669,7 @@ struct VkPresenter::Impl
         const float sharpen = ps2fmv::kSharpenAmounts[ps2fmv::sharpen.load(std::memory_order_relaxed)];
         const bool on = sceneValid && sceneMovie && filter != ps2fmv::Pixel;
         const uint32_t w = static_cast<uint32_t>(r.w), h = static_cast<uint32_t>(r.h);
-        const bool run = on && w && h && ensureFmvPipeline() && ensureFmvTarget(w, h);
+        const bool run = on && w && h && ensureFmvPipeline() && ensureFmvTarget(w, h, sharpen > 0.0f);
         if (run != fmvLogged)
         {
             std::fprintf(stderr, "[host] FMV scale pass %s (filter=%s %ux%u -> %ux%u deband=%d sharpen=%.2f)\n",

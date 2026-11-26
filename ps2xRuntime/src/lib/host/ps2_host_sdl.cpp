@@ -18,9 +18,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -159,15 +161,22 @@ namespace ps2host
         g_showRate = ps2cfg::envBool("PS2X_SHOW_FPS", "display.show_fps", false);
         ps2fmv::enabled = ps2cfg::envBool("PS2X_FMV", "video.fmv", true);
         ps2fmv::csc = ps2cfg::envBool("PS2X_FMV_CSC", "video.fmv_csc", true);
-        const std::string scale = ps2cfg::envString("PS2X_FMV_SCALE", "video.fmv_scale", "lanczos");
-        for (int i = 0; i < ps2fmv::ScaleCount; ++i)
-            if (scale == ps2fmv::kScaleNames[i])
-                ps2fmv::scale = i;
+        // Case-insensitive; an unknown value is reported and keeps the default.
+        const auto pick = [](const char *key, std::string v, const char *const *names, int count, std::atomic<int> &out) {
+            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            for (int i = 0; i < count; ++i)
+                if (v == names[i])
+                {
+                    out = i;
+                    return;
+                }
+            std::fprintf(stderr, "[host] %s: unknown value \"%s\", using \"%s\"\n", key, v.c_str(), names[out.load()]);
+        };
+        pick("fmv_scale", ps2cfg::envString("PS2X_FMV_SCALE", "video.fmv_scale", "lanczos"), ps2fmv::kScaleNames,
+             ps2fmv::ScaleCount, ps2fmv::scale);
         ps2fmv::deband = ps2cfg::envBool("PS2X_FMV_DEBAND", "video.fmv_deband", false);
-        const std::string sharpen = ps2cfg::envString("PS2X_FMV_SHARPEN", "video.fmv_sharpen", "off");
-        for (int i = 0; i < 3; ++i)
-            if (sharpen == ps2fmv::kSharpenNames[i])
-                ps2fmv::sharpen = i;
+        pick("fmv_sharpen", ps2cfg::envString("PS2X_FMV_SHARPEN", "video.fmv_sharpen", "off"), ps2fmv::kSharpenNames,
+             static_cast<int>(std::size(ps2fmv::kSharpenNames)), ps2fmv::sharpen);
         g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;

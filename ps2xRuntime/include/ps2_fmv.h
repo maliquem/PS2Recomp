@@ -4,7 +4,7 @@
 
 // Movie (FMV) quality options (Shadow Hearts plan 4.1, study 08). The SDL host loads them on the main thread
 // (PS2X_FMV* env vars win over the [video] fmv_* keys of the player TOML) and the pause menu changes them; the MPEG
-// decoder (EE thread) and the presenter read them. The defaults below hold when nothing loads them (raylib host).
+// decoder (EE thread) and the presenter read them. The raylib host only reads PS2X_FMV (off on Vita).
 // PS2X_FMV=0 turns every step off: the output is today's, bit for bit.
 namespace ps2fmv
 {
