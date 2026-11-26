@@ -839,12 +839,8 @@ bool PS2Runtime::initialize(const char *title)
 #if PS2X_HOST_RAYLIB
         SetTargetFPS(60);
         // No TOML here and only the decoder's step 1 applies; PS2X_FMV=0 turns it off.
-#if defined(PLATFORM_VITA)
-        ps2fmv::enabled = false; // shortcut: never measured on the Vita CPU (60 VPS), measure before turning on
-#else
-        const char *fmvEnv = std::getenv("PS2X_FMV");
-        ps2fmv::enabled = !(fmvEnv && fmvEnv[0] == '0');
-#endif
+        if (const char *fmvEnv = std::getenv("PS2X_FMV"); fmvEnv && fmvEnv[0] == '0')
+            ps2fmv::enabled = false;
 #else
         if (!ps2host::openWindow(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, m_gs))
         {
