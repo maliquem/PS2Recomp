@@ -60,7 +60,8 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
-    void submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount) override;
+    void submitSpu2Pcm(int bus, const int16_t *interleavedStereoPcm, size_t frameCount) override;
+    double spu2MusicRatio() override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
     std::string translateGuestPath(std::string_view path) const override;

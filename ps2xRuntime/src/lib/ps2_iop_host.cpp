@@ -268,9 +268,14 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             receive.size);
 }
 
-void PS2IopHostAdapter::submitSpu2Pcm(int core, const int16_t *interleavedStereoPcm, size_t frameCount)
+void PS2IopHostAdapter::submitSpu2Pcm(int bus, const int16_t *interleavedStereoPcm, size_t frameCount)
 {
-    m_runtime.audioBackend().submitSpu2Pcm(core, interleavedStereoPcm, frameCount);
+    m_runtime.audioBackend().submitSpu2Pcm(bus, interleavedStereoPcm, frameCount);
+}
+
+double PS2IopHostAdapter::spu2MusicRatio()
+{
+    return m_runtime.audioBackend().spu2MusicRatio();
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
