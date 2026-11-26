@@ -18,7 +18,7 @@ namespace
     using Value = toml::ordered_value;
 
     constexpr const char *kTemplate = R"(# PS2Recomp player settings. Delete this file to get the defaults back.
-# An environment variable set explicitly (PS2X_VSYNC, PS2X_SHOW_FPS, PS2X_GS_BACKEND, PS2X_MUSIC_TURBO) wins over this file.
+# An environment variable set explicitly (PS2X_VSYNC, PS2X_SHOW_FPS, PS2X_GS_BACKEND, PS2X_MUSIC_TURBO, PS2X_FMV*) wins over this file.
 # The pause menu (Esc, or Guide / Back+Start on a controller) changes most of these and saves them here.
 
 [display]
@@ -26,6 +26,18 @@ namespace
 vsync = true
 # FPS/VPS counter in the corner (F3 toggles it).
 show_fps = false
+
+[video]
+# Movie (FMV) enhancements; false shows the movies exactly as before (PS2X_FMV=0 does the same).
+fmv = true
+# Precise colour conversion of the movies (sharper colour edges, no colour shift).
+fmv_csc = true
+# How movies are scaled to the screen: "pixel" (as before), "bilinear", "bicubic" or "lanczos" (sharpest, no halos).
+fmv_scale = "lanczos"
+# Smooth the colour steps in dark movie gradients (adds a fine dither). Not with "pixel".
+fmv_deband = false
+# Sharpen movies after scaling: "off", "light" or "medium". Medium also brings out compression blocks. Not with "pixel".
+fmv_sharpen = "off"
 
 [gs]
 # "vulkan" (default) or "cpu".

@@ -1,6 +1,7 @@
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
+#include "ps2_fmv.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
@@ -510,10 +511,12 @@ namespace
             return false;
         s.lastTick = tick;
         s.latched = true;
-        const uint32_t fullFrameHeight = useFullMpegFrame ? ps2_stubs::mpegPresentationHeight() : 0u;
+        const uint32_t mpegHeight = ps2_stubs::mpegPresentationHeight(); // one load: a movie may start or end meanwhile
+        const uint32_t fullFrameHeight = useFullMpegFrame ? mpegHeight : 0u;
         if (ps2host::gpuPresent())
         {
             rt->gs().latchHostPresentationFrameGpu(fullFrameHeight, s.gpu);
+            s.gpu.movie = mpegHeight != 0u;
             return true;
         }
         rt->gs().latchHostPresentationFrame(fullFrameHeight);
@@ -835,6 +838,9 @@ bool PS2Runtime::initialize(const char *title)
 #endif
 #if PS2X_HOST_RAYLIB
         SetTargetFPS(60);
+        // No TOML here and only the decoder's step 1 applies; PS2X_FMV=0 turns it off.
+        if (const char *fmvEnv = std::getenv("PS2X_FMV"); fmvEnv && fmvEnv[0] == '0')
+            ps2fmv::enabled = false;
 #else
         if (!ps2host::openWindow(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, m_gs))
         {

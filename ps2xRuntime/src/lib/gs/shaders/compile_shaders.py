@@ -12,6 +12,7 @@ SHADERS = (
     ('kGsUploadSpv', 'gs_upload.comp'),
     ('kGsTileRasterSpv', 'gs_tile_raster.comp'),
     ('kGsPresentSpv', 'gs_present.comp'),
+    ('kFmvScaleSpv', 'fmv_scale.comp'),
 )
 
 

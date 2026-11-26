@@ -12,9 +12,12 @@ extern "C"
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 #endif
+
+#include "ps2_fmv.h"
 
 #include <deque>
 #include <memory>
@@ -370,6 +373,36 @@ namespace ps2_stubs
                 }
             }
 
+            // FMV step 1 (study 08: 58-60 dB against a float BT.601 reference, today's bilinear path 41-55 dB).
+            // Chroma positions go through options because sws_getContext cannot take them; MPEG-2 4:2:0 puts the
+            // chroma sample on the left luma column (h 0) and between the two rows (v 128 of 256).
+            static SwsContext *createAccurateScaler(int width, int height, AVPixelFormat srcFormat)
+            {
+                SwsContext *ctx = sws_alloc_context();
+                if (!ctx)
+                    return nullptr;
+                av_opt_set_int(ctx, "srcw", width, 0);
+                av_opt_set_int(ctx, "srch", height, 0);
+                av_opt_set_int(ctx, "src_format", srcFormat, 0);
+                av_opt_set_int(ctx, "dstw", width, 0);
+                av_opt_set_int(ctx, "dsth", height, 0);
+                av_opt_set_int(ctx, "dst_format", AV_PIX_FMT_RGBA, 0);
+                av_opt_set_int(ctx, "sws_flags", SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, 0);
+                av_opt_set_int(ctx, "src_h_chr_pos", 0, 0);
+                av_opt_set_int(ctx, "src_v_chr_pos", 128, 0);
+                // ~2 ms per 640x448 frame on one core cost 3-5 VPS on the EE thread; slices give the same pixels.
+                av_opt_set_int(ctx, "threads", 4, 0);
+                if (sws_init_context(ctx, nullptr, nullptr) < 0)
+                {
+                    sws_freeContext(ctx);
+                    return nullptr;
+                }
+                const int *bt601 = sws_getCoefficients(SWS_CS_ITU601);
+                sws_setColorspaceDetails(ctx, bt601, 0 /* limited-range YUV */, bt601, 1 /* full-range RGB */,
+                                         0, 1 << 16, 1 << 16);
+                return ctx;
+            }
+
             bool convertFrame(std::deque<MpegDecodedFrame> &frames)
             {
                 const int width = m_frame->width;
@@ -380,27 +413,31 @@ namespace ps2_stubs
                     return false;
                 }
 
+                const bool accurate = ps2fmv::cscOn();
                 if (!m_swsCtx ||
                     m_swsWidth != width ||
                     m_swsHeight != height ||
-                    m_swsFormat != srcFormat)
+                    m_swsFormat != srcFormat ||
+                    m_swsAccurate != accurate)
                 {
                     if (m_swsCtx)
                     {
                         sws_freeContext(m_swsCtx);
                         m_swsCtx = nullptr;
                     }
-                    m_swsCtx = sws_getContext(
-                        width,
-                        height,
-                        srcFormat,
-                        width,
-                        height,
-                        AV_PIX_FMT_RGBA,
-                        SWS_BILINEAR,
-                        nullptr,
-                        nullptr,
-                        nullptr);
+                    m_swsCtx = accurate ? createAccurateScaler(width, height, srcFormat)
+                                        : sws_getContext(
+                                              width,
+                                              height,
+                                              srcFormat,
+                                              width,
+                                              height,
+                                              AV_PIX_FMT_RGBA,
+                                              SWS_BILINEAR,
+                                              nullptr,
+                                              nullptr,
+                                              nullptr);
+                    m_swsAccurate = accurate;
                     if (!m_swsCtx)
                     {
                         std::cerr << "[MPEG] failed to create FFmpeg scaler." << std::endl;
@@ -420,16 +457,38 @@ namespace ps2_stubs
                                      : -1;
                 decoded.rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
 
-                uint8_t *dstData[4] = {decoded.rgba.data(), nullptr, nullptr, nullptr};
-                int dstLinesize[4] = {width * 4, 0, 0, 0};
-                const int scaledRows = sws_scale(
-                    m_swsCtx,
-                    m_frame->data,
-                    m_frame->linesize,
-                    0,
-                    height,
-                    dstData,
-                    dstLinesize);
+                int scaledRows = 0;
+                if (accurate)
+                {
+                    // Only sws_scale_frame runs the slice threads; dst wraps decoded.rgba without copying.
+                    AVFrame *dst = av_frame_alloc();
+                    if (dst)
+                    {
+                        dst->width = width;
+                        dst->height = height;
+                        dst->format = AV_PIX_FMT_RGBA;
+                        dst->data[0] = decoded.rgba.data();
+                        dst->linesize[0] = width * 4;
+                        dst->buf[0] = av_buffer_create(decoded.rgba.data(), decoded.rgba.size(),
+                                                       [](void *, uint8_t *) {}, nullptr, 0);
+                        if (dst->buf[0] && sws_scale_frame(m_swsCtx, dst, m_frame) >= 0)
+                            scaledRows = height;
+                        av_frame_free(&dst);
+                    }
+                }
+                else
+                {
+                    uint8_t *dstData[4] = {decoded.rgba.data(), nullptr, nullptr, nullptr};
+                    int dstLinesize[4] = {width * 4, 0, 0, 0};
+                    scaledRows = sws_scale(
+                        m_swsCtx,
+                        m_frame->data,
+                        m_frame->linesize,
+                        0,
+                        height,
+                        dstData,
+                        dstLinesize);
+                }
                 if (scaledRows <= 0)
                 {
                     std::cerr << "[MPEG] FFmpeg scaler produced no rows." << std::endl;
@@ -450,6 +509,7 @@ namespace ps2_stubs
             int m_swsWidth = 0;
             int m_swsHeight = 0;
             AVPixelFormat m_swsFormat = AV_PIX_FMT_NONE;
+            bool m_swsAccurate = false;
             bool m_initialized = false;
             bool m_drained = false;
         };
