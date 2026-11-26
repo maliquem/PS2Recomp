@@ -4059,8 +4059,9 @@ void register_ps2_gs_tests()
             constexpr uint32_t kImageAddr = 0x4000u;
             constexpr uint32_t kSrcAddr = 0x5000u;
             constexpr uint32_t kDstAddr = 0x6000u;
+            constexpr uint16_t kImageBlock = 6796u; // past 2048, where a page-unit reading would wrap
 
-            const GsImageMem image{0u, 0u, 2u, 2u, 0u, 1u, 0u};
+            const GsImageMem image{0u, 0u, 2u, 2u, kImageBlock, 1u, 0u};
             const uint8_t pixels[16] = {
                 0x10u, 0x20u, 0x30u, 0x40u,
                 0x50u, 0x60u, 0x70u, 0x80u,
@@ -4090,6 +4091,10 @@ void register_ps2_gs_tests()
             std::memcpy(&loadReg3, rdram + runtime.guestHeapBase() + 56u, sizeof(loadReg3));
             std::memcpy(&loadReg4, rdram + runtime.guestHeapBase() + 72u, sizeof(loadReg4));
             t.Equals(loadReg1, 0x50ull, "sceGsExecLoadImage should encode BITBLTBUF as A+D register 0x50");
+            uint64_t loadBitblt = 0u;
+            std::memcpy(&loadBitblt, rdram + runtime.guestHeapBase() + 16u, sizeof(loadBitblt));
+            t.Equals(static_cast<uint32_t>((loadBitblt >> 32u) & 0x3FFFu), static_cast<uint32_t>(kImageBlock),
+                     "sceGsExecLoadImage should pass the base pointer in blocks, the unit BITBLTBUF uses");
             t.Equals(loadReg2, 0x51ull, "sceGsExecLoadImage should encode TRXPOS as A+D register 0x51");
             t.Equals(loadReg3, 0x52ull, "sceGsExecLoadImage should encode TRXREG as A+D register 0x52");
             t.Equals(loadReg4, 0x53ull, "sceGsExecLoadImage should encode TRXDIR as A+D register 0x53");
@@ -4115,6 +4120,10 @@ void register_ps2_gs_tests()
             std::memcpy(&storeReg3, rdram + runtime.guestHeapBase() + 56u, sizeof(storeReg3));
             std::memcpy(&storeReg4, rdram + runtime.guestHeapBase() + 72u, sizeof(storeReg4));
             t.Equals(storeReg1, 0x50ull, "sceGsExecStoreImage should encode BITBLTBUF as A+D register 0x50");
+            uint64_t storeBitblt = 0u;
+            std::memcpy(&storeBitblt, rdram + runtime.guestHeapBase() + 16u, sizeof(storeBitblt));
+            t.Equals(static_cast<uint32_t>(storeBitblt & 0x3FFFu), static_cast<uint32_t>(kImageBlock),
+                     "sceGsExecStoreImage should pass the base pointer in blocks, the unit BITBLTBUF uses");
             t.Equals(storeReg2, 0x51ull, "sceGsExecStoreImage should encode TRXPOS as A+D register 0x51");
             t.Equals(storeReg3, 0x52ull, "sceGsExecStoreImage should encode TRXREG as A+D register 0x52");
             t.Equals(storeReg4, 0x53ull, "sceGsExecStoreImage should encode TRXDIR as A+D register 0x53");

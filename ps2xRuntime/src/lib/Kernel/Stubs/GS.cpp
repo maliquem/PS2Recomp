@@ -631,7 +631,8 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // libgraph takes the base pointer in blocks (address/64), the unit BITBLTBUF uses.
+        uint32_t dbp = img.vram_addr;
         uint32_t dsax = static_cast<uint32_t>(img.x);
         uint32_t dsay = static_cast<uint32_t>(img.y);
 
@@ -696,7 +697,7 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        uint32_t sbp = img.vram_addr;
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
