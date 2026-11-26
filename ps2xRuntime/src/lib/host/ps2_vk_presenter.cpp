@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -126,6 +128,7 @@ struct VkPresenter::Impl
     // image as presented and the scene it was blitted from, to check colors on the presented pixels.
     std::string dumpPrefix;
     uint64_t dumpAt = 0, presentCount = 0;
+    std::string dumpReq; // PS2X_PRESENT_DUMP_REQ: while this file exists, dump to the prefix it holds, then delete it
     VkBuffer dumpBuffer = VK_NULL_HANDLE;
     VkDeviceMemory dumpMemory = VK_NULL_HANDLE;
 
@@ -502,6 +505,12 @@ bool VkPresenter::init(SDL_Window *window, const GSHostGpuContext &ctx, bool vsy
         p.dumpPrefix = dump;
         p.dumpAt = (at && *at) ? std::strtoull(at, nullptr, 10) : 600u;
     }
+    if (const char *req = std::getenv("PS2X_PRESENT_DUMP_REQ"); req && *req)
+    {
+        p.dumpReq = req;
+        if (!p.dumpAt)
+            p.dumpAt = UINT64_MAX; // never reached: only enables the transfer-source swapchain the dump needs
+    }
     if (!ctx.swapchainEnabled || !p.instance || !p.device || !p.queue)
     {
         error = "GS Vulkan device has no swapchain support";
@@ -703,7 +712,23 @@ void VkPresenter::present(const GSGpuFrame *frame, ImDrawData *imgui)
     if (imgui && p.imgui)
         ImGui_ImplVulkan_RenderDrawData(imgui, p.cmd);
     p.vk.vkCmdEndRenderPass(p.cmd);
-    const bool dumpNow = p.dumpAt && ++p.presentCount == p.dumpAt;
+    bool dumpNow = p.dumpAt && ++p.presentCount == p.dumpAt;
+    if (!dumpNow && !p.dumpReq.empty())
+    {
+        if (std::FILE *f = std::fopen(p.dumpReq.c_str(), "rb"))
+        {
+            char prefix[512]{};
+            const bool ok = std::fgets(prefix, sizeof(prefix), f) != nullptr;
+            std::fclose(f);
+            std::remove(p.dumpReq.c_str());
+            if (ok)
+            {
+                prefix[std::strcspn(prefix, "\r\n")] = 0;
+                p.dumpPrefix = prefix;
+                dumpNow = prefix[0] != 0;
+            }
+        }
+    }
     const bool dump = dumpNow && p.sceneValid && p.recordDump(p.images[index]);
     if (dumpNow && !dump)
         std::fprintf(stderr, "[host] present dump skipped at present %llu (no scene or no host memory)\n",

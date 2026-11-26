@@ -377,6 +377,30 @@ namespace ps2host
                 g_textureH = static_cast<int>(height);
             }
             SDL_UpdateTexture(g_texture, nullptr, rgba, static_cast<int>(rowPixels * 4u));
+            // PS2X_PRESENT_DUMP_REQ on the CPU path: same request file as the Vulkan presenter, scene only.
+            static const char *dumpReq = std::getenv("PS2X_PRESENT_DUMP_REQ");
+            if (dumpReq && *dumpReq)
+            {
+                if (std::FILE *f = std::fopen(dumpReq, "rb"))
+                {
+                    char prefix[512]{};
+                    const bool ok = std::fgets(prefix, sizeof(prefix), f) != nullptr;
+                    std::fclose(f);
+                    std::remove(dumpReq);
+                    prefix[std::strcspn(prefix, "\r\n")] = 0;
+                    if (ok && prefix[0])
+                    {
+                        if (std::FILE *out = std::fopen((std::string(prefix) + ".scene.ppm").c_str(), "wb"))
+                        {
+                            std::fprintf(out, "P6\n%u %u\n255\n", width, height);
+                            for (uint32_t y = 0; y < height; ++y)
+                                for (uint32_t x = 0; x < width; ++x)
+                                    std::fwrite(rgba + (size_t(y) * rowPixels + x) * 4u, 1, 3, out);
+                            std::fclose(out);
+                        }
+                    }
+                }
+            }
         }
         else if (fresh && g_texture)
         {
