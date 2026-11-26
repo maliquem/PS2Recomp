@@ -63,6 +63,11 @@ if(PS2X_IOP_BUILD_TESTS)
     target_include_directories(ps2_iop_import_version_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ps2_iop_import_version_tests COMMAND ps2_iop_import_version_tests)
 
+    add_executable(ps2_iop_spu2_tests tests/spu2_synth_tests.cpp)
+    target_link_libraries(ps2_iop_spu2_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_spu2_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ps2_iop_spu2_tests COMMAND ps2_iop_spu2_tests)
+
     # Tool, not a test: renders a PS2X_SPU2_TRACE file into a WAV.
     add_executable(spu2_trace_replay tests/spu2_trace_replay.cpp)
     target_link_libraries(spu2_trace_replay PRIVATE ps2_iop)

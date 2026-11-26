@@ -1,10 +1,11 @@
 // Renders a PS2X_SPU2_TRACE file through Spu2Synth into a 48 kHz 16-bit stereo WAV, without the game:
-// spu2_trace_replay <trace> <out.wav>. Same input, so two synth versions can be compared sample by sample.
+// spu2_trace_replay <trace> <out.wav> [--no-reverb]. Same input, so two synth versions can be compared.
 #include "emulator/core/spu2_synth.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace
@@ -25,7 +26,7 @@ int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        std::fprintf(stderr, "usage: spu2_trace_replay <trace> <out.wav>\n");
+        std::fprintf(stderr, "usage: spu2_trace_replay <trace> <out.wav> [--no-reverb]\n");
         return 2;
     }
     std::FILE *in = std::fopen(argv[1], "rb");
@@ -39,16 +40,12 @@ int main(int argc, char **argv)
                              char(0x80), char(0xBB), 0, 0, 0, char(0xEE), 2, 0, 4, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0};
     std::fwrite(header, 1u, sizeof(header), out);
 
-    ps2x::iop::detail::Spu2Synth synth;
-    std::vector<int16_t> chunk; // last rendered chunk: AutoDMA blocks that follow it are mixed in before it is written
+    using ps2x::iop::detail::Spu2Synth;
+    const auto synth = std::make_unique<Spu2Synth>();
+    synth->setReverbEnabled(argc < 4 || std::strcmp(argv[3], "--no-reverb") != 0);
     std::vector<uint8_t> data;
+    std::vector<int16_t> mix;
     uint32_t frames = 0u;
-    auto flush = [&]
-    {
-        std::fwrite(chunk.data(), sizeof(int16_t), chunk.size(), out);
-        frames += static_cast<uint32_t>(chunk.size() / 2u);
-        chunk.clear();
-    };
 
     for (int tag; (tag = std::fgetc(in)) != EOF;)
     {
@@ -57,7 +54,7 @@ int main(int argc, char **argv)
         {
             uint16_t event[2];
             if ((ok = get(in, event)))
-                synth.write16(0x1F900000u + event[0], event[1]);
+                synth->write16(0x1F900000u + event[0], event[1]);
         }
         else if (tag == 'D' || tag == 'd')
         {
@@ -69,10 +66,10 @@ int main(int argc, char **argv)
                 if (tag == 'D')
                 {
                     if ((ok = std::fread(data.data(), 1u, bytes, in) == bytes))
-                        synth.dmaWrite(core, data.data(), bytes);
+                        synth->dmaWrite(core, data.data(), bytes);
                 }
                 else
-                    synth.dmaRead(core, data.data(), bytes);
+                    synth->dmaRead(core, data.data(), bytes);
             }
         }
         else if (tag == 'R')
@@ -81,25 +78,26 @@ int main(int argc, char **argv)
             uint64_t micros;
             if ((ok = get(in, count) && get(in, micros) && count <= 48000u))
             {
-                flush();
-                chunk.assign(count * 2u, 0);
-                synth.render(chunk.data(), count);
+                synth->render(count);
+                mix.assign(count * 2u, 0);
+                for (int bus = 0; bus < Spu2Synth::kBusCount; ++bus)
+                {
+                    const auto &pcm = synth->output(bus);
+                    for (size_t i = 0u; i < std::min(mix.size(), pcm.size()); ++i)
+                        mix[i] = static_cast<int16_t>(std::clamp(mix[i] + pcm[i], -32768, 32767));
+                }
+                synth->clearOutput();
+                std::fwrite(mix.data(), sizeof(int16_t), mix.size(), out);
+                frames += count;
             }
         }
         else if (tag == 'A')
         {
-            uint8_t core;
-            int32_t volL, volR;
-            int16_t block[512];
-            if ((ok = get(in, core) && get(in, volL) && get(in, volR) && get(in, block)))
-            {
-                // Same mix as IopEmulator::advanceSpu2Audio: left in the first half of the block, right in the second.
-                for (size_t i = 0u; i < std::min<size_t>(256u, chunk.size() / 2u); ++i)
-                {
-                    chunk[i * 2u] = static_cast<int16_t>(std::clamp(chunk[i * 2u] + ((block[i] * volL) >> 15), -32768, 32767));
-                    chunk[i * 2u + 1u] = static_cast<int16_t>(std::clamp(chunk[i * 2u + 1u] + ((block[256u + i] * volR) >> 15), -32768, 32767));
-                }
-            }
+            // The PCM input of the samples that follow (traces of the older synth put it after the
+            // chunk it was mixed into: those replay 256 samples late, which nothing can hear).
+            uint8_t core, unused[8], block[1024];
+            if ((ok = get(in, core) && get(in, unused) && get(in, block)))
+                synth->setInputBlock(core, block);
         }
         else
             ok = false;
@@ -109,7 +107,6 @@ int main(int argc, char **argv)
             break;
         }
     }
-    flush();
 
     std::fseek(out, 4, SEEK_SET);
     put32(out, 36u + frames * 4u);

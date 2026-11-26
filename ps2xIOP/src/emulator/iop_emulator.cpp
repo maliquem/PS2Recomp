@@ -243,8 +243,10 @@ namespace ps2x::iop::detail
             {
                 nextAudioCycle += kAudioChunkCycles;
 
-                std::array<int16_t, kAudioChunkFrames * 2u> stereo{};
-                bool producedAudio = memory.spu2().render(stereo.data(), kAudioChunkFrames);
+                Spu2Synth &spu2 = memory.spu2();
+                bool producedAudio = spu2.render(kAudioChunkFrames);
+                if (spu2.takeIrq())
+                    pendingDmaInterrupts[9] = totalCycles; // SPU2 interrupt
 
                 for (int c = 0; c < 2; ++c)
                 {
@@ -252,28 +254,17 @@ namespace ps2x::iop::detail
                     if (!state.active)
                         continue;
 
-                    if (!memory.spu2().isAutoDmaEnabled(c))
+                    if (!spu2.isAutoDmaEnabled(c))
                     {
                         state.active = false;
                         continue;
                     }
 
+                    // The block goes through the core's input area: it plays over the next chunk.
                     uint8_t raw[1024]{};
                     if (memory.readRam(state.currentMadr, raw, sizeof(raw)))
                     {
-                        int32_t volL = 0x7FFE;
-                        int32_t volR = 0x7FFE;
-                        memory.spu2().getAutoDmaVolume(c, volL, volR);
-                        memory.spu2().traceAutoDma(c, volL, volR, raw);
-                        const int16_t *left = reinterpret_cast<const int16_t *>(raw);
-                        const int16_t *right = reinterpret_cast<const int16_t *>(raw + 512u);
-                        for (uint32_t i = 0u; i < kAudioChunkFrames; ++i)
-                        {
-                            const int32_t sL = (static_cast<int32_t>(left[i]) * volL) >> 15;
-                            const int32_t sR = (static_cast<int32_t>(right[i]) * volR) >> 15;
-                            stereo[i * 2u] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(stereo[i * 2u]) + sL, -32768, 32767));
-                            stereo[i * 2u + 1u] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(stereo[i * 2u + 1u]) + sR, -32768, 32767));
-                        }
+                        spu2.setInputBlock(c, raw);
                         producedAudio = true;
                     }
 
@@ -303,7 +294,9 @@ namespace ps2x::iop::detail
                 if (producedAudio)
                     audioStreamActive = true;
                 if (audioStreamActive)
-                    host.submitSpu2Pcm(0, stereo.data(), kAudioChunkFrames);
+                    for (int bus = 0; bus < Spu2Synth::kBusCount; ++bus)
+                        host.submitSpu2Pcm(bus, spu2.output(bus).data(), spu2.output(bus).size() / 2u);
+                spu2.clearOutput();
             }
         }
 
