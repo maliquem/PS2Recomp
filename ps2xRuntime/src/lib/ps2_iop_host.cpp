@@ -7,6 +7,7 @@
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
+#include "runtime/ps2_audio_mix.h"
 
 #include <algorithm>
 #include <cstring>
@@ -14,6 +15,9 @@
 #include <iostream>
 #include <limits>
 #include <utility>
+
+static_assert(ps2x::audio::kBusCount == ps2x::iop::kSpu2BusCount && ps2x::audio::kBusMusic == ps2x::iop::kSpu2MusicBus,
+              "the SPU2 core and the output mixer number the buses alike");
 
 #if !defined(_WIN32)
 #include <sys/types.h>

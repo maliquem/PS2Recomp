@@ -55,7 +55,8 @@ namespace ps2x::iop
         // survive reset() and run on the thread that executes the IOP.
         void addCodeHook(uint64_t imageHash, uint32_t offset, CodeHook hook);
         // SPU2 output buses (the numbers of ps2x::audio in runtime/ps2_audio_mix.h): the bus a voice
-        // plays on from its next key-on, the bus of a core's PCM input (kept across reset()), and
+        // plays on from its next key-on and every one after it, until set again (so a profile either
+        // tags every key-on or assigns voices once), the bus of a core's PCM input (kept across reset()), and
         // how many samples a bus has advanced (the music bus falls behind bus 0 while it runs slower).
         void setSpu2VoiceBus(int core, uint32_t voice, int bus);
         void setSpu2InputBus(int core, int bus);

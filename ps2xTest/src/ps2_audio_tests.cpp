@@ -192,5 +192,35 @@ void register_ps2_audio_tests()
                 t.IsTrue(phase > 9u * 48000u && phase < 11u * 48000u, "music made at wall-clock rate" + at + ": " + std::to_string(phase) + " frames");
             }
         });
+
+        tc.Run("MusicTickGate_runs_one_music_tick_per_tick_of_music_samples", [](TestCase &t)
+        {
+            // A 240 Hz sequencer (200 samples a tick). Game time advances 200 samples per tick; the
+            // music bus advances 200 / speed of them.
+            for (const double speed : {1.0, 2.0, 3.0, 2.5})
+            {
+                ps2x::audio::MusicTickGate gate;
+                uint32_t game = 0xFFFFFF00u; // the counters wrap in the middle of the run
+                double music = 4294967000.0;
+                gate.lastGame = game;
+                gate.lastMusic = static_cast<uint32_t>(static_cast<uint64_t>(music));
+                int ran = 0;
+                const int ticks = 2400;
+                for (int i = 0; i < ticks; ++i)
+                {
+                    game += 200u;
+                    music += 200.0 / speed;
+                    ran += gate.skipTick(game, static_cast<uint32_t>(static_cast<uint64_t>(music)), 200) ? 0 : 1;
+                }
+                const std::string at = " at " + std::to_string(speed) + "x";
+                if (speed == 1.0)
+                    t.IsTrue(ran == ticks, "normal speed never skips" + at);
+                t.IsTrue(std::abs(ran - ticks / speed) <= 2.0, "music ticks follow the music bus" + at + ": " + std::to_string(ran));
+            }
+            ps2x::audio::MusicTickGate gate;
+            (void)gate.skipTick(1000u, 1000u, 200);
+            (void)gate.skipTick(90000u, 2000u, 200); // a loaded state: the counters jump apart
+            t.IsTrue(gate.debt <= 400, "a jump costs at most two ticks");
+        });
     });
 }

@@ -30,6 +30,27 @@ namespace ps2x::audio
     // for less music instead (musicRatio).
     extern std::atomic<bool> g_musicWallClock;
 
+    // For a game profile: keeps a sequencer on the music bus's clock. Asked once per sequencer tick
+    // with how far the game-time bus and the music bus have advanced (IopSubsystem::spu2BusSamples),
+    // it says when the music sequences must sit the tick out. At normal speed it never does.
+    struct MusicTickGate
+    {
+        uint32_t lastGame = 0u, lastMusic = 0u;
+        int64_t debt = 0; // samples the music bus fell behind game time
+
+        bool skipTick(uint32_t gameSamples, uint32_t musicSamples, int64_t tickSamples)
+        {
+            debt += static_cast<int64_t>(gameSamples - lastGame) - static_cast<int64_t>(musicSamples - lastMusic);
+            lastGame = gameSamples;
+            lastMusic = musicSamples;
+            debt = debt < 0 ? 0 : debt > 2 * tickSamples ? 2 * tickSamples : debt; // also swallows the jump of a loaded state
+            if (debt < tickSamples)
+                return false;
+            debt -= tickSamples;
+            return true;
+        }
+    };
+
     // True when the music bus runs on the wall clock at this speed (g_speedPercent: 100 = normal,
     // 0 = unlimited). shortcut: slow motion (<100) keeps the music on game time, it would need the
     // sequencer to repeat ticks; upgrade when a game ships slow motion as a feature.

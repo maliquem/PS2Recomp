@@ -244,14 +244,14 @@ namespace
         display.items.push_back(info({"Post-processing", "P√≥s-processamento"}, {"Coming soon", "Em breve"}));
         g_sections.push_back(std::move(display));
 
-        Section audio{"audio", {"Audio", "¡udio"}};
+        Section audio{"audio", {"Audio", "√Åudio"}};
         {
             // Index for ps2x::audio::volumePercent: 0 master, 1 + bus.
             static const std::pair<int, Text> kVolumes[] = {{0, {"Master volume", "Volume geral"}},
-                                                           {2, {"Music", "M˙sica"}},
+                                                           {2, {"Music", "M√∫sica"}},
                                                            {1, {"Effects", "Efeitos"}},
                                                            {3, {"Voices", "Vozes"}},
-                                                           {4, {"Videos", "VÌdeos"}}};
+                                                           {4, {"Videos", "V√≠deos"}}};
             for (const auto &[index, label] : kVolumes)
             {
                 Item it{Kind::Choice, label};
@@ -261,7 +261,7 @@ namespace
                 it.setIndex = [index = index](int choice) { ps2x::audio::setVolumePercent(index, choice * 10); };
                 audio.items.push_back(std::move(it));
             }
-            audio.items.push_back(toggle({"Music at normal speed in turbo", "M˙sica em velocidade normal no turbo"},
+            audio.items.push_back(toggle({"Music at normal speed in turbo", "M√∫sica em velocidade normal no turbo"},
                                          [] { return ps2x::audio::g_musicWallClock.load(std::memory_order_relaxed); },
                                          ps2x::audio::setMusicWallClock));
         }

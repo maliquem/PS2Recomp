@@ -716,16 +716,24 @@ namespace ps2x::iop::detail
                 buf.assign(size, 0);
             area = buf.data();
         }
-        const uint32_t ticks = m_busTicks[static_cast<size_t>(bus)];
-        const uint32_t r = ticks & 1u;
+        const uint32_t r = m_busTicks[static_cast<size_t>(bus)] & 1u;
+        const int64_t base = rv.areaPos % size; // the game may have shrunk the area
+        if (r != 0u)
+            rv.areaPos = static_cast<uint32_t>((base + 1) % size);
+        // Offsets below the position (sameDst - 1, a destination minus its size) arrive wrapped: signed.
+        const auto index = [&](uint32_t offset) -> uint32_t
+        {
+            const int64_t rel = (base + static_cast<int32_t>(offset)) % static_cast<int64_t>(size);
+            return static_cast<uint32_t>(rel < 0 ? rel + size : rel);
+        };
         const auto get = [&](uint32_t offset) -> int32_t
         {
-            const uint32_t rel = ((ticks >> 1u) + offset) % size;
+            const uint32_t rel = index(offset);
             return area ? area[rel] : ramRead(rel + start);
         };
         const auto set = [&](uint32_t offset, int64_t value)
         {
-            const uint32_t rel = ((ticks >> 1u) + offset) % size;
+            const uint32_t rel = index(offset);
             if (area)
                 area[rel] = static_cast<int16_t>(clamp16(value));
             else

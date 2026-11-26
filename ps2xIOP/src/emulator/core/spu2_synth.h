@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ps2x/iop/iop_types.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -41,8 +43,8 @@ namespace ps2x::iop::detail
         static constexpr uint32_t kRamHalfwordMask = kRamHalfwords - 1u;
         static constexpr uint32_t kVoicesPerCore = 24u;
         static constexpr uint32_t kCoreCount = 2u;
-        static constexpr int kBusCount = 4;
-        static constexpr int kBusMusic = 1;
+        static constexpr int kBusCount = kSpu2BusCount;
+        static constexpr int kBusMusic = kSpu2MusicBus;
         static constexpr uint32_t kInputFrames = 256u; // one AutoDMA block: 256 left then 256 right samples
 
         Spu2Synth();
@@ -135,6 +137,7 @@ namespace ps2x::iop::detail
             int16_t down[2][128] = {};
             int16_t up[2][128] = {};
             uint32_t pos = 0u;
+            uint32_t areaPos = 0u; // where the work area's offsets count from; one step per 24 kHz sample
         };
 
         struct Core
