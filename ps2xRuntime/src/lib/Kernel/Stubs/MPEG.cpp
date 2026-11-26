@@ -12,9 +12,12 @@ extern "C"
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 #endif
+
+#include "ps2_fmv.h"
 
 #include <deque>
 #include <memory>
@@ -370,6 +373,34 @@ namespace ps2_stubs
                 }
             }
 
+            // FMV step 1 (study 08: 58-60 dB against a float BT.601 reference, today's bilinear path 41-55 dB).
+            // Chroma positions go through options because sws_getContext cannot take them; MPEG-2 4:2:0 puts the
+            // chroma sample on the left luma column (h 0) and between the two rows (v 128 of 256).
+            static SwsContext *createAccurateScaler(int width, int height, AVPixelFormat srcFormat)
+            {
+                SwsContext *ctx = sws_alloc_context();
+                if (!ctx)
+                    return nullptr;
+                av_opt_set_int(ctx, "srcw", width, 0);
+                av_opt_set_int(ctx, "srch", height, 0);
+                av_opt_set_int(ctx, "src_format", srcFormat, 0);
+                av_opt_set_int(ctx, "dstw", width, 0);
+                av_opt_set_int(ctx, "dsth", height, 0);
+                av_opt_set_int(ctx, "dst_format", AV_PIX_FMT_RGBA, 0);
+                av_opt_set_int(ctx, "sws_flags", SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, 0);
+                av_opt_set_int(ctx, "src_h_chr_pos", 0, 0);
+                av_opt_set_int(ctx, "src_v_chr_pos", 128, 0);
+                if (sws_init_context(ctx, nullptr, nullptr) < 0)
+                {
+                    sws_freeContext(ctx);
+                    return nullptr;
+                }
+                const int *bt601 = sws_getCoefficients(SWS_CS_ITU601);
+                sws_setColorspaceDetails(ctx, bt601, 0 /* limited-range YUV */, bt601, 1 /* full-range RGB */,
+                                         0, 1 << 16, 1 << 16);
+                return ctx;
+            }
+
             bool convertFrame(std::deque<MpegDecodedFrame> &frames)
             {
                 const int width = m_frame->width;
@@ -380,27 +411,31 @@ namespace ps2_stubs
                     return false;
                 }
 
+                const bool accurate = ps2fmv::cscOn();
                 if (!m_swsCtx ||
                     m_swsWidth != width ||
                     m_swsHeight != height ||
-                    m_swsFormat != srcFormat)
+                    m_swsFormat != srcFormat ||
+                    m_swsAccurate != accurate)
                 {
                     if (m_swsCtx)
                     {
                         sws_freeContext(m_swsCtx);
                         m_swsCtx = nullptr;
                     }
-                    m_swsCtx = sws_getContext(
-                        width,
-                        height,
-                        srcFormat,
-                        width,
-                        height,
-                        AV_PIX_FMT_RGBA,
-                        SWS_BILINEAR,
-                        nullptr,
-                        nullptr,
-                        nullptr);
+                    m_swsCtx = accurate ? createAccurateScaler(width, height, srcFormat)
+                                        : sws_getContext(
+                                              width,
+                                              height,
+                                              srcFormat,
+                                              width,
+                                              height,
+                                              AV_PIX_FMT_RGBA,
+                                              SWS_BILINEAR,
+                                              nullptr,
+                                              nullptr,
+                                              nullptr);
+                    m_swsAccurate = accurate;
                     if (!m_swsCtx)
                     {
                         std::cerr << "[MPEG] failed to create FFmpeg scaler." << std::endl;
@@ -450,6 +485,7 @@ namespace ps2_stubs
             int m_swsWidth = 0;
             int m_swsHeight = 0;
             AVPixelFormat m_swsFormat = AV_PIX_FMT_NONE;
+            bool m_swsAccurate = false;
             bool m_initialized = false;
             bool m_drained = false;
         };

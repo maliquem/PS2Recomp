@@ -3,6 +3,7 @@
 #include "ps2_menu_host.h"
 #include "ps2_menu.h"
 #include "ps2_user_config.h"
+#include "ps2_fmv.h"
 #include "ps2_vk_presenter.h"
 
 #include "runtime/gs/gs_frontend.h"
@@ -156,6 +157,8 @@ namespace ps2host
         const bool vsync = (vsyncEnv && *vsyncEnv) ? envFlag("PS2X_VSYNC") : (!hidden && ps2cfg::getBool("display.vsync", true));
         g_vsync = vsync;
         g_showRate = ps2cfg::envBool("PS2X_SHOW_FPS", "display.show_fps", false);
+        ps2fmv::enabled = ps2cfg::envBool("PS2X_FMV", "video.fmv", true);
+        ps2fmv::csc = ps2cfg::envBool("PS2X_FMV_CSC", "video.fmv_csc", true);
         g_baseTitle = title;
         const GSHostGpuContext *ctx = gs.hostGpuContext();
         const bool tryVulkan = ctx && ctx->swapchainEnabled;
