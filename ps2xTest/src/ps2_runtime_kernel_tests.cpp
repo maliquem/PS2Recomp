@@ -1015,6 +1015,18 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(getRegS32(env.ctx, 2), -4, "__divdi3 should divide signed 64-bit values");
         });
 
+        tc.Run("rand matches the EE newlib sequence over the full 31-bit range", [](TestCase &t)
+        {
+            TestEnv env;
+            setRegU32(env.ctx, 4, 1u);
+            ps2_stubs::srand(env.rdram.data(), &env.ctx, &env.runtime);
+            for (const int32_t expected : {1103527590, 377401575, 662824084})
+            {
+                ps2_stubs::rand(env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(getRegS32(env.ctx, 2), expected, "rand must follow newlib (x*1103515245+12345) & 0x7FFFFFFF");
+            }
+        });
+
         tc.Run("ReleaseAlarm aliases CancelAlarm and cache syscalls succeed", [](TestCase &t)
         {
             TestEnv env;

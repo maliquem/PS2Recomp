@@ -1076,13 +1076,13 @@ namespace ps2_stubs
         setReturnU32(ctx, 0u);
     }
 
-    // Same LCG as the MSVC CRT rand() used before, but with a state the save state can carry.
+    // The EE SDK's newlib rand(): RAND_MAX is 0x7FFFFFFF, and games scale by 2^31 (a 15-bit result collapses every random spread).
     uint32_t g_randState = 1u;
 
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_randState = g_randState * 214013u + 2531011u;
-        setReturnS32(ctx, static_cast<int32_t>((g_randState >> 16) & 0x7FFFu));
+        g_randState = g_randState * 1103515245u + 12345u;
+        setReturnS32(ctx, static_cast<int32_t>(g_randState & 0x7FFFFFFFu));
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
