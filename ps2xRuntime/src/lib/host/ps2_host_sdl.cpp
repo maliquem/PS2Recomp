@@ -438,7 +438,7 @@ namespace ps2host
 
     void imguiEndFrame() {} // the frame is rendered once in drawOverlay, after the counter and the menu
 
-    void drawOverlay(uint64_t vsyncTick)
+    void drawOverlay(uint64_t vsyncTick, bool presented)
     {
         if (g_showRate)
         {
@@ -449,9 +449,9 @@ namespace ps2host
                 g_rateTick = vsyncTick;
                 g_rateFrames = 0;
             }
-            else if (++g_rateFrames, now - g_rateStartNs >= 1000000000ull)
+            else if (g_rateFrames += presented ? 1 : 0, now - g_rateStartNs >= 1000000000ull)
             {
-                // Called once per host present, so its call rate is the screen FPS.
+                // Only presented loops count, so the rate is the screen FPS (turbo frameskip drops presents).
                 const double secs = static_cast<double>(now - g_rateStartNs) / 1e9;
                 g_fps = static_cast<float>(g_rateFrames / secs);
                 g_vps = static_cast<float>(static_cast<double>(vsyncTick - g_rateTick) / secs);

@@ -2573,9 +2573,10 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        // The ImGui frame is finished every loop (input and the F1 panel stay whole); frameskip only drops the present.
+        ps2host::drawOverlay(m_memory.gs().vsyncTick.load(std::memory_order_relaxed), !skipPresent);
         if (!skipPresent)
         {
-            ps2host::drawOverlay(m_memory.gs().vsyncTick.load(std::memory_order_relaxed));
             if (ps2host::gpuPresent())
                 ps2host::presentGpuFrame(hostLatch.gpu, freshField);
             else

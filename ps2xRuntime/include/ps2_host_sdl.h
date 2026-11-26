@@ -122,7 +122,7 @@ namespace ps2host
     bool imguiBeginFrame();
     void imguiEndFrame();
     // Main thread, after the debug UI and before present: FPS counter (F3) and the pause menu.
-    void drawOverlay(uint64_t vsyncTick);
+    void drawOverlay(uint64_t vsyncTick, bool presented);
 
     // Main thread. setShowFps saves display.show_fps; setVsync applies at once (the menu saves display.vsync).
     bool showFps();
