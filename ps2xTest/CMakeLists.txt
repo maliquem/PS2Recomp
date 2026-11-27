@@ -40,6 +40,8 @@ add_library(ps2_test_lib STATIC
     src/ps2_float_semantics_tests.cpp
     src/ps2_savestate_tests.cpp
     src/ps2_audio_tests.cpp
+    src/ps2_gs_dump_tests.cpp
+    src/gs_dump_replay.cpp
 )
 
 target_include_directories(ps2_test_lib PRIVATE
@@ -98,6 +100,19 @@ endif()
 
 if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_tests)
+endif()
+
+# PCSX2 GS dump replay for the batch test against PCSX2 screenshots (tools/gs-dump in the game repo).
+add_executable(ps2x_gsdump
+    src/gs_dump_main.cpp
+    src/gs_dump_replay.cpp
+)
+target_include_directories(ps2x_gsdump PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+target_link_libraries(ps2x_gsdump PRIVATE ps2_runtime)
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_gsdump)
 endif()
 
 include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
