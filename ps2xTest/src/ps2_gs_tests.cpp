@@ -7,6 +7,7 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_vulkan_backend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -19,6 +20,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -3911,10 +3914,44 @@ void register_ps2_gs_tests()
             const GsPixelTestResult panel =
                 drawGsPixelForTests(GS_PSM_CT32, 0xBull, false, 0xAB030201u, 0x11111111u, 0x78u);
             t.Equals(panel.framebuffer, 0x78563412u, "with ZTE=0 the pixel must be drawn whatever ZTST says");
+            t.Equals(panel.depth, 0x11111111u, "with ZTE=0 depth is not written even with ZMSK clear");
 
             const GsPixelTestResult never =
                 drawGsPixelForTests(GS_PSM_CT32, (1ull << 16), false, 0xAB030201u, 0x11111111u, 0x78u);
             t.Equals(never.framebuffer, 0xAB030201u, "with ZTE=1 ZTST=NEVER still rejects the pixel");
+        });
+
+        tc.Run("GS line runs cover exactly the line walk's pixels and merge flat rows and columns", [](TestCase &t)
+        {
+            GSPrimitiveBatch ln{};
+            ln.vertexCount = 2u;
+            ln.state.prim.type = GS_PRIM_LINE;
+            auto check = [&](float x0, float y0, float x1, float y1, bool iip, size_t expectRuns)
+            {
+                ln.state.prim.iip = iip;
+                ln.vertices[0] = {x0, y0, 10.0, 0, 50, 100, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                ln.vertices[1] = {x1, y1, 10.0, 255, 50, 100, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                std::map<std::pair<int, int>, uint8_t> walked, covered;
+                GSInternal::walkLine(ln, [&](int x, int y, uint32_t, uint8_t r, uint8_t, uint8_t, uint8_t, uint8_t)
+                                     { walked[{x, y}] = r; });
+                size_t runs = 0u;
+                bool once = true;
+                GSInternal::lineRuns(ln, [&](const GSInternal::LineRun &run)
+                {
+                    ++runs;
+                    for (int y = run.y0; y <= run.y1; ++y)
+                        for (int x = run.x0; x <= run.x1; ++x)
+                            once = covered.emplace(std::make_pair(x, y), run.r).second && once;
+                });
+                t.IsTrue(once, "no pixel is covered twice");
+                t.IsTrue(covered == walked, "runs cover the walked pixels with their colour");
+                if (expectRuns)
+                    t.Equals(runs, expectRuns, "run count");
+            };
+            check(5.0f, 7.0f, 40.0f, 7.0f, false, 1u);   // flat row
+            check(9.0f, 30.0f, 9.0f, 2.0f, false, 1u);   // flat column, upwards
+            check(0.0f, 0.0f, 20.0f, 3.0f, false, 4u);   // shallow: one run per row
+            check(0.0f, 0.0f, 30.0f, 17.0f, true, 0u);   // Gouraud diagonal
         });
 
         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
@@ -5121,6 +5158,55 @@ void register_ps2_gs_tests()
                 rt16.vertices[1] = {16.0f, 8.0f, 0.0, 200, 100, 50, 0x50, 1.0f, 0.0f, 0.0f, 0, 0, 0};
                 b.Submit(rt16);
             });
+
+            const uint64_t syncsBeforeLines = vkBackend->CpuFallbackSyncsForTests();
+            runOnBoth([&](GSRasterBackend &b)
+            {
+                // 3d. Lines and points (Vulkan draws them as runs of the CPU line walk): Gouraud diagonal, flat
+                // horizontal and vertical, steep, reversed, blended, depth GEQUAL on Z16S, with an XY offset.
+                GSPrimitiveBatch ln{};
+                ln.vertexCount = 2u;
+                ln.state.prim.type = GS_PRIM_LINE;
+                ln.state.context.frame = {10u, 10u, GS_PSM_CT32, 0u};
+                ln.state.context.zbuf = {80u, GS_PSM_Z16S, false};
+                ln.state.context.scissor = {0u, 639u, 0u, 223u};
+                ln.state.context.xyoffset = {32u << 4u, 8u << 4u};
+                ln.state.context.test = (1ull << 16u) | (2ull << 17u);
+                const struct { float x0, y0, x1, y1; double z0, z1; uint8_t c0, c1; bool iip, abe; } lines[] = {
+                    {40.0f, 108.0f, 140.0f, 160.0f, 300.0, 900.0, 10, 250, true, false},
+                    {40.0f, 170.0f, 200.0f, 170.0f, 500.0, 500.0, 90, 90, false, false},
+                    {210.0f, 110.0f, 210.0f, 200.0f, 400.0, 1200.0, 200, 30, true, true},
+                    {150.0f, 200.0f, 160.0f, 110.0f, 950.0, 100.0, 60, 180, true, true},
+                    {300.0f, 115.0f, 230.0f, 190.0f, 700.0, 700.0, 120, 120, false, true},
+                    {10.0f, 150.0f, 90.0f, 140.0f, 600.0, 650.0, 30, 220, true, false}, // starts left of the scissor
+                };
+                for (const auto &l : lines)
+                {
+                    ln.state.prim.iip = l.iip;
+                    ln.state.prim.abe = l.abe;
+                    ln.state.context.alpha = 0x44ull;
+                    ln.vertices[0] = {l.x0, l.y0, l.z0, l.c0, static_cast<uint8_t>(255 - l.c0), 77, 0x40, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                    ln.vertices[1] = {l.x1, l.y1, l.z1, l.c1, static_cast<uint8_t>(255 - l.c1), 99, 0x70, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                    b.Submit(ln);
+                }
+                // Fogged Gouraud line.
+                ln.state.prim.fge = true;
+                ln.state.fogR = 200;
+                ln.state.fogG = 10;
+                ln.state.fogB = 90;
+                ln.vertices[0] = {60.0f, 190.0f, 800.0, 50, 60, 70, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 10};
+                ln.vertices[1] = {190.0f, 205.0f, 820.0, 150, 160, 170, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 240};
+                b.Submit(ln);
+                ln.state.prim.fge = false;
+                ln.state.prim.type = GS_PRIM_POINT;
+                ln.vertexCount = 1u;
+                for (int i = 0; i < 4; ++i)
+                {
+                    ln.vertices[0] = {static_cast<float>(50 + i * 7), 112.0f, 1000.0, 255, 0, static_cast<uint8_t>(i * 60), 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 0};
+                    b.Submit(ln);
+                }
+            });
+            t.Equals(vkBackend->CpuFallbackSyncsForTests(), syncsBeforeLines, "lines and points must not read VRAM back for the CPU");
 
             std::vector<uint8_t> snapCpu, snapVk;
             cpuBackend.SnapshotVram(snapCpu);

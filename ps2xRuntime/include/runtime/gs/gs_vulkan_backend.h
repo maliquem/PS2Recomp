@@ -31,6 +31,7 @@ public:
     static void SetHostInstanceExtensions(std::vector<std::string> extensions);
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
+    uint64_t CpuFallbackSyncsForTests() const { return m_cpuSyncs; }
     void Reset() override;
 
     void Submit(const GSPrimitiveBatch &batch) override;
@@ -218,6 +219,7 @@ private:
 
     void recordSpriteUnlocked(const GSPrimitiveBatch &batch);
     void recordTriangleUnlocked(const GSPrimitiveBatch &batch);
+    void recordLineUnlocked(const GSPrimitiveBatch &batch);
 
     static void setPageRange(PageMask &mask, uint32_t firstPage, uint32_t lastPage);
     static bool masksOverlap(const PageMask &a, const PageMask &b);
@@ -266,6 +268,7 @@ private:
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
     mutable bool m_gpuVramDirtyForCpu = false;
+    mutable uint64_t m_cpuSyncs = 0u; // whole-VRAM readbacks for CPU work
     mutable bool m_cpuVramDirtyForGpu = false;
     mutable GSCpuBackend m_cpuFallback;
 

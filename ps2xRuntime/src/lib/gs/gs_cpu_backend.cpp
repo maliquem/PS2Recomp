@@ -1952,69 +1952,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 {
-    const GSDrawState &state = batch.state;
-    const GSVertex &v0 = batch.vertices[0];
-    const GSVertex &v1 = batch.vertices[1];
-    const auto &ctx = state.context;
-
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
-    int step = 0;
-
-    for (;;)
-    {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
-        uint8_t r, g, b, a;
-        if (state.prim.iip)
-        {
-            r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
-            g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
-            b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * t));
-            a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * t));
-        }
-        else
-        {
-            r = v1.r;
-            g = v1.g;
-            b = v1.b;
-            a = v1.a;
-        }
-
-        double z = (v0.z + (v1.z - v0.z) * t);
-        const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
-
-        if (x0 == x1 && y0 == y1)
-            break;
-
-        int e2 = 2 * err;
-        if (e2 >= dy)
-        {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
-        }
-        ++step;
-    }
+    walkLine(batch, [&](int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+             { WritePixel(batch.state, x, y, static_cast<int>(z), r, g, b, a, fog); });
 }
 
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
