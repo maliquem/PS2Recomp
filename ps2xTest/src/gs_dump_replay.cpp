@@ -222,13 +222,13 @@ namespace gsdump
         const uint32_t stateVersion = header[0], stateSize = header[1];
         const uint32_t serialOffset = header[2], serialSize = header[3];
         const size_t headerStart = cur.pos - kDumpHeaderBytes;
-        if (serialSize != 0u && serialOffset <= headerSize && serialSize <= headerSize - serialOffset)
-            r.serial.assign(reinterpret_cast<const char *>(file.data() + headerStart + serialOffset), serialSize);
         if (!cur.skip(headerSize - kDumpHeaderBytes))
         {
             r.error = "truncated GS dump header";
             return r;
         }
+        if (serialSize != 0u && serialOffset <= headerSize && serialSize <= headerSize - serialOffset)
+            r.serial.assign(reinterpret_cast<const char *>(file.data() + headerStart + serialOffset), serialSize);
 
         const size_t stateStart = cur.pos;
         uint32_t version = 0;

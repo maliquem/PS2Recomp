@@ -47,7 +47,10 @@ namespace
     // Frame 0 (640x448 CT32) is gray in the saved VRAM, FRAME/SCISSOR/TEST of context 1 exist only in the saved
     // state, the display is turned on by a Registers packet, and two GIF packets are each cut in two records:
     // PATH3 uploads an 8x8 red block at (100,100), PATH2 draws a green sprite (200,50)-(240,90).
-    std::vector<uint8_t> makeSyntheticDump()
+    // Record path index as PCSX2 writes it (GSState::Transfer<index>): 1 = PATH2, 2 = PATH3.
+    // inFlight: PATH2 is saved in the middle of a PACKED tag (NLOOP 2, NREG 2, reg 1), so its first record starts
+    // with 3 leftover qwords that must be skipped, not read as a tag.
+    std::vector<uint8_t> makeSyntheticDump(bool inFlight = false)
     {
         Bytes state;
         state.u32(9); // STATE_VERSION
@@ -80,10 +83,11 @@ namespace
             for (uint32_t x = 0; x < 640u; ++x)
                 std::memcpy(vram.data() + GSPSMCT32::addrPSMCT32(0u, 10u, x, y), &kGray, 4);
         state.raw(vram.data(), vram.size());
-        for (int p = 0; p < 4; ++p) // GIF paths idle: tag (16) + reg (4)
+        for (int p = 0; p < 4; ++p) // GIF paths: tag (16) + reg (4); idle unless inFlight
         {
-            state.qword(0, 0);
-            state.u32(0);
+            const bool busy = inFlight && p == 1;
+            state.qword(busy ? gifTag(2, GIF_FMT_PACKED, 2, true) : 0ull, busy ? 0xEEull : 0ull);
+            state.u32(busy ? 1u : 0u);
         }
         const float q = 1.0f;
         state.raw(&q, 4);
@@ -116,10 +120,17 @@ namespace
         sprite.qword((200ull << 4) | ((50ull << 4) << 16), GS_REG_XYZ2);
         sprite.qword((240ull << 4) | ((90ull << 4) << 16), GS_REG_XYZ2);
 
-        transfer(out, 3, upload.b, 0, 176);      // ends after 5 of the 16 image qwords
-        transfer(out, 2, sprite.b, 0, 48);       // ends inside the A+D list
-        transfer(out, 3, upload.b, 176, upload.b.size());
-        transfer(out, 2, sprite.b, 48, sprite.b.size());
+        if (inFlight)
+        {
+            Bytes leftover; // rest of the saved PACKED tag: A+D writes that would wreck the frame if read as a tag
+            for (int i = 0; i < 3; ++i)
+                leftover.qword(0x1FFull, GS_REG_FRAME_1);
+            transfer(out, 1, leftover.b, 0, leftover.b.size());
+        }
+        transfer(out, 2, upload.b, 0, 176);      // ends after 5 of the 16 image qwords
+        transfer(out, 1, sprite.b, 0, 48);       // ends inside the A+D list
+        transfer(out, 2, upload.b, 176, upload.b.size());
+        transfer(out, 1, sprite.b, 48, sprite.b.size());
 
         out.u8(3);
         priv[0x000] = 1u;                                                  // PMODE: EN1
@@ -142,13 +153,13 @@ namespace
         return v & 0x00FFFFFFu;
     }
 
-    void checkScene(TestCase &t, const gsdump::Result &r, const char *backend)
+    void checkScene(TestCase &t, const gsdump::Result &r, const char *backend, bool inFlight = false)
     {
         const std::string tag = std::string(" (") + backend + ")";
         t.IsTrue(r.ok, ("replay should succeed: " + r.error + tag).c_str());
-        t.IsTrue(r.warnings.empty(), ("no warnings expected" + tag).c_str());
+        t.Equals(r.warnings.size(), static_cast<size_t>(inFlight ? 1 : 0), ("warning only for the packet in flight" + tag).c_str());
         t.Equals(r.serial, std::string("SYNTH-00000"), ("serial from the header" + tag).c_str());
-        t.Equals(r.transfers, 4u, ("four transfer records" + tag).c_str());
+        t.Equals(r.transfers, inFlight ? 5u : 4u, ("transfer records" + tag).c_str());
         t.Equals(r.frames.size(), static_cast<size_t>(2), ("one frame per VSync" + tag).c_str());
         for (const gsdump::Frame &f : r.frames)
         {
@@ -191,6 +202,11 @@ void register_ps2_gs_dump_tests()
             checkScene(t, gsdump::replay(makeSyntheticDump(), std::move(vk)), "vulkan");
         });
 
+        tc.Run("GS dump reader skips the rest of a packet in flight at dump start", [](TestCase &t)
+        {
+            checkScene(t, gsdump::replay(makeSyntheticDump(true), std::make_unique<GSCpuBackend>()), "cpu", true);
+        });
+
         tc.Run("GS dump reader rejects compressed and truncated dumps", [](TestCase &t)
         {
             const std::vector<uint8_t> zstd = {0x28, 0xB5, 0x2F, 0xFD, 0, 0, 0, 0};
@@ -202,6 +218,16 @@ void register_ps2_gs_dump_tests()
             cut.resize(4096);
             const gsdump::Result truncated = gsdump::replay(cut, nullptr);
             t.IsFalse(truncated.ok, "dump cut inside the state is refused");
+
+            Bytes shortHeader; // header says 47 bytes with an 11-byte serial, the file stops after 42
+            shortHeader.u32(0xFFFFFFFFu);
+            shortHeader.u32(47u);
+            const uint32_t header[9] = {9u, 0u, 36u, 11u, 0u, 0u, 0u, 0u, 0u};
+            shortHeader.raw(header, sizeof(header));
+            shortHeader.raw("SYNTH-", 6);
+            const gsdump::Result cutHeader = gsdump::replay(shortHeader.b, nullptr);
+            t.IsFalse(cutHeader.ok, "dump cut inside the header is refused");
+            t.IsTrue(cutHeader.serial.empty(), "serial is not read past the end of the file");
         });
     });
 }
