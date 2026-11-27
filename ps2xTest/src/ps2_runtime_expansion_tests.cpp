@@ -1322,7 +1322,7 @@ void register_ps2_runtime_expansion_tests()
             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + 0x100010ull); // 1 px: an empty sprite draws nothing (PCSX2)
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
@@ -1336,7 +1336,7 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + 0x100010ull); // 1 px: an empty sprite draws nothing (PCSX2)
 
             bool anyWrite = false;
             for (size_t i = 0; i < 1024u; ++i)
@@ -1385,7 +1385,7 @@ void register_ps2_runtime_expansion_tests()
 
             const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + 0x100010ull); // 1 px: an empty sprite draws nothing (PCSX2)
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");

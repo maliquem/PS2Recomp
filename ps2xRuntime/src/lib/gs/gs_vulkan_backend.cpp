@@ -27,12 +27,12 @@ constexpr uint32_t kClutBytes = 512u * sizeof(uint16_t);
 constexpr uint32_t kStagingBytes = 16u * 1024u * 1024u;
 constexpr uint32_t kMaxSprites = 32768u;
 constexpr uint32_t kMaxTriangles = 32768u;
-constexpr uint32_t kMaxTileHeaders = 65536u;
+constexpr uint32_t kMaxTileHeaders = 61440u + 128u * 128u; // a batch reserves a whole grid; flushes as with 64x64
 constexpr uint32_t kMaxTileIndices = 1048576u; // 4 MiB
 constexpr uint32_t kTileShift = 4u;            // 16x16 tiles
 constexpr uint32_t kTileSize = 1u << kTileShift;
-constexpr uint32_t kTileGridW = 64u;           // up to 1024 px wide
-constexpr uint32_t kTileGridH = 64u;           // up to 1024 px tall
+constexpr uint32_t kTileGridW = 128u;          // 2048 px: the whole scissor range, so no draw falls to the CPU
+constexpr uint32_t kTileGridH = 128u;
 constexpr uint32_t kTileGridSize = kTileGridW * kTileGridH;
 constexpr uint32_t kHostFrameWidth = 640u;
 constexpr uint32_t kHostFrameHeight = 512u;
@@ -1892,19 +1892,19 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    const int ofx = ctx.xyoffset.ofx >> 4;
-    const int ofy = ctx.xyoffset.ofy >> 4;
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    int x0 = GSInternal::spriteEdge(v0.x, ctx.xyoffset.ofx);
+    int y0 = GSInternal::spriteEdge(v0.y, ctx.xyoffset.ofy);
+    int x1 = GSInternal::spriteEdge(v1.x, ctx.xyoffset.ofx);
+    int y1 = GSInternal::spriteEdge(v1.y, ctx.xyoffset.ofy);
     if (x0 > x1) std::swap(x0, x1);
     if (y0 > y1) std::swap(y0, y1);
+    if (x0 == x1 || y0 == y1)
+        return;
 
     const int unclippedX0 = x0;
     const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
+    const int spanX = x1 - x0;
+    const int spanY = y1 - y0;
     const int unclippedX1 = unclippedX0 + spanX - 1;
     const int unclippedY1 = unclippedY0 + spanY - 1;
     if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
@@ -1920,7 +1920,7 @@ void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)
     if (drawW <= 0 || drawH <= 0)
         return;
 
-    // Fallback to CPU if coordinates exceed the 1024x1024 tile grid.
+    // Unreachable since the grid covers the scissor (0..2047); kept as a guard.
     if (drawX0 < 0 || drawY0 < 0 || drawX1 >= static_cast<int>(kTileGridW * kTileSize) ||
         drawY1 >= static_cast<int>(kTileGridH * kTileSize))
     {

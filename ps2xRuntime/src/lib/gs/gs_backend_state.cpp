@@ -52,7 +52,11 @@ void GS::stateIo(ps2x::state::Archive &ar)
         m_backend->stateIo(ar);
     }
     if (ar.loading())
+    {
+        m_image24 = m_trxdir == 0u && (m_bitbltbuf.dpsm == GS_PSM_CT24 || m_bitbltbuf.dpsm == GS_PSM_Z24);
+        m_imageCarryLen = 0u;
         snapshotVRAM();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

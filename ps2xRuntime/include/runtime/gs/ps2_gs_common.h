@@ -51,6 +51,22 @@ static inline int clampInt(int v, int lo, int hi)
     return v;
 }
 
+// Sprite edge in window pixels: the 12.4 vertex minus the 12.4 XYOFFSET, rounded up. A sprite covers
+// ceil(min corner) .. ceil(max corner) - 1 (PCSX2 GSRasterizer::DrawSprite), so equal edges draw nothing.
+static inline int spriteEdge(float vertex, uint16_t offset)
+{
+    return (static_cast<int>(vertex * 16.0f) - static_cast<int>(offset) + 15) >> 4;
+}
+
+// Z24 and Z16 saturate at the format's maximum for both the test and the write; they do not wrap
+// (PCSX2 GSRendererSW z_max / GSDrawScanline zclamp, paraLLEl-GS ubershader). Same formula as clampDepth in
+// gs_common.glsl: ZPSM & 3 is 0 for Z32, 1 for Z24 and 2 for Z16/Z16S.
+static inline uint32_t clampDepth(uint32_t zpsm, uint32_t z)
+{
+    const uint32_t zmax = 0xFFFFFFFFu >> ((zpsm & 3u) * 8u);
+    return z < zmax ? z : zmax;
+}
+
 // Average of the texels (packed RGBA8) the two interlace fields show at one pixel. With texture alpha in use the
 // colours are weighted by alpha: the same as blending each field over the background and averaging the results.
 static inline uint32_t blendFieldTexels(uint32_t a, uint32_t b, bool alphaWeighted)
