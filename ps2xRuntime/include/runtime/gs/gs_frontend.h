@@ -227,7 +227,8 @@ private:
     GSTrxReg m_trxreg{};
     uint32_t m_trxdir = 3;
     // PSMCT24/PSMZ24 host->local upload: bytes of a 3-byte pixel that straddles two packets (processImageData).
-    // shortcut: not in the save state (adding it changes the layout); a save in mid-pixel drops those <= 2 bytes.
+    // shortcut: not in the save state (adding it changes the layout); a load in mid-pixel shifts the rest of that
+    // transfer by those bytes, until the game uploads it again. Add it with the next save-state version bump.
     bool m_image24 = false;
     uint8_t m_imageCarryLen = 0;
     uint8_t m_imageCarry[3]{};

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <cstring>
 #include <map>
 #include <utility>
@@ -430,7 +431,10 @@ namespace
             {
                 auto backend = GSVulkanBackend::CreateIfAvailable();
                 if (!backend)
-                    return; // headless machine without a Vulkan compute GPU
+                {
+                    std::cout << "  [skip] no Vulkan compute GPU: only the CPU backend was checked" << std::endl;
+                    return;
+                }
                 vk = backend.get();
                 gs.setRasterBackend(std::move(backend));
             }

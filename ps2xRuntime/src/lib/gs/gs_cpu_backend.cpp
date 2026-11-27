@@ -1297,12 +1297,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        const float spriteW = static_cast<float>(spanX); // >= 1: empty sprites returned above
+        const float spriteH = static_cast<float>(spanY);
 
         // Same rule as the Vulkan backend (recordSpriteUnlocked and the shader's field blend).
         const bool fieldBlend = state.spriteFieldBlend && !state.linearFilter && std::fabs(v1f - v0f) > spriteH;
