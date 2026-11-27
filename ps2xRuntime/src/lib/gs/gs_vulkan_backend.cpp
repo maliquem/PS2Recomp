@@ -1833,12 +1833,55 @@ void GSVulkanBackend::Submit(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRIFAN:
         recordTriangleUnlocked(batch);
         break;
+    case GS_PRIM_POINT:
+    case GS_PRIM_LINE:
+    case GS_PRIM_LINESTRIP:
+        recordLineUnlocked(batch);
+        break;
     default:
         syncGpuToCpuUnlocked();
         m_cpuFallback.Submit(batch);
         m_cpuVramDirtyForGpu = true;
         break;
     }
+}
+
+// Points and lines draw as flat sprites, one per run of the CPU backend's own line walk. Sent to the CPU instead, each
+// line cost a whole-VRAM readback and upload (Shadow Hearts skill effects draw ~900 lines per 250 ms).
+void GSVulkanBackend::recordLineUnlocked(const GSPrimitiveBatch &batch)
+{
+    GSPrimitiveBatch sprite{};
+    sprite.vertexCount = 2u;
+    sprite.state = batch.state;
+    sprite.state.prim.type = GS_PRIM_SPRITE;
+    sprite.state.prim.tme = false; // the CPU line and point do not sample the texture either
+    const int ofx = batch.state.context.xyoffset.ofx >> 4;
+    const int ofy = batch.state.context.xyoffset.ofy >> 4;
+    auto emit = [&](const GSInternal::LineRun &run)
+    {
+        GSVertex v{};
+        v.z = static_cast<double>(run.z);
+        v.r = run.r;
+        v.g = run.g;
+        v.b = run.b;
+        v.a = run.a;
+        v.fog = run.fog;
+        sprite.vertices[0] = v;
+        sprite.vertices[1] = v;
+        sprite.vertices[0].x = static_cast<float>(run.x0 + ofx);
+        sprite.vertices[0].y = static_cast<float>(run.y0 + ofy);
+        sprite.vertices[1].x = static_cast<float>(run.x1 + 1 + ofx);
+        sprite.vertices[1].y = static_cast<float>(run.y1 + 1 + ofy);
+        recordSpriteUnlocked(sprite);
+    };
+    if (batch.state.prim.type == GS_PRIM_POINT)
+    {
+        const GSVertex &v = batch.vertices[0];
+        const int x = static_cast<int>(v.x) - ofx, y = static_cast<int>(v.y) - ofy;
+        emit({x, y, x, y, static_cast<uint32_t>(v.z), v.r, v.g, v.b, v.a, v.fog});
+        return;
+    }
+    GSInternal::lineRuns(batch, emit);
 }
 
 void GSVulkanBackend::recordSpriteUnlocked(const GSPrimitiveBatch &batch)

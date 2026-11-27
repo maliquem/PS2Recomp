@@ -218,6 +218,7 @@ private:
 
     void recordSpriteUnlocked(const GSPrimitiveBatch &batch);
     void recordTriangleUnlocked(const GSPrimitiveBatch &batch);
+    void recordLineUnlocked(const GSPrimitiveBatch &batch);
 
     static void setPageRange(PageMask &mask, uint32_t firstPage, uint32_t lastPage);
     static bool masksOverlap(const PageMask &a, const PageMask &b);

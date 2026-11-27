@@ -1746,6 +1746,9 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     for (int i = 0; i < batch.vertexCount; ++i)
         batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
     batch.state.context = m_ctx[m_prim.ctxt ? 1 : 0];
+    // ZTE=0 also drops the depth write (PCSX2 and paraLLEl-GS do the same).
+    if (!(batch.state.context.test & (1ull << 16)))
+        batch.state.context.zbuf.zmask = true;
     batch.state.prim = m_prim;
     batch.state.texa = m_texa;
     batch.state.texclut = m_texclut;
