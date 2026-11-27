@@ -1966,6 +1966,7 @@ void register_ps2_vu1_tests()
                 };
 
                 emit(0x11u << 25 | 0x000FC0u);                          // FCSET 0xFC0
+                emit(lowerOp(0x09u, 7u, 0u, 1));                        // ISUBIU vi7 = -1 (FMOR sign extension)
                 emit(makeVuLq(0xFu, 4u, 0u, 0));                        // matrix -> vf4..vf7
                 emit(makeVuLq(0xFu, 5u, 0u, 1));
                 emit(makeVuLq(0xFu, 6u, 0u, 2));
@@ -1996,6 +1997,7 @@ void register_ps2_vu1_tests()
                 emit(makeVuLowerSpecial(0x30u, 15u, 2u, 0u, 0xFu), makeVuUpper(0x28u, 0xEu, 0u, 8u, 9u)); // MOVE vf2 | ADD vf9
                 emit(0x12u << 25 | 0x3Fu);                              // FCAND vi1, 0x3F
                 emit(makeVuLowerDirect(0x35u, 11u, 1u, 11u));           // IOR vi11, vi11, vi1
+                emit(makeVuFlagRegister(0x1Bu, 6u, 7u));                // FMOR vi6, vi7
                 emit(makeVuLowerSpecial(0x3Bu, 0u), makeVuUpper(0x1Cu, 0xEu, 0u, 15u, 16u)); // WAITQ | MULq.xyz vf16
                 emit(0u, makeVuUpperSpecial(0x15u, 0xEu, 16u, 16u));    // FTOI4.xyz vf16
                 emit(makeVuLowerSpecial(0x3Du, 11u, 16u, 0u, 0x1u));    // MFIR.w vf16, vi11
@@ -2051,6 +2053,7 @@ void register_ps2_vu1_tests()
                 t.Equals(fastVu.state().cycles, refVu.state().cycles, "fast path cycles must match reference exactly");
                 t.Equals(fastVu.state().pc, refVu.state().pc, "fast path final PC must match reference");
                 t.Equals(fastVu.state().clip, refVu.state().clip, "fast path CLIP flags must match reference");
+                t.Equals(fastVu.state().mac, refVu.state().mac, "fast path MAC flags must match reference");
                 t.Equals(std::memcmp(fastVu.state().vf, refVu.state().vf, sizeof(refVu.state().vf)), 0,
                          "fast path VF registers must match reference bit-for-bit");
                 t.Equals(std::memcmp(fastVu.state().acc, refVu.state().acc, sizeof(refVu.state().acc)), 0,
