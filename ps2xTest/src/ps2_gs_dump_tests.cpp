@@ -134,12 +134,17 @@ namespace
         transfer(out, 1, sprite.b, 48, sprite.b.size());
 
         out.u8(3);
-        priv[0x000] = 1u;                                                  // PMODE: EN1
-        priv[0x020] = fieldMode ? 3u : 0u;                                 // SMODE2: INT, FFMD
+        priv[0x000] = fieldMode ? 3u : 1u; // PMODE: EN1, plus EN2 in field mode (both circuits, as the game)
+        priv[0x020] = fieldMode ? 3u : 0u; // SMODE2: INT, FFMD
         const uint64_t dispfb = 0ull | (10ull << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
         const uint64_t display = (639ull << 32) | (447ull << 44);
         std::memcpy(priv.data() + 0x070, &dispfb, 8);
         std::memcpy(priv.data() + 0x080, &display, 8);
+        if (fieldMode) // DISPLAY2 too: the frame takes the taller circuit, so each one must be halved
+        {
+            std::memcpy(priv.data() + 0x090, &dispfb, 8);
+            std::memcpy(priv.data() + 0x0A0, &display, 8);
+        }
         out.raw(priv.data(), priv.size());
         out.u8(1); out.u8(0); // VSync, field 0
         out.u8(3);

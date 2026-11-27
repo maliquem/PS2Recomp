@@ -49,7 +49,8 @@ namespace gsdump
             return v;
         }
 
-        bool fieldMode(const GSRegisters &r)
+        // SMODE2 INT=1 FFMD=1. The backends' local `fieldMode` means the other interlaced mode (INT=1 FFMD=0).
+        bool ffmdField(const GSRegisters &r)
         {
             return (r.smode2 & 3u) == 3u;
         }
@@ -80,7 +81,7 @@ namespace gsdump
             // each field reads half of it; our runtime keeps one field's height there (the sceGsSetDefDBuffDc stub
             // writes DH 223, displayRows in gs_backend_state.cpp follows it). Halve it so Present reads one field;
             // drop this once Present takes the hardware value.
-            if (fieldMode(r))
+            if (ffmdField(r))
             {
                 constexpr uint64_t kDhMask = 0x7FFull << 44;
                 for (uint64_t *display : {&r.display1, &r.display2})
@@ -377,7 +378,7 @@ namespace gsdump
                                                     &f.usedPreferred);
                 const uint64_t dispfb = (regs.pmode & 1u) ? regs.dispfb1 : regs.dispfb2;
                 f.displayPsm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
-                f.field = fieldMode(regs);
+                f.field = ffmdField(regs);
                 r.frames.push_back(std::move(f));
                 break;
             }
