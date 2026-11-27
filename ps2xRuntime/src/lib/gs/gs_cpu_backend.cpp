@@ -63,13 +63,16 @@ namespace
         const bool rgbZero = r == 0u && g == 0u && b == 0u;
         uint8_t a = static_cast<uint8_t>((texel >> 24) & 0xFFu);
 
-        switch (psm)
+        switch (psm) // Z formats read as textures expand like their colour twins (PCSX2 GSBlock Expand24to32/16to32)
         {
         case GS_PSM_CT24:
+        case GS_PSM_Z24:
             a = (texa.aem && rgbZero) ? 0u : texa.ta0;
             break;
         case GS_PSM_CT16:
         case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
             if ((a & 0x80u) != 0u)
                 a = texa.ta1;
             else
@@ -856,6 +859,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     const auto &ctx = state.context;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
+    z = static_cast<int>(clampDepth(ctx.zbuf.psm, static_cast<uint32_t>(z)));
 
     if (state.prim.fge)
     {
@@ -1120,7 +1124,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     if (!state.linearFilter)
     {
-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        return samplePoint(static_cast<int>(std::floor(texUf)), static_cast<int>(std::floor(texVf)));
     }
 
     const float sampleU = texUf - 0.5f;
@@ -1175,24 +1179,23 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-    u32 z1 = static_cast<u32>(v1.z);
+    int x0 = spriteEdge(v0.x, ctx.xyoffset.ofx);
+    int y0 = spriteEdge(v0.y, ctx.xyoffset.ofy);
+    int x1 = spriteEdge(v1.x, ctx.xyoffset.ofx);
+    int y1 = spriteEdge(v1.y, ctx.xyoffset.ofy);
+    u32 z1 = clampDepth(ctx.zbuf.psm, static_cast<u32>(v1.z));
 
     if (x0 > x1)
         std::swap(x0, x1);
     if (y0 > y1)
         std::swap(y0, y1);
+    if (x0 == x1 || y0 == y1)
+        return;
 
     const int unclippedX0 = x0;
     const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
+    const int spanX = x1 - x0;
+    const int spanY = y1 - y0;
     const int unclippedX1 = unclippedX0 + spanX - 1;
     const int unclippedY1 = unclippedY0 + spanY - 1;
 
@@ -1294,12 +1297,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        const float spriteW = static_cast<float>(spanX); // >= 1: empty sprites returned above
+        const float spriteH = static_cast<float>(spanY);
 
         // Same rule as the Vulkan backend (recordSpriteUnlocked and the shader's field blend).
         const bool fieldBlend = state.spriteFieldBlend && !state.linearFilter && std::fabs(v1f - v0f) > spriteH;

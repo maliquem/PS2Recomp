@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/ps2_gs_common.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -154,6 +155,8 @@ void GS::reset()
     m_trxpos = {};
     m_trxreg = {};
     m_trxdir = 3;
+    m_image24 = false;
+    m_imageCarryLen = 0u;
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_preferredDisplaySourceFrame = {};
@@ -1444,6 +1447,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        m_image24 = m_trxdir == 0u && (m_bitbltbuf.dpsm == GS_PSM_CT24 || m_bitbltbuf.dpsm == GS_PSM_Z24);
+        m_imageCarryLen = 0u;
 
         if (m_backend)
         {
@@ -1674,8 +1679,32 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (m_backend)
+    if (!m_backend)
+        return;
+    if (!m_image24)
+    {
         m_backend->UploadImage(data, sizeBytes);
+        return;
+    }
+    // A 3-byte pixel can straddle two packets (always with HWREG's 8 bytes): keep the tail for the next call,
+    // as PCSX2 GSState::Write does, so the backends only ever see whole pixels.
+    if (m_imageCarryLen != 0u)
+    {
+        const uint32_t take = std::min<uint32_t>(3u - m_imageCarryLen, sizeBytes);
+        std::memcpy(m_imageCarry + m_imageCarryLen, data, take);
+        m_imageCarryLen = static_cast<uint8_t>(m_imageCarryLen + take);
+        data += take;
+        sizeBytes -= take;
+        if (m_imageCarryLen < 3u)
+            return;
+        m_backend->UploadImage(m_imageCarry, 3u);
+        m_imageCarryLen = 0u;
+    }
+    const uint32_t whole = sizeBytes - sizeBytes % 3u;
+    if (whole != 0u)
+        m_backend->UploadImage(data, whole);
+    m_imageCarryLen = static_cast<uint8_t>(sizeBytes - whole);
+    std::memcpy(m_imageCarry, data + whole, m_imageCarryLen);
 }
 
 
@@ -1781,14 +1810,14 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];
-    int x0 = static_cast<int>(v0.x) - (ctx.xyoffset.ofx >> 4);
-    int y0 = static_cast<int>(v0.y) - (ctx.xyoffset.ofy >> 4);
-    int x1 = static_cast<int>(v1.x) - (ctx.xyoffset.ofx >> 4);
-    int y1 = static_cast<int>(v1.y) - (ctx.xyoffset.ofy >> 4);
+    int x0 = GSInternal::spriteEdge(v0.x, ctx.xyoffset.ofx);
+    int y0 = GSInternal::spriteEdge(v0.y, ctx.xyoffset.ofy);
+    int x1 = GSInternal::spriteEdge(v1.x, ctx.xyoffset.ofx);
+    int y1 = GSInternal::spriteEdge(v1.y, ctx.xyoffset.ofy);
     if (x0 > x1) std::swap(x0, x1);
     if (y0 > y1) std::swap(y0, y1);
-    const int xEnd = x0 + std::max(1, x1 - x0) - 1;
-    const int yEnd = y0 + std::max(1, y1 - y0) - 1;
+    const int xEnd = x1 - 1;
+    const int yEnd = y1 - 1;
     const uint8_t alphaMode = static_cast<uint8_t>(ctx.alpha & 0xFFu);
     const uint8_t alphaFix = static_cast<uint8_t>((ctx.alpha >> 32u) & 0xFFu);
     const bool displayCopy = state.prim.tme && state.prim.abe && state.prim.fst && state.prim.ctxt &&

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <cstring>
 #include <map>
 #include <utility>
@@ -413,6 +414,44 @@ namespace
             gs.ReadVram(framePsm, kFrameBlock, 1u, 0u, 0u),
             gs.ReadVram(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u),
         };
+    }
+
+    // Runs fn on a GS with the CPU backend, then (when a Vulkan compute device exists) on one with the Vulkan
+    // backend; vk is null for the CPU run. Rules checked against PCSX2 must hold on both, not only agree.
+    template <typename Fn>
+    void onEachGsBackend(Fn &&fn)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            GSVulkanBackend *vk = nullptr;
+            if (i == 1)
+            {
+                auto backend = GSVulkanBackend::CreateIfAvailable();
+                if (!backend)
+                {
+                    std::cout << "  [skip] no Vulkan compute GPU: only the CPU backend was checked" << std::endl;
+                    return;
+                }
+                vk = backend.get();
+                gs.setRasterBackend(std::move(backend));
+            }
+            fn(gs, std::string(i == 0 ? "cpu: " : "vulkan: "), vk);
+        }
+    }
+
+    uint64_t gsXyz(uint32_t x16, uint32_t y16, uint32_t z)
+    {
+        return static_cast<uint64_t>(x16 & 0xFFFFu) | (static_cast<uint64_t>(y16 & 0xFFFFu) << 16) |
+               (static_cast<uint64_t>(z) << 32);
+    }
+
+    uint64_t gsScissor(uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1)
+    {
+        return static_cast<uint64_t>(x0) | (static_cast<uint64_t>(x1) << 16) | (static_cast<uint64_t>(y0) << 32) |
+               (static_cast<uint64_t>(y1) << 48);
     }
 }
 
@@ -1063,7 +1102,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
@@ -2910,7 +2949,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3055,7 +3094,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3117,7 +3156,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3183,7 +3222,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -4749,7 +4788,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             uint32_t pixelHL = 0u;
             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
@@ -4772,7 +4811,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // 1 px: an empty sprite draws nothing (PCSX2)
 
             uint32_t pixelHH = 0u;
             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));
@@ -4898,6 +4937,218 @@ void register_ps2_gs_tests()
             }
             t.IsTrue(pattern2Ok,
                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+        });
+
+        tc.Run("GS Z24 and Z16 depth saturates at the format maximum instead of wrapping (PCSX2 zclamp)", [](TestCase &t)
+        {
+            onEachGsBackend([&](GS &gs, const std::string &who, GSVulkanBackend *)
+            {
+                struct DepthCase { uint32_t zbufPsm; uint32_t z; uint32_t zmax; };
+                const DepthCase cases[] = {{1u, 0x01000005u, 0x00FFFFFFu}, {2u, 0x00012345u, 0x0000FFFFu}};
+                for (const DepthCase &c : cases)
+                {
+                    const uint32_t zpsm = 0x30u | c.zbufPsm;
+                    const std::string fmt = who + (c.zbufPsm == 1u ? "Z24 " : "Z16 ");
+                    gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);                                    // FBP 0, FBW 1, CT32
+                    gs.writeRegister(GS_REG_ZBUF_1, 1ull | (static_cast<uint64_t>(c.zbufPsm) << 24)); // ZBP page 1
+                    gs.writeRegister(GS_REG_SCISSOR_1, gsScissor(0u, 15u, 0u, 15u));
+                    gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (1ull << 17));                    // ZTE, ALWAYS
+                    gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE);
+                    gs.writeRegister(GS_REG_RGBAQ, 0x80102030ull);
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 0u, c.z));
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(8u << 4, 8u << 4, c.z));
+                    t.Equals(gs.ReadVram(zpsm, 32u, 1u, 2u, 2u), c.zmax, fmt + "Z above the maximum stores the maximum");
+
+                    // GREATER with Z one past the maximum: saturated, it equals the stored maximum and fails.
+                    gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (3ull << 17));
+                    gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRIANGLE);
+                    gs.writeRegister(GS_REG_RGBAQ, 0x80C0C0C0ull);
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 0u, c.zmax + 1u));
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(16u << 4, 0u, c.zmax + 1u));
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 16u << 4, c.zmax + 1u));
+                    t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 2u), 0x80102030u, fmt + "saturated Z fails GREATER against the maximum");
+                    t.Equals(gs.ReadVram(zpsm, 32u, 1u, 2u, 2u), c.zmax, fmt + "a failed depth test leaves Z alone");
+                }
+            });
+        });
+
+        tc.Run("GS sprite edges round up like PCSX2 (fractional vertices and XYOFFSET, empty sprites draw nothing)", [](TestCase &t)
+        {
+            onEachGsBackend([&](GS &gs, const std::string &who, GSVulkanBackend *)
+            {
+                gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
+                gs.writeRegister(GS_REG_ZBUF_1, 1ull | (1ull << 32)); // Z masked
+                gs.writeRegister(GS_REG_SCISSOR_1, gsScissor(0u, 63u, 0u, 31u));
+                gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (1ull << 17));
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE);
+                gs.writeRegister(GS_REG_RGBAQ, 0x80FFFFFFull);
+                auto sprite = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) // 12.4
+                {
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(x0, y0, 0u));
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(x1, y1, 0u));
+                };
+                auto lit = [&](uint32_t x, uint32_t y) { return gs.ReadVram(GS_PSM_CT32, 0u, 1u, x, y) != 0u; };
+
+                // (0.5,0.5)-(4.5,2.5) covers pixels x 1..4, y 1..2.
+                sprite(8u, 8u, 72u, 40u);
+                t.IsTrue(!lit(0u, 0u) && !lit(0u, 1u) && !lit(1u, 0u), who + "pixels before ceil(start) stay empty");
+                t.IsTrue(lit(1u, 1u) && lit(4u, 2u), who + "pixels ceil(start)..ceil(end)-1 are drawn");
+                t.IsTrue(!lit(5u, 1u) && !lit(1u, 3u), who + "ceil(end) is exclusive");
+
+                // XYOFFSET (100.5, 100.5) and vertices at 110.75 / 113.75: window 10.25..13.25 covers 11..13.
+                gs.writeRegister(GS_REG_XYOFFSET_1, ((100ull << 4) | 8u) | (((100ull << 4) | 8u) << 32));
+                sprite((110u << 4) | 12u, (110u << 4) | 12u, (113u << 4) | 12u, (111u << 4) | 12u);
+                t.IsTrue(lit(11u, 11u) && lit(13u, 11u), who + "a fractional XYOFFSET is subtracted before rounding up");
+                t.IsTrue(!lit(10u, 11u) && !lit(14u, 11u) && !lit(11u, 10u) && !lit(11u, 12u), who + "nothing outside 11..13 x 11");
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+
+                // Both edges round to the same pixel: empty, as in PCSX2 (it used to draw one column).
+                sprite((20u << 4) | 4u, 16u, (20u << 4) | 12u, 80u);
+                sprite(30u << 4, 16u, 30u << 4, 80u);
+                t.IsTrue(!lit(20u, 2u) && !lit(21u, 2u) && !lit(30u, 2u), who + "sprites narrower than a pixel centre draw nothing");
+            });
+        });
+
+        tc.Run("GS PSMCT24 and PSMZ24 uploads keep a pixel split across IMAGE packets and HWREG writes", [](TestCase &t)
+        {
+            onEachGsBackend([&](GS &gs, const std::string &who, GSVulkanBackend *)
+            {
+                uint8_t bytes[32];
+                for (uint32_t i = 0u; i < 32u; ++i)
+                    bytes[i] = static_cast<uint8_t>(0x10u + i * 7u);
+                auto pixel = [&](uint32_t i)
+                {
+                    return static_cast<uint32_t>(bytes[i * 3u]) | (static_cast<uint32_t>(bytes[i * 3u + 1u]) << 8) |
+                           (static_cast<uint32_t>(bytes[i * 3u + 2u]) << 16);
+                };
+                auto begin = [&](uint32_t dbp, uint32_t dpsm, uint32_t width)
+                {
+                    gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(dbp) << 32) | (1ull << 48) |
+                                                           (static_cast<uint64_t>(dpsm) << 56));
+                    gs.writeRegister(GS_REG_TRXPOS, 0ull);
+                    gs.writeRegister(GS_REG_TRXREG, width | (1ull << 32));
+                    gs.writeRegister(GS_REG_TRXDIR, 0ull);
+                };
+
+                // 10 CT24 pixels in two one-qword IMAGE packets: pixel 5 straddles them.
+                begin(0u, GS_PSM_CT24, 10u);
+                for (uint32_t q = 0u; q < 2u; ++q)
+                {
+                    std::vector<uint8_t> packet;
+                    appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+                    appendU64(packet, 0ull);
+                    packet.insert(packet.end(), bytes + q * 16u, bytes + q * 16u + 16u);
+                    gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                }
+                for (uint32_t i = 0u; i < 10u; ++i)
+                    t.Equals(gs.ReadVram(GS_PSM_CT24, 0u, 1u, i, 0u), pixel(i), who + "IMAGE CT24 pixel " + std::to_string(i));
+
+                // 5 Z24 pixels by HWREG, 8 bytes per write: pixels 2 and 5 straddle writes.
+                begin(32u, GS_PSM_Z24, 5u);
+                for (uint32_t w = 0u; w < 2u; ++w)
+                {
+                    uint64_t value = 0u;
+                    std::memcpy(&value, bytes + w * 8u, sizeof(value));
+                    gs.writeRegister(GS_REG_HWREG, value);
+                }
+                for (uint32_t i = 0u; i < 5u; ++i)
+                    t.Equals(gs.ReadVram(GS_PSM_Z24, 32u, 1u, i, 0u), pixel(i), who + "HWREG Z24 pixel " + std::to_string(i));
+            });
+        });
+
+        tc.Run("GS draws past x=1024 stay on the GPU (lines, sprites and triangles up to the 2047 scissor)", [](TestCase &t)
+        {
+            onEachGsBackend([&](GS &gs, const std::string &who, GSVulkanBackend *vk)
+            {
+                gs.writeRegister(GS_REG_FRAME_1, 32ull << 16); // FBW 32: 2048 px wide
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, gsScissor(0u, 2047u, 0u, 63u));
+                gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (1ull << 17));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80405060ull);
+                const uint64_t syncsBefore = vk ? vk->CpuFallbackSyncsForTests() : 0u;
+                // A GPU draw left pending, so a CPU fallback would have to read VRAM back (which the counter sees).
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE);
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(4u << 4, 4u << 4, 0u));
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_LINE);
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(1000u << 4, 5u << 4, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(1100u << 4, 5u << 4, 0u));
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE);
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(1010u << 4, 10u << 4, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(1040u << 4, 13u << 4, 0u));
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRIANGLE);
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(1000u << 4, 20u << 4, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(2000u << 4, 20u << 4, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(1000u << 4, 60u << 4, 0u));
+                if (vk)
+                    t.Equals(vk->CpuFallbackSyncsForTests(), syncsBefore, who + "no whole-VRAM readback for draws past 1024 px");
+                const std::pair<uint32_t, uint32_t> drawn[] = {{1000u, 5u}, {1050u, 5u}, {1100u, 5u}, {1030u, 12u}, {1500u, 21u}};
+                for (const auto &p : drawn)
+                    t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 32u, p.first, p.second), 0x80405060u,
+                             who + "pixel " + std::to_string(p.first) + "," + std::to_string(p.second) + " drawn");
+                t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 32u, 1101u, 5u), 0u, who + "the line stops at its end");
+            });
+        });
+
+        tc.Run("GS Z24 and Z16 read as textures expand alpha through TEXA like CT24 and CT16", [](TestCase &t)
+        {
+            onEachGsBackend([&](GS &gs, const std::string &who, GSVulkanBackend *)
+            {
+                struct TexCase { uint32_t psm; uint32_t texel; uint32_t alpha; const char *name; };
+                // Z24: TA0. Z16 with bit 15 set: TA1.
+                const TexCase cases[] = {{GS_PSM_Z24, 0x123456u, 0x40u, "Z24 "}, {GS_PSM_Z16, 0x8000u | 0x1234u, 0x70u, "Z16 "}};
+                for (const TexCase &c : cases)
+                {
+                    for (uint32_t y = 0u; y < 8u; ++y)
+                        for (uint32_t x = 0u; x < 8u; ++x)
+                            gs.WriteVram(c.psm, 64u, 1u, x, y, c.texel);
+                    gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
+                    gs.writeRegister(GS_REG_ZBUF_1, 1ull | (1ull << 32));
+                    gs.writeRegister(GS_REG_SCISSOR_1, gsScissor(0u, 15u, 0u, 15u));
+                    gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (1ull << 17));
+                    gs.writeRegister(GS_REG_TEXA, 0x40ull | (0x70ull << 32));
+                    gs.writeRegister(GS_REG_TEXFLUSH, 0ull); // the Z24 case left block 64 in the texture cache
+                    // TBP0 64, TBW 1, 8x8, TCC, DECAL.
+                    gs.writeRegister(GS_REG_TEX0_1, 64ull | (1ull << 14) | (static_cast<uint64_t>(c.psm) << 20) |
+                                                        (3ull << 26) | (3ull << 30) | (1ull << 34) | (1ull << 35));
+                    gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE | (1u << 4) | (1u << 8)); // TME, FST
+                    gs.writeRegister(GS_REG_UV, 0ull);
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 0u, 0u));
+                    gs.writeRegister(GS_REG_UV, (8ull << 4) | ((8ull << 4) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, gsXyz(8u << 4, 8u << 4, 0u));
+                    t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 3u, 3u) >> 24, c.alpha, who + c.name + "alpha comes from TEXA");
+                }
+            });
+        });
+
+        tc.Run("GS nearest STQ sampling floors negative texture coordinates", [](TestCase &t)
+        {
+            onEachGsBackend([&](GS &gs, const std::string &who, GSVulkanBackend *)
+            {
+                for (uint32_t y = 0u; y < 8u; ++y)
+                    for (uint32_t x = 0u; x < 8u; ++x)
+                        gs.WriteVram(GS_PSM_CT32, 64u, 1u, x, y, x == 7u ? 0x80FF0000u : 0x800000FFu);
+                gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
+                gs.writeRegister(GS_REG_ZBUF_1, 1ull | (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, gsScissor(0u, 15u, 0u, 15u));
+                gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (1ull << 17));
+                gs.writeRegister(GS_REG_TEX0_1, 64ull | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                    (3ull << 26) | (3ull << 30) | (1ull << 34) | (1ull << 35));
+                gs.writeRegister(GS_REG_CLAMP_1, 0ull); // REPEAT
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRIANGLE | (1u << 4)); // TME, STQ
+                // s = -0.05 everywhere: u = -0.4 texels, which is texel -1 = 7 with REPEAT (toward zero gave 0).
+                const float s = -0.05f, tt = 0.5f, q = 1.0f;
+                uint32_t sBits = 0u, tBits = 0u, qBits = 0u;
+                std::memcpy(&sBits, &s, 4);
+                std::memcpy(&tBits, &tt, 4);
+                std::memcpy(&qBits, &q, 4);
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull | (static_cast<uint64_t>(qBits) << 32));
+                gs.writeRegister(GS_REG_ST, sBits | (static_cast<uint64_t>(tBits) << 32));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(16u << 4, 0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 16u << 4, 0u));
+                t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 2u), 0x80FF0000u, who + "u = -0.4 samples texel 7");
+            });
         });
 
         tc.Run("GSVulkanBackend matches GSCpuBackend byte-for-byte on uploads, CLUT, sprites, triangles and present", [](TestCase &t)

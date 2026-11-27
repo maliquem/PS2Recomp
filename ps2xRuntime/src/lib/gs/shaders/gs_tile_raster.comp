@@ -292,8 +292,8 @@ void main()
 
                 if (!linear)
                 {
-                    u0 = int(texUf);
-                    v0 = int(texVf);
+                    u0 = int(floor(texUf)); // floor, not toward zero: negative STQ coordinates
+                    v0 = int(floor(texVf));
                 }
                 else
                 {

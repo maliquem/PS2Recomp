@@ -230,9 +230,9 @@ uint applyTexa(uint texaPacked, uint psm, uint texel)
     bool aem = ((texaPacked >> 16u) & 1u) != 0u;
     bool rgbZero = (texel & 0x00FFFFFFu) == 0u;
     uint a = (texel >> 24u) & 0xFFu;
-    if (psm == PSM_CT24)
+    if (psm == PSM_CT24 || psm == PSM_Z24) // Z read as texture expands like its colour twin (PCSX2)
         a = (aem && rgbZero) ? 0u : ta0;
-    else if (psm == PSM_CT16 || psm == PSM_CT16S)
+    else if (psm == PSM_CT16 || psm == PSM_CT16S || psm == PSM_Z16 || psm == PSM_Z16S)
         a = ((a & 0x80u) != 0u) ? ta1 : ((aem && rgbZero) ? 0u : ta0);
     return (texel & 0x00FFFFFFu) | (a << 24u);
 }
@@ -356,12 +356,19 @@ int pickRgbSel(uint sel, int cs, int cd)
     return 0;
 }
 
+// Z24/Z16 saturate at the format's maximum, they do not wrap (PCSX2 zclamp). Mirrors GSInternal::clampDepth.
+uint clampDepth(uint zpsm, uint z)
+{
+    return min(z, 0xFFFFFFFFu >> ((zpsm & 3u) * 8u));
+}
+
 void writeGsPixel(uint x, uint y, uint zVal, ivec4 color, uint fog,
                   uint fbpBlock, uint fbw, uint fpsm, uint fbmsk,
                   uint zbpBlock, uint zpsm, bool zmask,
                   uint testLo, uint alphaLo, uint alphaFix,
                   bool abe, bool pabe, bool fba, bool fge, ivec3 fogColor)
 {
+    zVal = clampDepth(zpsm, zVal);
     if (fge)
     {
         uint invFog = 255u - fog;
