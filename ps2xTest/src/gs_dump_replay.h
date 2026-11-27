@@ -26,6 +26,7 @@ namespace gsdump
         uint32_t sourceFbp = 0;
         uint32_t displayPsm = 0;    // DISPFB PSM of the shown circuit (16-bit frames get a wider tolerance)
         bool usedPreferred = false; // our presentation heuristic showed another buffer than DISPFB
+        bool field = false;         // SMODE2 INT=1 FFMD=1: one field, half the height the TV shows
     };
 
     struct Result

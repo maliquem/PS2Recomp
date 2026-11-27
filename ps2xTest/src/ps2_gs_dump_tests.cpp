@@ -50,7 +50,8 @@ namespace
     // Record path index as PCSX2 writes it (GSState::Transfer<index>): 1 = PATH2, 2 = PATH3.
     // inFlight: PATH2 is saved in the middle of a PACKED tag (NLOOP 2, NREG 2, reg 1), so its first record starts
     // with 3 leftover qwords that must be skipped, not read as a tag.
-    std::vector<uint8_t> makeSyntheticDump(bool inFlight = false)
+    // fieldMode: SMODE2 INT=1 FFMD=1 with the hardware DISPLAY height of the whole frame (DH 447), as Shadow Hearts.
+    std::vector<uint8_t> makeSyntheticDump(bool inFlight = false, bool fieldMode = false)
     {
         Bytes state;
         state.u32(9); // STATE_VERSION
@@ -134,6 +135,7 @@ namespace
 
         out.u8(3);
         priv[0x000] = 1u;                                                  // PMODE: EN1
+        priv[0x020] = fieldMode ? 3u : 0u;                                 // SMODE2: INT, FFMD
         const uint64_t dispfb = 0ull | (10ull << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
         const uint64_t display = (639ull << 32) | (447ull << 44);
         std::memcpy(priv.data() + 0x070, &dispfb, 8);
@@ -153,7 +155,8 @@ namespace
         return v & 0x00FFFFFFu;
     }
 
-    void checkScene(TestCase &t, const gsdump::Result &r, const char *backend, bool inFlight = false)
+    void checkScene(TestCase &t, const gsdump::Result &r, const char *backend, bool inFlight = false,
+                    bool fieldMode = false)
     {
         const std::string tag = std::string(" (") + backend + ")";
         t.IsTrue(r.ok, ("replay should succeed: " + r.error + tag).c_str());
@@ -164,8 +167,10 @@ namespace
         for (const gsdump::Frame &f : r.frames)
         {
             t.Equals(f.width, 640u, ("frame width from DISPLAY1" + tag).c_str());
-            t.Equals(f.height, 448u, ("frame height from DISPLAY1" + tag).c_str());
-            if (f.width != 640u || f.height != 448u)
+            const uint32_t height = fieldMode ? 224u : 448u; // field mode shows one field: half of DH+1
+            t.Equals(f.height, height, ("frame height from DISPLAY1" + tag).c_str());
+            t.Equals(f.field, fieldMode, ("field flag for the comparator" + tag).c_str());
+            if (f.width != 640u || f.height != height)
                 return;
             t.Equals(rgbAt(f, 10, 10), kGray & 0xFFFFFFu, ("background comes from the saved VRAM" + tag).c_str());
             t.Equals(rgbAt(f, 104, 104), kRed & 0xFFFFFFu, ("PATH3 upload split across records lands" + tag).c_str());
@@ -205,6 +210,12 @@ void register_ps2_gs_dump_tests()
         tc.Run("GS dump reader skips the rest of a packet in flight at dump start", [](TestCase &t)
         {
             checkScene(t, gsdump::replay(makeSyntheticDump(true), std::make_unique<GSCpuBackend>()), "cpu", true);
+        });
+
+        tc.Run("GS dump in field mode presents one field of the frame", [](TestCase &t)
+        {
+            checkScene(t, gsdump::replay(makeSyntheticDump(false, true), std::make_unique<GSCpuBackend>()), "cpu",
+                       false, true);
         });
 
         tc.Run("GS dump reader rejects compressed and truncated dumps", [](TestCase &t)

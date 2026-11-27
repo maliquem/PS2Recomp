@@ -49,6 +49,11 @@ namespace gsdump
             return v;
         }
 
+        bool fieldMode(const GSRegisters &r)
+        {
+            return (r.smode2 & 3u) == 3u;
+        }
+
         // GSPrivRegSet keeps each register at its hardware offset from 0x12000000.
         void loadPrivRegs(GSRegisters &r, const uint8_t *p)
         {
@@ -71,6 +76,20 @@ namespace gsdump
             r.imr = le64(p + 0x1010);
             r.busdir = le64(p + 0x1040);
             r.siglblid = le64(p + 0x1080);
+            // shortcut: in field mode (SMODE2 INT=1 FFMD=1) the hardware DISPLAY height counts the whole frame and
+            // each field reads half of it; our runtime keeps one field's height there (the sceGsSetDefDBuffDc stub
+            // writes DH 223, displayRows in gs_backend_state.cpp follows it). Halve it so Present reads one field;
+            // drop this once Present takes the hardware value.
+            if (fieldMode(r))
+            {
+                constexpr uint64_t kDhMask = 0x7FFull << 44;
+                for (uint64_t *display : {&r.display1, &r.display2})
+                {
+                    const uint64_t rows = (((*display & kDhMask) >> 44) + 1u) / 2u;
+                    if (rows != 0u)
+                        *display = (*display & ~kDhMask) | ((rows - 1u) << 44);
+                }
+            }
         }
 
         // Bytes of one GIF tag and its data; same size rules as GS::processGIFPacket.
@@ -358,6 +377,7 @@ namespace gsdump
                                                     &f.usedPreferred);
                 const uint64_t dispfb = (regs.pmode & 1u) ? regs.dispfb1 : regs.dispfb2;
                 f.displayPsm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+                f.field = fieldMode(regs);
                 r.frames.push_back(std::move(f));
                 break;
             }

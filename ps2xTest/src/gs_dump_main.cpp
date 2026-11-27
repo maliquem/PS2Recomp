@@ -81,7 +81,8 @@ namespace
             js << (i ? "," : "") << "\n    {\"vsync\": " << i << ", \"file\": " << jsonString(file)
                << ", \"width\": " << f.width << ", \"height\": " << f.height << ", \"display_fbp\": " << f.displayFbp
                << ", \"source_fbp\": " << f.sourceFbp << ", \"display_psm\": " << f.displayPsm
-               << ", \"used_preferred\": " << (f.usedPreferred ? "true" : "false") << "}";
+               << ", \"used_preferred\": " << (f.usedPreferred ? "true" : "false")
+               << ", \"field\": " << (f.field ? "true" : "false") << "}";
         }
         js << "\n  ]\n}\n";
         return ok && static_cast<bool>(js);
