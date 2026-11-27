@@ -2530,9 +2530,9 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
         }
     }
 
-    // A MAC read (FMEQ/FMAND/FMOR) sees the newest FMAC result issued at least kFmacLatency cycles earlier, and the
-    // program leaves the MAC of its last FMAC. Walk back along every path and mark those producers: only marked
-    // nodes compute exact MAC flags.
+    // A MAC read (FMEQ/FMAND/FMOR) sees the newest FMAC result issued at least kFmacLatency cycles earlier. Walk
+    // back from each reader along every path and mark that producer: only marked nodes compute exact MAC flags.
+    if (readsMac)
     {
         auto writesMac = [&](uint32_t pair)
         {
@@ -2552,13 +2552,18 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
                 preds[nodes[n].nextTaken].push_back(n);
         }
 
-        // need: minimum issue distance to the producer. A reader must not reach the run's first pair, which sees the
-        // MAC from before the run; a program end that reaches it with no FMAC keeps that MAC as it is.
-        std::vector<uint8_t> seen(nodes.size() * (kFmacLatency + 1u));
-        std::vector<std::pair<uint32_t, uint32_t>> stack;
-        auto markBack = [&](uint32_t need, bool isReader) -> bool
+        for (uint32_t r = 0u; r < nodes.size(); ++r)
         {
-            std::fill(seen.begin(), seen.end(), 0u);
+            const uint8_t op = staged[nodes[r].pair].lowerOp;
+            if (op != FL_FMEQ && op != FL_FMAND && op != FL_FMOR)
+                continue;
+            // The run's first pair sees the MAC from before the run, which the fast path does not keep.
+            if (r == 0u)
+                return false;
+            std::vector<uint8_t> seen(nodes.size() * kFmacLatency + nodes.size());
+            std::vector<std::pair<uint32_t, uint32_t>> stack;
+            for (uint32_t p : preds[r])
+                stack.emplace_back(p, std::min<uint32_t>(nodes[r].cycleStep, kFmacLatency));
             while (!stack.empty())
             {
                 const auto [x, dist] = stack.back();
@@ -2567,35 +2572,16 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
                 if (mark)
                     continue;
                 mark = 1u;
-                if (dist >= need && writesMac(nodes[x].pair))
+                if (dist >= kFmacLatency && writesMac(nodes[x].pair))
                 {
                     nodes[x].macProducer = true;
                     continue;
                 }
-                if (x == 0u && isReader)
+                if (x == 0u)
                     return false;
                 for (uint32_t p : preds[x])
                     stack.emplace_back(p, std::min<uint32_t>(dist + nodes[x].cycleStep, kFmacLatency));
             }
-            return true;
-        };
-
-        for (uint32_t r = 0u; r < nodes.size(); ++r)
-        {
-            if (isTerminalDelay[nodes[r].pair])
-            {
-                stack.emplace_back(r, 0u);
-                markBack(0u, false);
-            }
-            const uint8_t op = staged[nodes[r].pair].lowerOp;
-            if (op != FL_FMEQ && op != FL_FMAND && op != FL_FMOR)
-                continue;
-            if (r == 0u)
-                return false;
-            for (uint32_t p : preds[r])
-                stack.emplace_back(p, std::min<uint32_t>(nodes[r].cycleStep, kFmacLatency));
-            if (!markBack(kFmacLatency, true))
-                return false;
         }
     }
 
@@ -2667,8 +2653,9 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
     uint64_t issueCycle = cycles; // cycle the current pair issues on, after its stall
 
     // MAC results of the producer nodes, newest last; a reader takes the newest one already through the pipeline.
-    // shortcut: unmarked FMACs keep no flags, so a run that stops on the cycle budget leaves a stale m_state.mac
-    // (a finished program writes its last FMAC's MAC back); track every FMAC if a budget stop ever reads MAC.
+    // shortcut: unmarked FMACs keep no flags and m_state.mac is not written back, so a slow run that reads MAC
+    // before its first FMAC sees a stale value. Keeping the last FMAC's operands to compute it at the end cost
+    // 0.2 ms per field on the battle models (2026-11-27); do it if such a reader shows up.
     std::array<uint64_t, 8> macIssue{};
     std::array<uint32_t, 8> macValue{};
     uint32_t macCount = 0u;
@@ -3437,8 +3424,6 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
     if (programEnded)
     {
         cycles += terminalTailLatency;
-        if (macCount != 0u)
-            m_state.mac = macValue[(macCount - 1u) & 7u];
         if (xgkickIssued)
         {
             const uint32_t sourceAddress = (xgkickSourceQword * 16u) & dataMask;

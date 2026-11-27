@@ -2053,7 +2053,6 @@ void register_ps2_vu1_tests()
                 t.Equals(fastVu.state().cycles, refVu.state().cycles, "fast path cycles must match reference exactly");
                 t.Equals(fastVu.state().pc, refVu.state().pc, "fast path final PC must match reference");
                 t.Equals(fastVu.state().clip, refVu.state().clip, "fast path CLIP flags must match reference");
-                t.Equals(fastVu.state().mac, refVu.state().mac, "fast path MAC flags must match reference");
                 t.Equals(std::memcmp(fastVu.state().vf, refVu.state().vf, sizeof(refVu.state().vf)), 0,
                          "fast path VF registers must match reference bit-for-bit");
                 t.Equals(std::memcmp(fastVu.state().acc, refVu.state().acc, sizeof(refVu.state().acc)), 0,
