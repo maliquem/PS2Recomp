@@ -1904,6 +1904,168 @@ void register_ps2_vu1_tests()
             t.Equals(fastPkts == refPkts, true, "fast path XGKICK GIF packet must match reference byte-for-byte");
         });
 
+        tc.Run("VU1 fast path matches reference on culling loop with FCSET, FMAND, MULq|WAITQ and path-dependent stalls",
+               [](TestCase &t)
+        {
+            // Synthetic transform/cull loop: FCSET; FMAND reading the MAC of a SUB issued 4 cycles earlier while
+            // other FMACs are in flight; a cull branch whose two paths reach a DIV with different stalls; MULq in
+            // the same pair as WAITQ; a stall only on the first vertex; MSCNT-style resumes with new batches.
+            struct Batch
+            {
+                int32_t count;
+                float verts[6][4];
+            };
+            const Batch batches[3] = {
+                {4, {{0.5f, 0.0f, 1.0f, 0.0f}, {1.5f, 0.0f, 3.0f, 0.0f}, {-2.0f, 0.0f, 3.0f, 0.0f}, {0.25f, 0.0f, 2.0f, 0.0f}}},
+                {6, {{3.0f, 1.0f, 5.0f, 0.0f}, {-0.5f, 0.0f, -1.0f, 0.0f}, {0.75f, 0.0f, -1.0f, 0.0f},
+                     {2.5f, -2.0f, 4.0f, 0.0f}, {0.0f, 0.0f, 6.0f, 0.0f}, {-1.25f, 1.0f, 0.5f, 0.0f}}},
+                {2, {{1.0f, 0.0f, 0.5f, 0.0f}, {-3.0f, 0.0f, 0.5f, 0.0f}}},
+            };
+
+            // resumeReadsVi: the resume entry is a branch on the VI written in the [E] delay slot, so it must see
+            // the old value (slow resume); otherwise it is a plain B and every run takes the fast path.
+            auto runProgram = [&](bool resumeReadsVi, uint32_t maxCycles, VU1Interpreter &vu, std::vector<uint8_t> &dataOut,
+                                  std::vector<std::vector<uint8_t>> &packetsOut)
+            {
+                Vu1Fixture fx;
+                t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+                fx.mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    packetsOut.emplace_back(data, data + sizeBytes);
+                });
+
+                const float mat[4][4] = {
+                    {1.0f, 0.5f, 0.0f, 0.0f},
+                    {0.0f, 1.0f, 0.25f, 0.0f},
+                    {0.25f, 0.0f, 1.0f, 0.0f},
+                    {0.5f, -0.75f, 1.0f, 1.0f},
+                };
+                std::memcpy(fx.data, mat, sizeof(mat)); // qw0..qw3
+                auto loadBatch = [&](const Batch &b)
+                {
+                    const uint32_t header[4] = {static_cast<uint32_t>(b.count), 0u, 0u, 0u};
+                    std::memcpy(fx.data + 4u * 16u, header, sizeof(header)); // qw4
+                    const uint64_t tag[2] = {makeGifTag(static_cast<uint16_t>(b.count), GIF_FMT_PACKED, 2u, true), 0x51ull};
+                    std::memcpy(fx.data + 5u * 16u, tag, sizeof(tag)); // qw5
+                    std::memcpy(fx.data + 6u * 16u, b.verts, sizeof(float) * 4u * static_cast<uint32_t>(b.count));
+                };
+
+                auto lowerOp = [](uint32_t op, uint32_t it, uint32_t is, int32_t imm) -> uint32_t
+                {
+                    return (op << 25) | ((it & 0xFu) << 16) | ((is & 0xFu) << 11) | (static_cast<uint32_t>(imm) & 0x7FFu);
+                };
+                std::vector<std::pair<uint32_t, uint32_t>> prog;
+                auto emit = [&](uint32_t lower, uint32_t upper = kVuUpperNop)
+                {
+                    prog.emplace_back(lower, upper);
+                    return static_cast<int32_t>(prog.size() - 1u);
+                };
+                auto branchTo = [&](int32_t at, int32_t target) // patch imm11 = target - (at + 1)
+                {
+                    prog[at].first |= static_cast<uint32_t>(target - (at + 1)) & 0x7FFu;
+                };
+
+                emit(0x11u << 25 | 0x000FC0u);                          // FCSET 0xFC0
+                emit(lowerOp(0x09u, 7u, 0u, 1));                        // ISUBIU vi7 = -1 (FMOR sign extension)
+                emit(makeVuLq(0xFu, 4u, 0u, 0));                        // matrix -> vf4..vf7
+                emit(makeVuLq(0xFu, 5u, 0u, 1));
+                emit(makeVuLq(0xFu, 6u, 0u, 2));
+                emit(makeVuLq(0xFu, 7u, 0u, 3));
+                const int32_t batchStart = emit(makeVuIlw(0x8u, 2u, 0u, 4)); // vi2 = count
+                emit(makeVuLq(0xFu, 12u, 0u, 5), makeVuUpper(0x2Cu, 0xFu, 0u, 0u, 2u)); // vf12 = GIFtag | SUB vf2 = 0
+                emit(makeVuIaddiu(3u, 0u, 0));                          // vi3 = 0
+                emit(makeVuIaddiu(14u, 0u, 0x40));                      // vi14 = vi4 = output
+                emit(makeVuIaddiu(4u, 0u, 0x40));
+                emit(makeVuIaddiu(5u, 0u, 6));                          // vi5 = input
+                emit(makeVuLowerSpecial(0x35u, 12u, 14u, 0u, 0xFu));    // SQI vf12, (vi14++)
+                emit(makeVuLq(0xEu, 13u, 5u, 0));                       // LQ.xyz vf13
+                const int32_t loop =
+                    emit(makeVuIaddiu(5u, 5u, 1), makeVuUpperSpecial(0x18u, 0xFu, 13u, 4u)); // MULAx (stalls 1st vertex only)
+                emit(0u, makeVuUpperSpecial(0x09u, 0xFu, 13u, 5u));     // MADDAy
+                emit(0u, makeVuUpperSpecial(0x0Au, 0xFu, 13u, 6u));     // MADDAz
+                emit(0u, makeVuUpper(0x0Bu, 0xFu, 0u, 7u, 15u));        // MADDw vf15, vf7, vf0w
+                emit(makeVuIaddiu(1u, 0u, 0x22), makeVuUpper(0x2Cu, 0xEu, 2u, 15u, 1u)); // SUB.xyz vf1 = vf15 - prev (MAC)
+                emit(makeVuLq(0xEu, 13u, 5u, 0), makeVuUpper(0x2Au, 0xEu, 6u, 5u, 20u)); // prefetch | MUL (in flight)
+                emit(0u, makeVuUpper(0x28u, 0xEu, 5u, 6u, 21u));        // ADD (in flight)
+                emit(0u, makeVuUpper(0x2Cu, 0xEu, 7u, 5u, 22u));        // SUB (in flight)
+                emit(makeVuFlagRegister(0x1Au, 1u, 1u), makeVuUpperSpecial(0x1Fu, 0xEu, 15u, 15u)); // FMAND | CLIPw
+                const int32_t cull = emit(lowerOp(0x28u, 0u, 1u, 0), makeVuUpper(0x28u, 0xFu, 0u, 15u, 3u)); // IBEQ | ADD vf3
+                emit(makeVuIaddiu(11u, 0u, 0));                         // delay slot
+                emit(makeVuIaddiu(11u, 0u, 0x400), makeVuUpper(0x28u, 0xFu, 15u, 15u, 8u)); // fall path only: vf8
+                const int32_t merge = emit(makeVuDiv(0u, 3u, 3u, 3u));  // DIV Q, vf0w, vf3w (stall depends on path)
+                branchTo(cull, merge);
+                emit(makeVuLowerSpecial(0x30u, 15u, 2u, 0u, 0xFu), makeVuUpper(0x28u, 0xEu, 0u, 8u, 9u)); // MOVE vf2 | ADD vf9
+                emit(0x12u << 25 | 0x3Fu);                              // FCAND vi1, 0x3F
+                emit(makeVuLowerDirect(0x35u, 11u, 1u, 11u));           // IOR vi11, vi11, vi1
+                emit(makeVuFlagRegister(0x1Bu, 6u, 7u));                // FMOR vi6, vi7
+                emit(makeVuLowerSpecial(0x3Bu, 0u), makeVuUpper(0x1Cu, 0xEu, 0u, 15u, 16u)); // WAITQ | MULq.xyz vf16
+                emit(0u, makeVuUpperSpecial(0x15u, 0xEu, 16u, 16u));    // FTOI4.xyz vf16
+                emit(makeVuLowerSpecial(0x3Du, 11u, 16u, 0u, 0x1u));    // MFIR.w vf16, vi11
+                emit(makeVuLowerDirect(0x32u, 2u, 2u, 0x1Fu));          // IADDI vi2, vi2, -1
+                emit(makeVuSq(0xFu, 16u, 14u, 0));
+                emit(makeVuSq(0xFu, 9u, 14u, 1));
+                branchTo(emit(lowerOp(0x2Du, 0u, 2u, 0)), loop);        // IBGTZ vi2, loop
+                emit(makeVuIaddiu(14u, 14u, 2));                        // delay slot
+                emit(makeVuLowerSpecial(0x6Cu, 4u), kVuUpperNop | 0x40000000u); // [E] XGKICK vi4
+                emit(makeVuIaddiu(3u, 0u, 1));                          // delay slot: vi3 = 1 (old 0 kept for a branch)
+                branchTo(emit(resumeReadsVi ? lowerOp(0x28u, 0u, 3u, 0) : makeVuBranch(0)), batchStart); // resume entry
+                emit(0u);
+                emit(0u, kVuUpperNop | 0x40000000u);                    // reached only if IBEQ saw the new vi3
+                emit(0u);
+
+                for (size_t i = 0; i < prog.size(); ++i)
+                    writeVuInstructionPair(fx.code, static_cast<uint32_t>(i * 8u), prog[i].first, prog[i].second);
+
+                loadBatch(batches[0]);
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, maxCycles);
+                for (uint32_t b = 1u; b < 3u; ++b)
+                {
+                    loadBatch(batches[b]);
+                    vu.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, maxCycles);
+                }
+                dataOut.assign(fx.data, fx.data + PS2_VU1_DATA_SIZE);
+            };
+
+            for (const bool resumeReadsVi : {false, true})
+            {
+                VU1Interpreter refVu, fastVu;
+                std::vector<uint8_t> refData, fastData;
+                std::vector<std::vector<uint8_t>> refPkts, fastPkts;
+                runProgram(resumeReadsVi, 16383u, refVu, refData, refPkts);
+                runProgram(resumeReadsVi, 16384u, fastVu, fastData, fastPkts);
+
+                t.Equals(refPkts.size(), static_cast<size_t>(3u), "reference should kick one packet per batch");
+                bool culled = false, kept = false;
+                for (const auto &pkt : refPkts)
+                {
+                    for (size_t off = 16u; off + 32u <= pkt.size(); off += 32u)
+                    {
+                        int32_t w = 0;
+                        std::memcpy(&w, pkt.data() + off + 12u, sizeof(w));
+                        ((w & 0x400) != 0 ? kept : culled) = true;
+                    }
+                }
+                t.IsTrue(culled && kept, "batches should take both sides of the cull branch");
+
+                t.IsTrue(refVu.state().status != 0u, "reference interpreter should record FMAC status flags");
+                if (!resumeReadsVi)
+                    t.Equals(fastVu.state().status, 0u, "fast direct path should have executed every run");
+                t.Equals(fastVu.state().cycles, refVu.state().cycles, "fast path cycles must match reference exactly");
+                t.Equals(fastVu.state().pc, refVu.state().pc, "fast path final PC must match reference");
+                t.Equals(fastVu.state().clip, refVu.state().clip, "fast path CLIP flags must match reference");
+                t.Equals(std::memcmp(fastVu.state().vf, refVu.state().vf, sizeof(refVu.state().vf)), 0,
+                         "fast path VF registers must match reference bit-for-bit");
+                t.Equals(std::memcmp(fastVu.state().acc, refVu.state().acc, sizeof(refVu.state().acc)), 0,
+                         "fast path ACC must match reference bit-for-bit");
+                t.Equals(std::memcmp(fastVu.state().vi, refVu.state().vi, sizeof(refVu.state().vi)), 0,
+                         "fast path VI registers must match reference");
+                t.Equals(std::memcmp(&fastVu.state().q, &refVu.state().q, sizeof(float)), 0,
+                         "fast path Q register must match reference bit-for-bit");
+                t.Equals(fastData == refData, true, "fast path VU1 data memory must match reference byte-for-byte");
+                t.Equals(fastPkts == refPkts, true, "fast path XGKICK GIF packets must match reference byte-for-byte");
+            }
+        });
+
         tc.Run("VU1 fast path rejects cross-pair hazards and preserves exact fallback parity", [](TestCase &t)
         {
             auto checkFallbackParity = [&](auto buildCode, const char *label)
@@ -1985,7 +2147,7 @@ void register_ps2_vu1_tests()
                 vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 16384u);
                 const uint64_t cB = vu.state().cycles - cA1;
                 refB.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 16383u);
-                t.Equals(cB, refB.state().cycles, "conflicting entry B must fall back with exact cycles");
+                t.Equals(cB, refB.state().cycles, "entry B with a different stall at the shared pair must keep exact cycles");
 
                 const uint64_t beforeA2 = vu.state().cycles;
                 vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 8u, 0u, 0u, 16384u);

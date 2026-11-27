@@ -13,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <ps2_log.h>
 
@@ -1422,7 +1424,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
         m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
 
     m_fastEntryStatus.fill(0u);
-    m_fastPairCommitted.fill(0u);
+    m_fastNodes.clear();
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;
     m_cachedCodeSize = codeSize;
@@ -1526,12 +1528,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         !m_state.branchPending &&
         !m_state.ebit &&
         !m_state.haltAfterDelaySlot &&
-        !m_viBranchBackupValid &&
         !pipelinesPending() &&
         (m_state.pc & 7u) == 0u &&
         (m_state.pc / 8u) < pairCount &&
+        // The old-VI copy left by a delay-slot write only matters to a first pair that reads that VI.
+        (!m_viBranchBackupValid ||
+         (decodedCode[m_state.pc / 8u].lowerUsage.viRead & (1u << m_viBranchBackupReg)) == 0u) &&
         isFastEntryEligible(m_state.pc / 8u, pairCount))
     {
+        m_viBranchBackupValid = false;
         runFastDirect(vuData, dataSize, pairCount, budgetEnd);
         if (useVuRounding && previousRoundingMode != -1)
             std::fesetround(previousRoundingMode);
@@ -1845,7 +1850,11 @@ namespace
         FL_IBGEZ,
         FL_XTOP,
         FL_XITOP,
-        FL_XGKICK
+        FL_XGKICK,
+        FL_FCSET,
+        FL_FMEQ,
+        FL_FMAND,
+        FL_FMOR
     };
 
     constexpr uint8_t kFastFlagEBit = 1u << 0;
@@ -2114,8 +2123,18 @@ bool VU1Interpreter::buildFastPair(const DecodedInstructionPair &decoded,
     case 0x08: out.lowerOp = FL_IADDIU; out.lReg1 = viT; out.lReg2 = viS; out.imm = static_cast<int16_t>((lower & 0x7FFu) | ((lower >> 10) & 0x7800u)); return true;
     case 0x09: out.lowerOp = FL_ISUBIU; out.lReg1 = viT; out.lReg2 = viS; out.imm = static_cast<int16_t>((lower & 0x7FFu) | ((lower >> 10) & 0x7800u)); return true;
     case 0x10: out.lowerOp = FL_FCEQ; out.imm24 = lower & 0xFFFFFFu; return true;
+    case 0x11:
+        // FCSET cancels a same-pair CLIP; the fast path applies both at once, so keep that pair on the slow path.
+        if (decoded.upperUsage.writesClip)
+            return false;
+        out.lowerOp = FL_FCSET;
+        out.imm24 = lower & 0xFFFFFFu;
+        return true;
     case 0x12: out.lowerOp = FL_FCAND; out.imm24 = lower & 0xFFFFFFu; return true;
     case 0x13: out.lowerOp = FL_FCOR; out.imm24 = lower & 0xFFFFFFu; return true;
+    case 0x18: out.lowerOp = FL_FMEQ; out.lReg1 = viT; out.lReg2 = viS; return true;
+    case 0x1A: out.lowerOp = FL_FMAND; out.lReg1 = viT; out.lReg2 = viS; return true;
+    case 0x1B: out.lowerOp = FL_FMOR; out.lReg1 = viT; out.lReg2 = viS; return true;
     case 0x20: out.lowerOp = FL_B; out.flags |= kFastFlagUncondBranch; return setBranchTarget();
     case 0x28: out.lowerOp = FL_IBEQ; out.lReg1 = viS; out.lReg2 = viT; return setBranchTarget();
     case 0x29: out.lowerOp = FL_IBNE; out.lReg1 = viS; out.lReg2 = viT; return setBranchTarget();
@@ -2204,6 +2223,8 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
     std::array<std::array<uint16_t, 2>, kMaxDecodedPairs> succ{};
     std::array<uint16_t, kMaxDecodedPairs> queue{};
     std::array<uint16_t, kMaxDecodedPairs> reachableList{};
+    std::array<uint16_t, kMaxDecodedPairs> delayTaken{};
+    std::array<uint16_t, kMaxDecodedPairs> delayFall{};
     uint32_t qHead = 0u, qTail = 0u, reachableCount = 0u;
 
     auto enqueue = [&](uint32_t idx) -> bool
@@ -2274,6 +2295,8 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
             const uint32_t fallIdx = (delayIdx + 1u < pairCount) ? (delayIdx + 1u) : 0u;
             const uint32_t targetIdx = static_cast<uint32_t>(fp.imm);
             isDelaySlot[delayIdx] = 1u;
+            delayTaken[delayIdx] = static_cast<uint16_t>(targetIdx);
+            delayFall[delayIdx] = static_cast<uint16_t>((fp.flags & kFastFlagUncondBranch) != 0u ? targetIdx : fallIdx);
             if (!addEdge(idx, delayIdx))
                 return false;
             if (!addEdge(delayIdx, targetIdx))
@@ -2335,7 +2358,8 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
         }
     }
 
-    // Pass 2: Monotone dataflow fixed-point over remaining pipeline latencies.
+    // Pass 2: walk (pair, pending-latency state) nodes from the entry. A pair reached under different pending
+    // latencies gets its own node per state, so every node's stall and tail latency are exact on every path.
     struct RemState
     {
         uint8_t vf[32][4]{};
@@ -2344,47 +2368,62 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
         uint8_t fdiv = 0u;
         uint16_t branchDelayViMask = 0u;
     };
+    static_assert(std::has_unique_object_representations_v<RemState>, "states are compared with memcmp");
 
-    std::vector<RemState> inState(pairCount);
-    std::array<uint8_t, kMaxDecodedPairs> inInit{};
-    std::array<uint8_t, kMaxDecodedPairs> inWork{};
-    std::array<uint16_t, kMaxDecodedPairs * 4u> worklist{};
-    uint32_t wHead = 0u, wTail = 0u;
-    const uint32_t wCap = static_cast<uint32_t>(worklist.size());
+    constexpr uint32_t kNoNode = 0xFFFFFFFFu;
+    const uint32_t maxNodes = reachableCount * 16u + 256u;
+    std::vector<FastNode> nodes;
+    std::vector<RemState> nodeIn;
+    std::vector<uint32_t> nextAtPair;
+    std::vector<uint32_t> firstAtPair(pairCount, kNoNode);
+    std::vector<uint32_t> work;
 
-    auto pushWork = [&](uint32_t idx)
+    auto nodeFor = [&](uint32_t pair, const RemState &st) -> uint32_t
     {
-        if (!inWork[idx])
-        {
-            inWork[idx] = 1u;
-            worklist[wTail % wCap] = static_cast<uint16_t>(idx);
-            ++wTail;
-        }
+        for (uint32_t n = firstAtPair[pair]; n != kNoNode; n = nextAtPair[n])
+            if (std::memcmp(&nodeIn[n], &st, sizeof(RemState)) == 0)
+                return n;
+        if (nodes.size() >= maxNodes)
+            return kNoNode;
+        const uint32_t n = static_cast<uint32_t>(nodes.size());
+        FastNode node{};
+        node.next = kNoNode;
+        node.nextTaken = kNoNode;
+        node.pair = static_cast<uint16_t>(pair);
+        nodes.push_back(node);
+        nodeIn.push_back(st);
+        nextAtPair.push_back(firstAtPair[pair]);
+        firstAtPair[pair] = n;
+        work.push_back(n);
+        return n;
     };
 
-    inInit[entryPair] = 1u;
-    pushWork(entryPair);
-
-    uint32_t iterations = 0u;
-    const uint32_t maxIterations = pairCount * 16u + 64u;
-    while (wHead < wTail)
+    auto advanceRem = [](RemState &s, uint8_t delta)
     {
-        if (++iterations > maxIterations)
-            return false;
+        if (delta == 0u)
+            return;
+        for (uint32_t r = 1u; r < 32u; ++r)
+            for (uint32_t c = 0u; c < 4u; ++c)
+                s.vf[r][c] = s.vf[r][c] > delta ? static_cast<uint8_t>(s.vf[r][c] - delta) : 0u;
+        for (uint32_t r = 1u; r < 16u; ++r)
+            s.vi[r] = s.vi[r] > delta ? static_cast<uint8_t>(s.vi[r] - delta) : 0u;
+        s.clip = s.clip > delta ? static_cast<uint8_t>(s.clip - delta) : 0u;
+        s.fdiv = s.fdiv > delta ? static_cast<uint8_t>(s.fdiv - delta) : 0u;
+    };
 
-        const uint32_t idx = worklist[wHead % wCap];
-        ++wHead;
-        inWork[idx] = 0u;
-
+    nodeFor(entryPair, RemState{});
+    bool readsMac = false;
+    while (!work.empty())
+    {
+        const uint32_t n = work.back();
+        work.pop_back();
+        const uint32_t idx = nodes[n].pair;
         const DecodedInstructionPair &d = m_decodedCodeCache[idx];
-        FastPair &fp = staged[idx];
-        RemState st = inState[idx];
+        const FastPair &fp = staged[idx];
+        RemState st = nodeIn[n];
 
-        // Non-stalling hazards must be zero on entry.
-        if (d.lowerUsage.readsClip && st.clip > 0u)
-            return false;
-        if ((fp.flags & kFastFlagReadsQ) != 0u && st.fdiv > 0u)
-            return false;
+        if (fp.lowerOp == FL_FMEQ || fp.lowerOp == FL_FMAND || fp.lowerOp == FL_FMOR)
+            readsMac = true;
         if ((fp.flags & kFastFlagIsBranch) != 0u && (d.lowerUsage.viRead & st.branchDelayViMask) != 0u)
             return false;
 
@@ -2407,27 +2446,14 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
         }
         if (d.lowerUsage.pipeline == PipelineFdiv || d.lowerUsage.waitQ)
             stall = std::max(stall, st.fdiv);
+        advanceRem(st, stall);
+        nodes[n].cycleStep = static_cast<uint8_t>(1u + stall);
 
-        // Merge points cannot have path-dependent stalls.
-        if (stall > 0u && inDegree[idx] > 1u)
+        // Non-stalling reads see only committed CLIP and Q, which the fast path applies at issue.
+        if (d.lowerUsage.readsClip && st.clip > 0u)
             return false;
-        fp.cycleStep = static_cast<uint8_t>(1u + stall);
-
-        auto advanceRem = [](RemState &s, uint8_t delta)
-        {
-            if (delta == 0u)
-                return;
-            for (uint32_t r = 1u; r < 32u; ++r)
-                for (uint32_t c = 0u; c < 4u; ++c)
-                    s.vf[r][c] = s.vf[r][c] > delta ? static_cast<uint8_t>(s.vf[r][c] - delta) : 0u;
-            for (uint32_t r = 1u; r < 16u; ++r)
-                s.vi[r] = s.vi[r] > delta ? static_cast<uint8_t>(s.vi[r] - delta) : 0u;
-            s.clip = s.clip > delta ? static_cast<uint8_t>(s.clip - delta) : 0u;
-            s.fdiv = s.fdiv > delta ? static_cast<uint8_t>(s.fdiv - delta) : 0u;
-        };
-
-        if (stall > 0u)
-            advanceRem(st, stall);
+        if ((fp.flags & kFastFlagReadsQ) != 0u && st.fdiv > 0u)
+            return false;
 
         // Check WAW hazards (slower earlier write would overwrite faster later write).
         auto applyVfWrite = [&](const InstructionUsage &u) -> bool
@@ -2464,7 +2490,7 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
                 st.vi[reg] = lat;
             }
         }
-        if (d.upperUsage.writesClip)
+        if (d.upperUsage.writesClip || d.lowerUsage.writesClip)
             st.clip = kFmacLatency;
         if (d.lowerUsage.pipeline == PipelineFdiv)
             st.fdiv = d.lowerUsage.latency;
@@ -2482,69 +2508,96 @@ bool VU1Interpreter::isFastEntryEligible(uint32_t entryPair, uint32_t pairCount)
                     maxRem = std::max(maxRem, st.vf[r][c]);
             for (uint32_t r = 1u; r < 16u; ++r)
                 maxRem = std::max(maxRem, st.vi[r]);
-            fp.tailLatency = maxRem;
+            nodes[n].tailLatency = maxRem;
             continue;
         }
 
-        for (uint8_t k = 0u; k < succCount[idx]; ++k)
+        if (isDelaySlot[idx])
         {
-            const uint32_t s = succ[idx][k];
-            if (!inInit[s])
-            {
-                inState[s] = st;
-                inInit[s] = 1u;
-                pushWork(s);
-            }
-            else
-            {
-                RemState &dst = inState[s];
-                bool changed = false;
-                for (uint32_t r = 1u; r < 32u; ++r)
-                    for (uint32_t c = 0u; c < 4u; ++c)
-                        if (st.vf[r][c] > dst.vf[r][c]) { dst.vf[r][c] = st.vf[r][c]; changed = true; }
-                for (uint32_t r = 1u; r < 16u; ++r)
-                    if (st.vi[r] > dst.vi[r]) { dst.vi[r] = st.vi[r]; changed = true; }
-                if (st.clip > dst.clip) { dst.clip = st.clip; changed = true; }
-                if (st.fdiv > dst.fdiv) { dst.fdiv = st.fdiv; changed = true; }
-                const uint16_t newMask = static_cast<uint16_t>(dst.branchDelayViMask | st.branchDelayViMask);
-                if (newMask != dst.branchDelayViMask) { dst.branchDelayViMask = newMask; changed = true; }
-                if (changed)
-                    pushWork(s);
-            }
-        }
-    }
-
-    // If any terminal delay slot has nonzero tailLatency and the program has merges, reject so tail cycle count is always exact.
-    bool hasMerge = false;
-    for (uint32_t r = 0u; r < reachableCount; ++r)
-        if (inDegree[reachableList[r]] > 1u)
-            hasMerge = true;
-    if (hasMerge)
-    {
-        for (uint32_t r = 0u; r < reachableCount; ++r)
-            if (isTerminalDelay[reachableList[r]] && staged[reachableList[r]].tailLatency != 0u)
+            const uint32_t taken = nodeFor(delayTaken[idx], st);
+            const uint32_t fall = nodeFor(delayFall[idx], st);
+            if (taken == kNoNode || fall == kNoNode)
                 return false;
-    }
-
-    // Reject if any shared pair conflicts with an already-committed entry's static timing.
-    for (uint32_t r = 0u; r < reachableCount; ++r)
-    {
-        const uint32_t idx = reachableList[r];
-        if (m_fastPairCommitted[idx] &&
-            (m_fastCodeCache[idx].cycleStep != staged[idx].cycleStep ||
-             m_fastCodeCache[idx].tailLatency != staged[idx].tailLatency))
+            nodes[n].nextTaken = taken;
+            nodes[n].next = fall;
+        }
+        else
         {
-            return false;
+            const uint32_t next = nodeFor(succ[idx][0], st);
+            if (next == kNoNode)
+                return false;
+            nodes[n].next = next;
         }
     }
 
-    for (uint32_t r = 0u; r < reachableCount; ++r)
+    // A MAC read (FMEQ/FMAND/FMOR) sees the newest FMAC result issued at least kFmacLatency cycles earlier. Walk
+    // back from each reader along every path and mark that producer: only marked nodes compute exact MAC flags.
+    if (readsMac)
     {
-        const uint32_t idx = reachableList[r];
-        m_fastCodeCache[idx] = staged[idx];
-        m_fastPairCommitted[idx] = 1u;
+        auto writesMac = [&](uint32_t pair)
+        {
+            const uint32_t upper = m_decodedCodeCache[pair].upper;
+            const uint32_t op = upper & 0x3Fu;
+            const uint32_t a = op >= 0x3Cu ? ((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+            return DEST(upper) != 0u &&
+                   (a <= 0x0Fu || (a >= 0x18u && a <= 0x1Cu) || a == 0x1Eu || (a >= 0x20u && a <= 0x2Eu && a != 0x2Bu));
+        };
+
+        std::vector<std::vector<uint32_t>> preds(nodes.size());
+        for (uint32_t n = 0u; n < nodes.size(); ++n)
+        {
+            if (nodes[n].next != kNoNode)
+                preds[nodes[n].next].push_back(n);
+            if (nodes[n].nextTaken != kNoNode && nodes[n].nextTaken != nodes[n].next)
+                preds[nodes[n].nextTaken].push_back(n);
+        }
+
+        for (uint32_t r = 0u; r < nodes.size(); ++r)
+        {
+            const uint8_t op = staged[nodes[r].pair].lowerOp;
+            if (op != FL_FMEQ && op != FL_FMAND && op != FL_FMOR)
+                continue;
+            // The run's first pair sees the MAC from before the run, which the fast path does not keep.
+            if (r == 0u)
+                return false;
+            std::vector<uint8_t> seen(nodes.size() * kFmacLatency + nodes.size());
+            std::vector<std::pair<uint32_t, uint32_t>> stack;
+            for (uint32_t p : preds[r])
+                stack.emplace_back(p, std::min<uint32_t>(nodes[r].cycleStep, kFmacLatency));
+            while (!stack.empty())
+            {
+                const auto [x, dist] = stack.back();
+                stack.pop_back();
+                uint8_t &mark = seen[x * (kFmacLatency + 1u) + dist];
+                if (mark)
+                    continue;
+                mark = 1u;
+                if (dist >= kFmacLatency && writesMac(nodes[x].pair))
+                {
+                    nodes[x].macProducer = true;
+                    continue;
+                }
+                if (x == 0u)
+                    return false;
+                for (uint32_t p : preds[x])
+                    stack.emplace_back(p, std::min<uint32_t>(dist + nodes[x].cycleStep, kFmacLatency));
+            }
+        }
     }
 
+    const uint32_t base = static_cast<uint32_t>(m_fastNodes.size());
+    for (FastNode node : nodes)
+    {
+        if (node.next != kNoNode)
+            node.next += base;
+        if (node.nextTaken != kNoNode)
+            node.nextTaken += base;
+        m_fastNodes.push_back(node);
+    }
+    for (uint32_t r = 0u; r < reachableCount; ++r)
+        m_fastCodeCache[reachableList[r]] = staged[reachableList[r]];
+
+    m_fastEntryNode[entryPair] = base;
     m_fastEntryStatus[entryPair] = 1u;
     return true;
 }
@@ -2595,6 +2648,17 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
     uint64_t cycles = m_cycle;
     uint32_t pcIdx = m_state.pc / 8u;
     const FastPair *fast = m_fastCodeCache.data();
+    const FastNode *nodes = m_fastNodes.data();
+    uint32_t nodeIdx = m_fastEntryNode[pcIdx];
+    uint64_t issueCycle = cycles; // cycle the current pair issues on, after its stall
+
+    // MAC results of the producer nodes, newest last; a reader takes the newest one already through the pipeline.
+    // shortcut: unmarked FMACs keep no flags and m_state.mac is not written back, so a slow run that reads MAC
+    // before its first FMAC sees a stale value. Keeping the last FMAC's operands to compute it at the end cost
+    // 0.2 ms per field on the battle models (2026-11-27); do it if such a reader shows up.
+    std::array<uint64_t, 8> macIssue{};
+    std::array<uint32_t, 8> macValue{};
+    uint32_t macCount = 0u;
 
     bool xgkickIssued = false;
     uint64_t xgkickIssueCycle = 0u;
@@ -3140,6 +3204,30 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
         case FL_FCOR:
             vi[1] = ((clip | p.imm24) == 0xFFFFFFu) ? 1 : 0;
             return false;
+        case FL_FCSET:
+            clip = p.imm24;
+            return false;
+        case FL_FMEQ:
+        case FL_FMAND:
+        case FL_FMOR:
+            if (p.lReg1 != 0u)
+            {
+                // Pass 2 proved a marked producer is visible on every path; m_state.mac is only a fallback.
+                uint32_t mac = m_state.mac;
+                for (uint32_t k = 0u; k < std::min<uint32_t>(macCount, 8u); ++k)
+                {
+                    const uint32_t slot = (macCount - 1u - k) & 7u;
+                    if (macIssue[slot] + kFmacLatency <= issueCycle)
+                    {
+                        mac = macValue[slot];
+                        break;
+                    }
+                }
+                const uint32_t mask = static_cast<uint16_t>(vi[p.lReg2]);
+                vi[p.lReg1] = p.lowerOp == FL_FMEQ ? ((mac & 0xFFFFu) == mask ? 1 : 0)
+                                                   : static_cast<int16_t>(p.lowerOp == FL_FMAND ? (mac & mask) : (mac | mask));
+            }
+            return false;
         case FL_B:
             return true;
         case FL_IBEQ:
@@ -3164,7 +3252,7 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
             return false;
         case FL_XGKICK:
             xgkickIssued = true;
-            xgkickIssueCycle = cycles + static_cast<uint64_t>(p.cycleStep - 1u);
+            xgkickIssueCycle = issueCycle;
             xgkickSourceQword = static_cast<uint16_t>(vi[p.lReg1]);
             return false;
         default:
@@ -3172,8 +3260,66 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
         }
     };
 
-    auto execPair = [&](const FastPair &p) -> bool
+    // A producer runs the reference upper op, so its VF result and MAC flags match the slow path bit for bit.
+    auto execProducerUpper = [&](uint32_t pairIdx)
     {
+        const uint32_t upper = m_decodedCodeCache[pairIdx].upper;
+        const uint8_t dest = DEST(upper);
+        const uint8_t fd = FD(upper);
+#if defined(__SSE2__) || defined(_M_X64)
+        _mm_storeu_ps(m_state.vf[FS(upper)], vf[FS(upper)]);
+        _mm_storeu_ps(m_state.vf[FT(upper)], vf[FT(upper)]);
+        _mm_storeu_ps(m_state.acc, acc);
+#else
+        std::memcpy(m_state.vf[FS(upper)], vf[FS(upper)], sizeof(vf[0]));
+        std::memcpy(m_state.vf[FT(upper)], vf[FT(upper)], sizeof(vf[0]));
+        std::memcpy(m_state.acc, acc, sizeof(acc));
+#endif
+        m_state.q = q;
+        m_state.i = iReg;
+#if defined(__SSE2__) || defined(_M_X64)
+        // The slow path runs without FTZ/DAZ; a flushed denormal product could change a MADD sum.
+        _mm_setcsr(mxcsrGuard.saved);
+        execUpper(upper);
+        _mm_setcsr((mxcsrGuard.saved & ~0x6000u) | 0xE040u);
+#else
+        execUpper(upper);
+#endif
+        uint32_t mac = 0u;
+        m_flagPipeline.forEach([&](FlagPipelineEntry &entry) { if (entry.writesMac) mac = entry.mac; });
+        m_flagPipeline.clear();
+        const bool toAcc = (upper & 0x3Fu) >= 0x3Cu;
+#if defined(__SSE2__) || defined(_M_X64)
+        if (toAcc)
+            sseApplyMask(acc, _mm_loadu_ps(m_state.acc), dest);
+        else if (fd != 0u)
+            sseApplyMask(vf[fd], _mm_loadu_ps(m_state.vf[fd]), dest);
+#else
+        float *dst = toAcc ? acc : (fd != 0u ? vf[fd] : nullptr);
+        const float *src = toAcc ? m_state.acc : m_state.vf[fd];
+        for (int c = 0; dst && c < 4; ++c)
+            if ((dest & (8u >> c)) != 0u)
+                dst[c] = src[c];
+#endif
+        m_state.vf[0][0] = 0.0f; m_state.vf[0][1] = 0.0f; m_state.vf[0][2] = 0.0f; m_state.vf[0][3] = 1.0f;
+        macIssue[macCount & 7u] = issueCycle;
+        macValue[macCount & 7u] = mac;
+        ++macCount;
+    };
+
+    auto execPair = [&](const FastPair &p, const FastNode &n) -> bool
+    {
+        if (n.macProducer) [[unlikely]]
+        {
+            if ((p.flags & kFastFlagShadowLowerFirst) != 0u)
+            {
+                const bool taken = execFastLower(p);
+                execProducerUpper(n.pair);
+                return taken;
+            }
+            execProducerUpper(n.pair);
+            return (p.lowerOp != FL_NOP) ? execFastLower(p) : false;
+        }
         if ((p.flags & kFastFlagShadowLowerFirst) != 0u)
         {
             const bool taken = execFastLower(p);
@@ -3189,28 +3335,32 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
     bool programEnded = false;
     uint8_t terminalTailLatency = 0u;
 
-    while (cycles < budgetEnd)
+    for (;;)
     {
-        const FastPair &p = fast[pcIdx];
-        const uint64_t nextCycles = cycles + p.cycleStep;
+        const FastNode &n = nodes[nodeIdx];
+        const FastPair &p = fast[n.pair];
+        const uint64_t nextCycles = cycles + n.cycleStep;
         if (nextCycles > budgetEnd)
         {
+            pcIdx = n.pair;
             cycles = budgetEnd;
             break;
         }
 
-        const bool taken = execPair(p);
+        issueCycle = nextCycles - 1u;
+        const bool taken = execPair(p, n);
         cycles = nextCycles;
 
         if ((p.flags & (kFastFlagIsBranch | kFastFlagEBit)) == 0u)
         {
-            pcIdx = (pcIdx + 1u < pairCount) ? (pcIdx + 1u) : 0u;
+            nodeIdx = n.next;
             continue;
         }
 
-        const uint32_t delayIdx = (pcIdx + 1u < pairCount) ? (pcIdx + 1u) : 0u;
+        const FastNode &dn = nodes[n.next];
+        const uint32_t delayIdx = dn.pair;
         const FastPair &delay = fast[delayIdx];
-        if (cycles + delay.cycleStep > budgetEnd)
+        if (cycles + dn.cycleStep > budgetEnd)
         {
             pcIdx = delayIdx;
             if ((p.flags & kFastFlagEBit) != 0u)
@@ -3227,19 +3377,30 @@ void VU1Interpreter::runFastDirect(uint8_t *vuData, uint32_t dataSize, uint32_t 
             cycles = budgetEnd;
             break;
         }
-        (void)execPair(delay);
-        cycles += delay.cycleStep;
+        // Like the slow path, the program's last pair leaves the old VI for a branch right after a resume.
+        const InstructionUsage &delayLower = m_decodedCodeCache[delayIdx].lowerUsage;
+        const uint32_t delayViWrite =
+            (p.flags & kFastFlagEBit) != 0u && delayLower.delaysNextBranchRead ? (delayLower.viWrite & ~1u) : 0u;
+        const int32_t delayOldVi = delayViWrite != 0u ? vi[std::countr_zero(delayViWrite)] : 0;
+        issueCycle = cycles + dn.cycleStep - 1u;
+        (void)execPair(delay, dn);
+        cycles += dn.cycleStep;
 
         if ((p.flags & kFastFlagEBit) != 0u)
         {
+            if (delayViWrite != 0u)
+            {
+                m_viBranchBackupReg = static_cast<uint8_t>(std::countr_zero(delayViWrite));
+                m_viBranchBackupValue = delayOldVi;
+                m_viBranchBackupValid = true;
+            }
             pcIdx = (delayIdx + 1u < pairCount) ? (delayIdx + 1u) : 0u;
-            terminalTailLatency = delay.tailLatency;
+            terminalTailLatency = dn.tailLatency;
             programEnded = true;
             break;
         }
 
-        pcIdx = taken ? static_cast<uint32_t>(p.imm)
-                      : ((delayIdx + 1u < pairCount) ? (delayIdx + 1u) : 0u);
+        nodeIdx = taken ? dn.nextTaken : dn.next;
     }
 
     // Write back local register state.

@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 class GS;
 namespace ps2x::state
@@ -253,10 +254,20 @@ private:
         uint8_t lReg2 = 0;
         uint8_t lReg3 = 0;
         uint8_t flags = 0;
-        uint8_t cycleStep = 1;
-        uint8_t tailLatency = 0;
         int16_t imm = 0;
         uint32_t imm24 = 0;
+    };
+
+    // One pair under one pipeline-latency state: a pair reached with different pending latencies gets one node per
+    // state, so each node's stall is exact on every path.
+    struct FastNode
+    {
+        uint32_t next = 0;      // sequential successor; for a delay slot, the not-taken target
+        uint32_t nextTaken = 0; // delay slot only: the taken target
+        uint16_t pair = 0;
+        uint8_t cycleStep = 1;
+        uint8_t tailLatency = 0;
+        bool macProducer = false; // its MAC flags are read by a later FMEQ/FMAND/FMOR
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
@@ -270,8 +281,9 @@ private:
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
     std::array<FastPair, kMaxDecodedPairs> m_fastCodeCache{};
-    std::array<uint8_t, kMaxDecodedPairs> m_fastPairCommitted{};
     std::array<uint8_t, kMaxDecodedPairs> m_fastEntryStatus{};
+    std::array<uint32_t, kMaxDecodedPairs> m_fastEntryNode{};
+    std::vector<FastNode> m_fastNodes;
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
