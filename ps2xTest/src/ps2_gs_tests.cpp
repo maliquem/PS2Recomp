@@ -5062,6 +5062,10 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (1ull << 17));
                 gs.writeRegister(GS_REG_RGBAQ, 0x80405060ull);
                 const uint64_t syncsBefore = vk ? vk->CpuFallbackSyncsForTests() : 0u;
+                // A GPU draw left pending, so a CPU fallback would have to read VRAM back (which the counter sees).
+                gs.writeRegister(GS_REG_PRIM, GS_PRIM_SPRITE);
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(0u, 0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, gsXyz(4u << 4, 4u << 4, 0u));
                 gs.writeRegister(GS_REG_PRIM, GS_PRIM_LINE);
                 gs.writeRegister(GS_REG_XYZ2, gsXyz(1000u << 4, 5u << 4, 0u));
                 gs.writeRegister(GS_REG_XYZ2, gsXyz(1100u << 4, 5u << 4, 0u));
