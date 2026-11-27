@@ -5157,7 +5157,11 @@ void register_ps2_gs_tests()
                 rt16.vertices[0] = {8.0f, 0.0f, 0.0, 200, 100, 50, 0x50, 1.0f, 0.0f, 0.0f, 0, 0, 0};
                 rt16.vertices[1] = {16.0f, 8.0f, 0.0, 200, 100, 50, 0x50, 1.0f, 0.0f, 0.0f, 0, 0, 0};
                 b.Submit(rt16);
+            });
 
+            const uint64_t syncsBeforeLines = vkBackend->CpuFallbackSyncsForTests();
+            runOnBoth([&](GSRasterBackend &b)
+            {
                 // 3d. Lines and points (Vulkan draws them as runs of the CPU line walk): Gouraud diagonal, flat
                 // horizontal and vertical, steep, reversed, blended, depth GEQUAL on Z16S, with an XY offset.
                 GSPrimitiveBatch ln{};
@@ -5174,6 +5178,7 @@ void register_ps2_gs_tests()
                     {210.0f, 110.0f, 210.0f, 200.0f, 400.0, 1200.0, 200, 30, true, true},
                     {150.0f, 200.0f, 160.0f, 110.0f, 950.0, 100.0, 60, 180, true, true},
                     {300.0f, 115.0f, 230.0f, 190.0f, 700.0, 700.0, 120, 120, false, true},
+                    {10.0f, 150.0f, 90.0f, 140.0f, 600.0, 650.0, 30, 220, true, false}, // starts left of the scissor
                 };
                 for (const auto &l : lines)
                 {
@@ -5184,6 +5189,15 @@ void register_ps2_gs_tests()
                     ln.vertices[1] = {l.x1, l.y1, l.z1, l.c1, static_cast<uint8_t>(255 - l.c1), 99, 0x70, 1.0f, 0.0f, 0.0f, 0, 0, 0};
                     b.Submit(ln);
                 }
+                // Fogged Gouraud line.
+                ln.state.prim.fge = true;
+                ln.state.fogR = 200;
+                ln.state.fogG = 10;
+                ln.state.fogB = 90;
+                ln.vertices[0] = {60.0f, 190.0f, 800.0, 50, 60, 70, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 10};
+                ln.vertices[1] = {190.0f, 205.0f, 820.0, 150, 160, 170, 0x80, 1.0f, 0.0f, 0.0f, 0, 0, 240};
+                b.Submit(ln);
+                ln.state.prim.fge = false;
                 ln.state.prim.type = GS_PRIM_POINT;
                 ln.vertexCount = 1u;
                 for (int i = 0; i < 4; ++i)
@@ -5192,6 +5206,7 @@ void register_ps2_gs_tests()
                     b.Submit(ln);
                 }
             });
+            t.Equals(vkBackend->CpuFallbackSyncsForTests(), syncsBeforeLines, "lines and points must not read VRAM back for the CPU");
 
             std::vector<uint8_t> snapCpu, snapVk;
             cpuBackend.SnapshotVram(snapCpu);

@@ -1327,6 +1327,7 @@ void GSVulkanBackend::syncGpuToCpuUnlocked() const
         !m_activeTransferContiguous && !m_gpuInFlight)
         return;
     submitPendingUnlocked(true, true);
+    ++m_cpuSyncs;
     std::memcpy(m_vram, m_vramReadback.mapped, kVramBytes);
     m_gpuVramDirtyForCpu = false;
     m_cpuFallback.TextureFlush();
